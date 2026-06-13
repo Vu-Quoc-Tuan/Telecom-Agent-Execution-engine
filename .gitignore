@@ -1,0 +1,37 @@
+# IDE / Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Environment Secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Agentic / AI Assistant artifacts
+.agents/
+.condex/
+
+# Virtual environments (if created at root)
+.venv/
+venv/
+ENV/
+env/
+
+# Node / Frontend (if created at root)
+node_modules/
+dist/
+build/
+.next/
