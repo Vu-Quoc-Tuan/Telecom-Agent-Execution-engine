@@ -1,0 +1,17 @@
+description: "Offline telecom backend safety, domain, and routing evals"
+
+prompts:
+  - "{{case_type}}"
+
+providers:
+  - id: file://providers/backend_policy.py
+    label: local-backend-policy
+    config:
+      pythonExecutable: ../backend/.venv/bin/python
+
+defaultTest:
+  assert:
+    - type: python
+      value: file://assertions/validate_agent_output.py:get_assert
+
+tests: file://scenarios.yaml
