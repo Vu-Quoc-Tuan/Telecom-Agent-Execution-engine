@@ -20,9 +20,21 @@ Thumbs.db
 *.log
 logs/
 
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Agentic / AI Assistant artifacts
 .agents/
 .condex/
+.claude/
+.gemini/
+.cursor/
+.memory/
+.codex/
 
 # Virtual environments (if created at root)
 .venv/
