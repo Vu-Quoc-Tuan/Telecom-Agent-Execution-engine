@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import clickhouse_connect
 import paramiko
 import psycopg2
 from dotenv import load_dotenv
 
-load_dotenv()
+repo_root = Path(__file__).resolve().parent.parent.parent
+load_dotenv(repo_root / ".env")
+load_dotenv(repo_root / ".env.external")
 
 
 def require_env(name: str) -> str:
@@ -17,7 +21,7 @@ def require_env(name: str) -> str:
     return value
 
 
-def test_postgres() -> None:
+def test_postgres() -> bool:
     print("\n1. CHECK POSTGRES")
 
     try:
@@ -66,12 +70,14 @@ def test_postgres() -> None:
         print(f"Metadata: {metadata}")
         print(f"Schemas: {schemas}")
         print(f"Tables: {tables}")
+        return True
 
     except Exception as exc:
         print(f"Lỗi kết nối PostgreSQL: {type(exc).__name__}: {exc}")
+        return False
 
 
-def test_clickhouse() -> None:
+def test_clickhouse() -> bool:
     print("\n2. CHECK CLICKHOUSE")
 
     client = None
@@ -115,23 +121,25 @@ def test_clickhouse() -> None:
         print(f"Metadata: {metadata}")
         print(f"Databases: {databases}")
         print(f"Tables: {tables}")
+        return True
 
     except Exception as exc:
         print(f"Lỗi kết nối ClickHouse: {type(exc).__name__}: {exc}")
+        return False
 
     finally:
         if client is not None:
             client.close()
 
 
-def test_ssh() -> None:
+def test_ssh() -> bool:
     print("\n3. CHECK SSH")
 
     ssh = paramiko.SSHClient()
 
     # Ưu tiên kiểm tra host key đã lưu trong ~/.ssh/known_hosts.
     ssh.load_system_host_keys()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
 
     try:
         ssh.connect(
@@ -166,6 +174,7 @@ def test_ssh() -> None:
         if error_output.strip():
             print("STDERR:")
             print(error_output)
+        return exit_code == 0
 
     except paramiko.ssh_exception.SSHException as exc:
         print(f"Lỗi SSH: {exc}")
@@ -173,13 +182,16 @@ def test_ssh() -> None:
             "Nếu đây là lần kết nối đầu tiên, hãy chạy lệnh ssh thủ công "
             "để xác nhận fingerprint và thêm host vào known_hosts."
         )
+        return False
     except Exception as exc:
         print(f"Lỗi kết nối SSH: {type(exc).__name__}: {exc}")
+        return False
     finally:
         ssh.close()
 
 
 if __name__ == "__main__":
-    test_postgres()
-    test_clickhouse()
-    test_ssh()
+    ok = test_postgres()
+    ok = test_clickhouse() and ok
+    ok = test_ssh() and ok
+    sys.exit(0 if ok else 1)

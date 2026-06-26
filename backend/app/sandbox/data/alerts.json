@@ -1,0 +1,14 @@
+{
+  "ALM_991": {
+    "alarm_id": "ALM_991",
+    "component": "gNodeB-Transceiver",
+    "severity": "CRITICAL",
+    "description": "Nhiệt độ khối xử lý vô tuyến vượt ngưỡng an toàn cho phép (>85C)."
+  },
+  "ALM_104": {
+    "alarm_id": "ALM_104",
+    "component": "BBU-Memory",
+    "severity": "MAJOR",
+    "description": "Tràn phân vùng bộ nhớ đệm tiến trình báo hiệu mạng lõi."
+  }
+}
