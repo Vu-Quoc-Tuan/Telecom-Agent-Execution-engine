@@ -69,16 +69,6 @@ class AgentRun(Base):
         server_default=text("'{}'::jsonb"),
     )
 
-    langfuse_trace_id = Column(
-        String(100),
-        nullable=True,
-    )
-
-    langfuse_trace_url = Column(
-        Text,
-        nullable=True,
-    )
-
     step_count = Column(
         Integer,
         nullable=False,
@@ -91,14 +81,14 @@ class AgentRun(Base):
         nullable=True,
     )
 
-    # Bản ghi được tạo lúc nào
+    # Tạo lúc nào
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
 
-    # Bản ghi được cập nhật gần nhất lúc nào
+    # Cập nhật gần nhất
     updated_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -106,13 +96,13 @@ class AgentRun(Base):
         nullable=False,
     )
 
-    # Agent thực sự bắt đầu chạy lúc nào
+    # Bắt đầu chạy lúc nào
     started_at = Column(
         DateTime(timezone=True),
         nullable=True,
     )
 
-    # Agent kết thúc, lỗi, timeout hoặc bị hủy lúc nào
+    # Kết thúc, lỗi, timeout hoặc bị hủy lúc nào
     completed_at = Column(
         DateTime(timezone=True),
         nullable=True,

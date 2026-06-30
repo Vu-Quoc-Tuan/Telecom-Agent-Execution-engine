@@ -18,6 +18,7 @@ class SkillRepository:
         skill_md: str,
         frontmatter: dict | None = None,
         bundled_files: dict | None = None,
+        script_manifest: dict | None = None,
         version: str = "1.0.0",
     ) -> Skill:
         """Persist an uploaded Agent Skill package once, awaiting validation result."""
@@ -29,6 +30,7 @@ class SkillRepository:
             skill_md=skill_md,
             frontmatter=frontmatter or {},
             bundled_files=bundled_files or {},
+            script_manifest=script_manifest or {},
             status="uploaded",
             is_malicious=False,
         )
@@ -91,6 +93,16 @@ class SkillRepository:
             db.commit()
             db.refresh(skill)
         return skill
+
+    @staticmethod
+    def delete_skill(db: Session, skill_id: uuid.UUID, commit: bool = True) -> bool:
+        skill = db.get(Skill, skill_id)
+        if skill is None:
+            return False
+        db.delete(skill)
+        if commit:
+            db.commit()
+        return True
 
     @staticmethod
     def list_ready_skills(db: Session) -> list[Skill]:

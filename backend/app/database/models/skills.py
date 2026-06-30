@@ -33,8 +33,6 @@ class Skill(Base):
         server_default=text("'1.0.0'"),
     )
 
-    # Body Markdown của SKILL.md (phần hướng dẫn sau YAML frontmatter).
-    # Được nạp đầy đủ cho LLM khi nó gọi tool load_skill (progressive disclosure - L2).
     skill_md = Column(
         Text,
         nullable=False,
@@ -56,6 +54,13 @@ class Skill(Base):
         server_default=text("'{}'::jsonb"),
     )
 
+    script_manifest = Column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+
     # uploaded | testing | ready | rejected
     status = Column(
         String(30),
@@ -64,7 +69,7 @@ class Skill(Base):
         server_default=text("'uploaded'"),
     )
 
-    # Tầng kiểm tra an ninh (Stack trace của AST hoặc đoạn nhận xét của LLM)
+    # Tầng kiểm tra an ninh
     security_review_log = Column(
         Text,
         nullable=True,

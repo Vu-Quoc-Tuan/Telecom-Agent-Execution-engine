@@ -81,7 +81,7 @@ class RunRepository:
         """
         values = {"status": status}
         if status in _TERMINAL_RUN_STATUSES:
-            values["completed_at"] = func.now()
+            values["completed_at"] = func.coalesce(AgentRun.completed_at, func.now())
         if error_msg is not None:
             values["error_message"] = error_msg
         statement = (
@@ -122,21 +122,6 @@ class RunRepository:
             .limit(limit)
         )
         return list(db.scalars(statement).all())
-
-    @staticmethod
-    def attach_langfuse_trace(
-        db: Session, run_id: uuid.UUID, trace_id: str, trace_url: str
-    ) -> AgentRun | None:
-        """
-        Attach Langfuse trace information to an AgentRun for frontend link rendering.
-        """
-        run = db.get(AgentRun, run_id)
-        if run:
-            run.langfuse_trace_id = trace_id
-            run.langfuse_trace_url = trace_url
-            db.commit()
-            db.refresh(run)
-        return run
 
     @staticmethod
     def increment_step_count(db: Session, run_id: uuid.UUID) -> AgentRun | None:

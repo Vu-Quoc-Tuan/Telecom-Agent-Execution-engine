@@ -49,7 +49,6 @@ class ToolCall(Base):
     )
 
     # ID tool call do OpenAI/Anthropic trả về.
-    # Có thể NULL với internal call hoặc replay.
     provider_tool_call_id = Column(
         String(255),
         nullable=True,
@@ -60,29 +59,12 @@ class ToolCall(Base):
         nullable=False,
     )
 
-    # Nên bắt buộc có version để audit/replay chính xác.
-    skill_version = Column(
-        String(30),
-        nullable=False,
-        default="1.0.0",
-        server_default=text("'1.0.0'"),
-    )
 
-    skill_source = Column(
-        String(20),
-        nullable=False,
-        default="internal",
-        server_default=text("'internal'"),
-    )
-    # internal | mcp
-
-    # Nullable vì một số skill thuần xử lý nội bộ,
-    # không gọi SSH/DB/API bên ngoài.
+    # ssh | clickhouse | external_postgres | internal | mcp_server_name
     connector_name = Column(
         String(100),
         nullable=True,
     )
-    # ssh | clickhouse | external_postgres | internal | mcp_server_name
 
     arguments_json = Column(
         JSONB,
@@ -107,11 +89,11 @@ class ToolCall(Base):
     risk_level = Column(
         String(30),
         nullable=False,
-        default="read_only",
-        server_default=text("'read_only'"),
+        default="auto_execute",
+        server_default=text("'auto_execute'"),
     )
-    # read_only | safe_action | dangerous_action | prohibited
 
+    # auto_execute | require_approval
     requires_approval = Column(
         Boolean,
         nullable=False,
@@ -139,7 +121,6 @@ class ToolCall(Base):
     )
 
     # Ngăn action bị thực thi lặp khi retry.
-    # Đặc biệt cần cho restart_service hoặc action có side effect.
     idempotency_key = Column(
         String(150),
         nullable=True,
@@ -194,16 +175,10 @@ class ToolCall(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "skill_source IN ('internal', 'mcp')",
-            name="ck_tool_calls_skill_source",
-        ),
-        CheckConstraint(
             """
             risk_level IN (
-                'read_only',
-                'safe_action',
-                'dangerous_action',
-                'prohibited'
+                'auto_execute',
+                'require_approval'
             )
             """,
             name="ck_tool_calls_risk_level",
@@ -228,8 +203,7 @@ class ToolCall(Base):
             "run_id",
         ),
         Index(
-            "idx_tool_calls_skill",
+            "idx_tool_calls_skill_name",
             "skill_name",
-            "skill_source",
         ),
     )

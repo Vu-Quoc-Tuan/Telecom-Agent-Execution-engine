@@ -50,20 +50,6 @@ class SessionRepository:
         return list(db.scalars(statement).all())
 
     @staticmethod
-    def update_session_status(
-        db: Session,
-        session_id: uuid.UUID,
-        new_status: str,
-    ) -> SessionModel | None:
-        session = db.get(SessionModel, session_id)
-        if session is None:
-            return None
-        session.status = new_status
-        db.commit()
-        db.refresh(session)
-        return session
-
-    @staticmethod
     def delete_session(db: Session, session_id: uuid.UUID) -> bool:
         session = db.get(SessionModel, session_id)
         if session is None or session.deleted_at is not None:

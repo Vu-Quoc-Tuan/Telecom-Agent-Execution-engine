@@ -6,8 +6,8 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
-    Text,
     func,
     text,
 )
@@ -52,11 +52,6 @@ class ApprovalRequest(Base):
         server_default=text("'pending'"),
     )
 
-    reason = Column(
-        Text,
-        nullable=False,
-    )
-
     requested_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -74,14 +69,18 @@ class ApprovalRequest(Base):
         nullable=True,
     )
 
-    resolved_by = Column(
-        String(100),
-        nullable=True,
+    required_confirmations = Column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
     )
 
-    resolution_note = Column(
-        Text,
-        nullable=True,
+    confirmation_count = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
     )
 
     updated_at = Column(
@@ -114,6 +113,14 @@ class ApprovalRequest(Base):
             )
             """,
             name="ck_approval_requests_status",
+        ),
+        CheckConstraint(
+            "required_confirmations IN (1, 2)",
+            name="ck_approval_requests_required_confirmations",
+        ),
+        CheckConstraint(
+            "confirmation_count >= 0 AND confirmation_count <= required_confirmations",
+            name="ck_approval_requests_confirmation_count",
         ),
         Index(
             "idx_approval_requests_run_id",

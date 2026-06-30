@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.database.models.tool_calls import ToolCall
@@ -19,7 +19,6 @@ class ToolCallRepository:
         run_id: uuid.UUID,
         run_step_id: uuid.UUID,
         skill_name: str,
-        skill_source: str,
         connector_name: str | None,
         arguments: dict[str, Any],
         risk_level: str,
@@ -33,7 +32,6 @@ class ToolCallRepository:
             run_step_id=run_step_id,
             provider_tool_call_id=provider_tool_call_id,
             skill_name=skill_name,
-            skill_source=skill_source,
             connector_name=connector_name,
             arguments_json=arguments,
             risk_level=risk_level,
@@ -85,16 +83,74 @@ class ToolCallRepository:
         return list(db.scalars(statement).all())
 
     @staticmethod
-    def get_by_provider_call_id(
+    def get_skill_telemetry(
         db: Session,
-        run_id: uuid.UUID,
-        provider_tool_call_id: str,
-    ) -> ToolCall | None:
-        statement = select(ToolCall).where(
-            ToolCall.run_id == run_id,
-            ToolCall.provider_tool_call_id == provider_tool_call_id,
+        skill_names: list[str],
+        lookback_days: int = 30,
+    ) -> dict[str, dict[str, object]]:
+        if not skill_names:
+            return {}
+
+        skill_name_list = list(set(skill_names))
+        package_loader_tools = {"load_skill", "read_skill_file"}
+        terminal_error_statuses = {"failed", "rejected", "cancelled", "timed_out"}
+        telemetry: dict[str, dict[str, object]] = {
+            skill_name: {
+                "call_count": 0,
+                "average_latency_ms": None,
+                "error_rate": 0.0,
+                "error_count": 0,
+                "last_called_at": None,
+            }
+            for skill_name in skill_names
+        }
+
+        argument_skill_name = ToolCall.arguments_json["skill_name"].as_string()
+        matched_skill_name = case(
+            (ToolCall.skill_name.in_(skill_name_list), ToolCall.skill_name),
+            (ToolCall.skill_name.in_(package_loader_tools), argument_skill_name),
+        ).label("matched_skill_name")
+        error_count = func.sum(
+            case((ToolCall.status.in_(terminal_error_statuses), 1), else_=0)
+        ).label("error_count")
+        since = datetime.now(UTC) - timedelta(days=max(1, lookback_days))
+        statement = (
+            select(
+                matched_skill_name,
+                func.count(ToolCall.id).label("call_count"),
+                func.avg(ToolCall.latency_ms).label("average_latency_ms"),
+                error_count,
+                func.max(ToolCall.created_at).label("last_called_at"),
+            )
+            .where(
+                ToolCall.created_at >= since,
+                or_(
+                    ToolCall.skill_name.in_(skill_name_list),
+                    and_(
+                        ToolCall.skill_name.in_(package_loader_tools),
+                        argument_skill_name.in_(skill_name_list),
+                    ),
+                ),
+            )
+            .group_by(matched_skill_name)
         )
-        return db.scalar(statement)
+        for row in db.execute(statement).all():
+            matched = row.matched_skill_name
+            if matched not in telemetry:
+                continue
+            call_count = int(row.call_count or 0)
+            row_error_count = int(row.error_count or 0)
+            item = telemetry[matched]
+            item["call_count"] = call_count
+            item["error_count"] = row_error_count
+            item["average_latency_ms"] = (
+                round(float(row.average_latency_ms)) if row.average_latency_ms is not None else None
+            )
+            item["error_rate"] = row_error_count / call_count if call_count else 0.0
+            if row.last_called_at is not None:
+                item["last_called_at"] = row.last_called_at.isoformat()
+
+        return telemetry
 
     @staticmethod
     def get_by_idempotency_key(db: Session, idempotency_key: str) -> ToolCall | None:

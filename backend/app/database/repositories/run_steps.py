@@ -46,6 +46,7 @@ class RunStepRepository:
         run_id: uuid.UUID,
         summary: str,
         metadata: dict[str, Any] | None = None,
+        commit: bool = True,
     ) -> RunStep:
         max_index = db.scalar(select(func.max(RunStep.step_index)).where(RunStep.run_id == run_id))
         now = datetime.now(UTC)
@@ -62,8 +63,11 @@ class RunStepRepository:
             completed_at=now,
         )
         db.add(step)
-        db.commit()
-        db.refresh(step)
+        if commit:
+            db.commit()
+            db.refresh(step)
+        else:
+            db.flush()
         return step
 
     @staticmethod
@@ -84,6 +88,7 @@ class RunStepRepository:
         status: str,
         summary: str | None = None,
         metadata: dict[str, Any] | None = None,
+        commit: bool = True,
     ) -> RunStep | None:
         step = db.get(RunStep, step_id)
         if step is None:
@@ -91,10 +96,13 @@ class RunStepRepository:
         step.status = status
         step.summary = summary
         if metadata is not None:
-            step.metadata_json = metadata
+            step.metadata_json = {**(step.metadata_json or {}), **metadata}
         step.completed_at = datetime.now(UTC)
-        db.commit()
-        db.refresh(step)
+        if commit:
+            db.commit()
+            db.refresh(step)
+        else:
+            db.flush()
         return step
 
     @staticmethod

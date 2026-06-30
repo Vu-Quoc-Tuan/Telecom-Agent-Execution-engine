@@ -15,15 +15,18 @@ class ApprovalRepository:
         db: Session,
         run_id: uuid.UUID,
         tool_call_id: uuid.UUID,
-        reason: str,
         expires_in_seconds: int = 1800,
+        required_confirmations: int = 1,
     ) -> ApprovalRequest:
+        if required_confirmations not in {1, 2}:
+            raise ValueError("required_confirmations must be 1 or 2")
         approval = ApprovalRequest(
             id=uuid.uuid4(),
             run_id=run_id,
             tool_call_id=tool_call_id,
             status="pending",
-            reason=reason,
+            required_confirmations=required_confirmations,
+            confirmation_count=0,
             expires_at=datetime.now(UTC) + timedelta(seconds=expires_in_seconds),
         )
         db.add(approval)
@@ -37,14 +40,6 @@ class ApprovalRepository:
         approval_id: uuid.UUID,
     ) -> ApprovalRequest | None:
         return db.get(ApprovalRequest, approval_id)
-
-    @staticmethod
-    def get_by_tool_call(
-        db: Session,
-        tool_call_id: uuid.UUID,
-    ) -> ApprovalRequest | None:
-        statement = select(ApprovalRequest).where(ApprovalRequest.tool_call_id == tool_call_id)
-        return db.scalar(statement)
 
     @staticmethod
     def get_pending_requests(db: Session) -> list[ApprovalRequest]:
@@ -86,8 +81,6 @@ class ApprovalRepository:
         db: Session,
         approval_id: uuid.UUID,
         status: str,
-        resolved_by: str,
-        note: str | None = None,
     ) -> ApprovalRequest | None:
         now = datetime.now(UTC)
         approval = db.get(ApprovalRequest, approval_id)
@@ -98,6 +91,15 @@ class ApprovalRepository:
             db.commit()
             return None
 
+        next_count = approval.confirmation_count
+        persisted_status = status
+        resolved_at = now
+        if status == "approved":
+            next_count += 1
+            if next_count < approval.required_confirmations:
+                persisted_status = "pending"
+                resolved_at = None
+
         statement = (
             update(ApprovalRequest)
             .where(
@@ -106,10 +108,9 @@ class ApprovalRepository:
                 or_(ApprovalRequest.expires_at.is_(None), ApprovalRequest.expires_at > now),
             )
             .values(
-                status=status,
-                resolved_by=resolved_by,
-                resolution_note=note,
-                resolved_at=now,
+                status=persisted_status,
+                confirmation_count=next_count,
+                resolved_at=resolved_at,
                 updated_at=now,
             )
             .returning(ApprovalRequest)
@@ -122,8 +123,6 @@ class ApprovalRepository:
     def cancel_pending_by_run(
         db: Session,
         run_id: uuid.UUID,
-        resolved_by: str,
-        note: str,
         commit: bool = True,
     ) -> int:
         now = datetime.now(UTC)
@@ -135,8 +134,6 @@ class ApprovalRepository:
             )
             .values(
                 status="cancelled",
-                resolved_by=resolved_by,
-                resolution_note=note,
                 resolved_at=now,
                 updated_at=now,
             )
