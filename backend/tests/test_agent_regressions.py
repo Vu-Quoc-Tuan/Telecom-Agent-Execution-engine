@@ -23,6 +23,12 @@ class FakeDb:
     def commit(self) -> None:
         pass
 
+    def rollback(self) -> None:
+        pass
+
+    def scalars(self, statement):
+        return types.SimpleNamespace(all=lambda: [])
+
 
 class FailingAgentApp:
     async def astream(self, *args, **kwargs):
@@ -78,6 +84,11 @@ class CapturingAgentApp:
             values={
                 "execution_error": None,
                 "latest_response": self.latest_response,
+                "messages": [
+                    LLMMessage(role=MessageRole.USER, content="check node"),
+                    LLMMessage(role=MessageRole.ASSISTANT, content="tool output summary"),
+                    LLMMessage(role=MessageRole.ASSISTANT, content=self.latest_response.content),
+                ],
                 "current_step_index": 1,
             }
         )
@@ -121,6 +132,40 @@ class TwoPhaseResumeAgentApp:
 
 
 class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_graph_config_isolates_checkpoints_by_run(self) -> None:
+        from app.services.agent_execution import AgentExecutionService
+
+        session_id = uuid.uuid4()
+        run_id = uuid.uuid4()
+
+        config = AgentExecutionService._graph_config(
+            FakeDb(),
+            types.SimpleNamespace(),
+            session_id,
+            run_id=run_id,
+        )
+
+        self.assertEqual(str(run_id), config["configurable"]["thread_id"])
+
+    def test_session_history_excludes_tool_rows_and_sanitizes_user_content(self) -> None:
+        from app.services.agent_execution import AgentExecutionService
+
+        history = [
+            types.SimpleNamespace(role="user", content="password=super-secret"),
+            types.SimpleNamespace(role="assistant", content="Tôi đã kiểm tra node."),
+            types.SimpleNamespace(role="tool", content="orphaned tool payload"),
+            types.SimpleNamespace(role="user", content="tiếp tục"),
+        ]
+
+        messages = AgentExecutionService._llm_messages_from_history(history)
+
+        self.assertEqual(
+            [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.USER],
+            [message.role for message in messages],
+        )
+        self.assertNotIn("super-secret", messages[0].content)
+        self.assertNotIn("orphaned tool payload", [message.content for message in messages])
+
     async def test_async_graph_state_uses_async_checkpointer_api(self) -> None:
         from app.services.agent_execution import AgentExecutionService
 
@@ -155,7 +200,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         statuses: list[str] = []
         create_run_kwargs = {}
 
-        def update_status(db, run_id, status, error_msg=None):
+        def update_status(db, run_id, status, error_msg=None, commit=True):
             statuses.append(status)
             return run
 
@@ -173,9 +218,6 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.agent_execution.RunRepository.create_run", side_effect=create_run),
             patch(
-                "app.services.agent_execution.RunRepository.attach_langfuse_trace", return_value=run
-            ),
-            patch(
                 "app.services.agent_execution.RunRepository.increment_step_count", return_value=run
             ),
             patch(
@@ -190,8 +232,16 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.agent_execution.RunStepRepository.create_error_step",
                 create=True,
             ) as create_error_step,
+            patch(
+                "app.services.agent_execution.MessageRepository.mark_pending_interventions_undelivered",
+                create=True,
+            ) as mark_undelivered,
             patch.object(AgentExecutionService, "_agent_app", FailingAgentApp()),
             patch.object(AgentExecutionService, "_serialize_steps", return_value=[]),
+            patch(
+                "app.services.agent_execution.telemetry_tracker.get_active_prompt_version",
+                return_value="0.1.0",
+            ),
         ):
             events = [
                 event
@@ -211,6 +261,13 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             run_id=run.id,
             summary="provider failed",
             metadata={"source": "agent_graph"},
+            commit=False,
+        )
+        mark_undelivered.assert_called_once_with(
+            unittest.mock.ANY,
+            run.id,
+            reason="provider failed",
+            commit=False,
         )
 
     async def test_run_config_is_passed_to_initial_graph_state_and_config(self) -> None:
@@ -237,9 +294,6 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.agent_execution.RunRepository.create_run", return_value=run),
             patch(
-                "app.services.agent_execution.RunRepository.attach_langfuse_trace", return_value=run
-            ) as attach_trace,
-            patch(
                 "app.services.agent_execution.RunRepository.increment_step_count", return_value=run
             ),
             patch(
@@ -250,9 +304,13 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
                 "app.services.agent_execution.ApprovalRepository.get_pending_requests",
                 return_value=[],
             ),
+            patch(
+                "app.services.agent_execution.MessageRepository.requeue_undelivered_interventions",
+                create=True,
+            ) as requeue_interventions,
             patch.object(AgentExecutionService, "_agent_app", agent_app),
             patch.object(AgentExecutionService, "_serialize_steps", return_value=[]),
-            patch.object(AgentExecutionService, "_push_llm_telemetry"),
+            patch("app.services.agent_execution.telemetry_tracker.trace_run_end"),
         ):
             events = [
                 event
@@ -271,7 +329,66 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0.2, agent_app.config["configurable"]["run_config"]["temperature"])
         self.assertEqual(7, agent_app.config["configurable"]["run_config"]["max_steps"])
         self.assertEqual(321, agent_app.config["configurable"]["run_config"]["max_tokens"])
-        self.assertEqual(run.id.hex, attach_trace.call_args.kwargs["trace_id"])
+        requeue_interventions.assert_called_once_with(
+            unittest.mock.ANY,
+            session_id=session_id,
+            run_id=run.id,
+        )
+
+    async def test_run_completion_closes_langfuse_trace(self) -> None:
+        from app.services.agent_execution import AgentExecutionService
+
+        session_id = uuid.uuid4()
+        run = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            session_id=session_id,
+            provider="openai",
+            model="gpt-4o",
+            run_config_json={},
+        )
+        message = types.SimpleNamespace(run_id=None)
+        agent_app = CapturingAgentApp()
+
+        with (
+            patch(
+                "app.services.agent_execution.SessionRepository.get_session_by_id",
+                return_value=types.SimpleNamespace(title="Existing title"),
+            ),
+            patch(
+                "app.services.agent_execution.MessageRepository.save_message", return_value=message
+            ),
+            patch("app.services.agent_execution.RunRepository.create_run", return_value=run),
+            patch(
+                "app.services.agent_execution.RunRepository.increment_step_count", return_value=run
+            ),
+            patch(
+                "app.services.agent_execution.RunRepository.update_run_status",
+                return_value=types.SimpleNamespace(status=RunStatus.COMPLETED.value),
+            ),
+            patch(
+                "app.services.agent_execution.ApprovalRepository.get_pending_requests",
+                return_value=[],
+            ),
+            patch.object(AgentExecutionService, "_agent_app", agent_app),
+            patch.object(AgentExecutionService, "_serialize_steps", return_value=[]),
+            patch(
+                "app.services.agent_execution.telemetry_tracker.trace_run_end"
+            ) as trace_run_end_mock,
+        ):
+            events = [
+                event
+                async for event in AgentExecutionService.run_agent_lifecycle(
+                    db=FakeDb(),
+                    llm_gateway=types.SimpleNamespace(),
+                    session_id=session_id,
+                    user_content="check node",
+                )
+            ]
+
+        self.assertEqual("run_completed", events[-1][0])
+        # Trace cha của lượt chạy phải được đóng đúng 1 lần với trạng thái completed.
+        trace_run_end_mock.assert_called_once()
+        self.assertEqual("completed", trace_run_end_mock.call_args.kwargs["status"])
 
     async def test_title_generation_uses_sanitized_user_content(self) -> None:
         from app.services.agent_execution import AgentExecutionService
@@ -309,9 +426,6 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.agent_execution.RunRepository.create_run", return_value=run),
             patch(
-                "app.services.agent_execution.RunRepository.attach_langfuse_trace", return_value=run
-            ),
-            patch(
                 "app.services.agent_execution.RunRepository.increment_step_count", return_value=run
             ),
             patch(
@@ -324,7 +438,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(AgentExecutionService, "_agent_app", CompletingAgentApp()),
             patch.object(AgentExecutionService, "_serialize_steps", return_value=[]),
-            patch.object(AgentExecutionService, "_push_llm_telemetry"),
+            patch("app.services.agent_execution.telemetry_tracker.trace_run_end"),
         ):
             events = [
                 event
@@ -377,9 +491,6 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.agent_execution.RunRepository.create_run", return_value=run),
             patch(
-                "app.services.agent_execution.RunRepository.attach_langfuse_trace", return_value=run
-            ),
-            patch(
                 "app.services.agent_execution.RunRepository.increment_step_count", return_value=run
             ),
             patch(
@@ -406,6 +517,68 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["user"], saved_roles)
         self.assertEqual("run_failed", events[-1][0])
         self.assertIn("cancelled", events[-1][1]["error"])
+
+    async def test_first_critical_confirmation_keeps_run_suspended(self) -> None:
+        from app.services.agent_execution import AgentExecutionService
+
+        run = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            session_id=uuid.uuid4(),
+            provider="openai",
+            model="gpt-4o",
+            status=RunStatus.WAITING_APPROVAL.value,
+        )
+        tool_call = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            run_step_id=uuid.uuid4(),
+            skill_name="run_ssh_command",
+            arguments_json={"node_name": "site-a", "command": "rm -rf /var/tmp/cache"},
+            risk_level="require_approval",
+        )
+        pending = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            run_id=run.id,
+            tool_call_id=tool_call.id,
+            status="pending",
+            reason="Critical SSH command",
+            required_confirmations=2,
+            confirmation_count=0,
+        )
+        first_confirmation = types.SimpleNamespace(**{**pending.__dict__, "confirmation_count": 1})
+
+        with (
+            patch(
+                "app.services.agent_execution.ApprovalRepository.get_request",
+                return_value=pending,
+            ),
+            patch(
+                "app.services.agent_execution.ApprovalRepository.resolve_request",
+                return_value=first_confirmation,
+            ),
+            patch("app.services.agent_execution.RunRepository.get_run", return_value=run),
+            patch(
+                "app.services.agent_execution.ToolCallRepository.get_tool_call",
+                return_value=tool_call,
+            ),
+            patch(
+                "app.services.agent_execution.execute_builtin_tool",
+                new=AsyncMock(),
+            ) as execute_tool,
+        ):
+            events = [
+                event
+                async for event in AgentExecutionService.resolve_approval_and_resume_lifecycle(
+                    db=FakeDb(),
+                    llm_gateway=types.SimpleNamespace(),
+                    approval_id=pending.id,
+                    action="approved",
+                )
+            ]
+
+        self.assertEqual("run_suspended", events[-1][0])
+        self.assertEqual(1, events[-1][1]["confirmation_count"])
+        self.assertEqual(2, events[-1][1]["required_confirmations"])
+        execute_tool.assert_not_awaited()
 
     async def test_unexpected_approved_tool_error_closes_run(self) -> None:
         from app.services.agent_execution import AgentExecutionService
@@ -463,7 +636,6 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
                     llm_gateway=types.SimpleNamespace(),
                     approval_id=approval.id,
                     action="approved",
-                    resolved_by="operator",
                 )
             ]
 
@@ -500,6 +672,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             status="pending",
         )
         saved_roles: list[str] = []
+        saved_contents: list[str] = []
         final_response = LLMResponse(
             provider="openai",
             model="gpt-4o",
@@ -510,6 +683,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         def save_message(db, session_id, run_id, role, content, metadata=None):
             saved_roles.append(role)
+            saved_contents.append(content)
             return types.SimpleNamespace(id=uuid.uuid4())
 
         with (
@@ -552,7 +726,9 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(AgentExecutionService, "_agent_app", agent_app),
             patch.object(AgentExecutionService, "_serialize_steps", return_value=[]),
-            patch.object(AgentExecutionService, "_push_llm_telemetry") as push_telemetry,
+            patch(
+                "app.services.agent_execution.telemetry_tracker.trace_run_end"
+            ) as trace_run_end_mock,
         ):
             events = [
                 event
@@ -561,17 +737,112 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
                     llm_gateway=types.SimpleNamespace(),
                     approval_id=approval.id,
                     action="rejected",
-                    resolved_by="operator",
-                    note="risky",
                 )
             ]
 
         self.assertEqual("run_completed", events[-1][0])
         self.assertIn("tool", saved_roles)
-        push_telemetry.assert_called_once()
+        self.assertTrue(any("HUMAN_REJECTED" in content for content in saved_contents))
+        trace_run_end_mock.assert_called_once()
 
 
 class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_cannot_call_tools_again_immediately_after_rejection(self) -> None:
+        from app.agent.nodes import AgentNodes
+        from app.llm.schemas import ToolChoiceMode
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            messages=[
+                LLMMessage(
+                    role=MessageRole.TOOL,
+                    content='{"status":"rejected","code":"HUMAN_REJECTED"}',
+                    tool_call_id="call-rejected",
+                    tool_is_error=True,
+                )
+            ],
+            approval_rejected=True,
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+
+        class FakeGateway:
+            providers = {"openai": object()}
+
+            def __init__(self):
+                self.options = None
+
+            async def invoke(self, **kwargs):
+                self.options = kwargs["options"]
+                return LLMResponse(
+                    provider="openai",
+                    model="gpt-4o",
+                    content="Hành động đã bị từ chối và không được thực hiện.",
+                    finish_reason=FinishReason.STOP,
+                )
+
+        gateway = FakeGateway()
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step"),
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
+        ):
+            await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "llm_gateway": gateway,
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "run_config": {},
+                    }
+                },
+            )
+
+        self.assertEqual(ToolChoiceMode.NONE, gateway.options.tool_choice.mode)
+
+    async def test_critical_ssh_request_requires_two_confirmations(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        run_id = uuid.uuid4()
+        response = LLMResponse(
+            provider="openai",
+            model="gpt-4o",
+            finish_reason=FinishReason.TOOL,
+            tool_calls=[
+                NormalizedToolCall(
+                    id="call-critical",
+                    name="run_ssh_command",
+                    arguments={"node_name": "site-a", "command": "rm -rf /var/tmp/cache"},
+                )
+            ],
+        )
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(run_id),
+            current_step_index=1,
+            latest_response=response,
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+        tool_call = types.SimpleNamespace(id=uuid.uuid4())
+
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.ToolCallRepository.get_by_idempotency_key", return_value=None),
+            patch("app.agent.nodes.ToolCallRepository.create_tool_call", return_value=tool_call),
+            patch("app.agent.nodes.ApprovalRepository.create_request") as create_request,
+            patch("app.agent.nodes.interrupt", return_value={"messages": []}),
+        ):
+            await AgentNodes.suspend_for_human(
+                state,
+                {"configurable": {"db": FakeDb()}},
+            )
+
+        self.assertEqual(2, create_request.call_args.kwargs["required_confirmations"])
+
     async def test_call_llm_gateway_uses_run_config_options(self) -> None:
         from app.agent.nodes import AgentNodes
 
@@ -605,6 +876,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch("app.agent.nodes.RunStepRepository.start_step"),
             patch("app.agent.nodes.RunStepRepository.complete_step"),
             patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
         ):
             result = await AgentNodes.call_llm_gateway(
                 state,
@@ -623,6 +895,567 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("gpt-4o-mini", gateway.options.model)
         self.assertEqual(0.2, gateway.options.temperature)
         self.assertEqual(55, gateway.options.max_tokens)
+
+    async def test_call_llm_gateway_normalizes_provider_case_and_model_override(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        run_id = uuid.uuid4()
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(run_id),
+            messages=[LLMMessage(role=MessageRole.USER, content="check node")],
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+
+        class FakeGateway:
+            providers = {"openai": object()}
+
+            def __init__(self):
+                self.provider = None
+                self.options = None
+
+            async def invoke(self, **kwargs):
+                self.provider = kwargs["provider"]
+                self.options = kwargs["options"]
+                return LLMResponse(
+                    provider="openai",
+                    model="gpt-4o-mini",
+                    content="done",
+                    finish_reason=FinishReason.STOP,
+                )
+
+        gateway = FakeGateway()
+
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step"),
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
+        ):
+            result = await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "llm_gateway": gateway,
+                        "provider": "OpenAI",
+                        "model": "gpt-4o-mini",
+                        "run_config": {"temperature": 0.2, "max_tokens": 55},
+                    }
+                },
+            )
+
+        self.assertEqual("done", result["latest_response"].content)
+        self.assertEqual("openai", gateway.provider)
+        self.assertEqual("gpt-4o-mini", gateway.options.model)
+
+    async def test_call_llm_gateway_routes_to_other_configured_provider_on_failure(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            messages=[LLMMessage(role=MessageRole.USER, content="check node")],
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+
+        class FakeAdapter:
+            def __init__(self, model):
+                self.model = model
+
+        class FakeGateway:
+            providers = ("openai", "anthropic")
+
+            def __init__(self):
+                self.kwargs = None
+
+            @staticmethod
+            def get_adapter(provider):
+                return FakeAdapter("gpt-4o" if provider == "openai" else "claude-sonnet")
+
+            async def invoke(self, **kwargs):
+                self.kwargs = kwargs
+                return LLMResponse(
+                    provider="anthropic",
+                    model="claude-sonnet",
+                    content="fallback worked",
+                    finish_reason=FinishReason.STOP,
+                )
+
+        gateway = FakeGateway()
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step"),
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
+        ):
+            result = await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "llm_gateway": gateway,
+                        "provider": "openai",
+                        "model": "gpt-4o-mini",
+                        "run_config": {},
+                    }
+                },
+            )
+
+        self.assertEqual("fallback worked", result["latest_response"].content)
+        self.assertEqual(["anthropic"], gateway.kwargs["fallback_providers"])
+        self.assertTrue(gateway.kwargs["fallback_on_non_retryable"])
+        self.assertEqual(
+            "claude-sonnet",
+            gateway.kwargs["provider_options"]["anthropic"].model,
+        )
+
+    async def test_specific_skill_filters_catalog_and_forces_load_before_reasoning(self) -> None:
+        from app.agent.nodes import AgentNodes
+        from app.llm.schemas import ToolChoiceMode
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            messages=[LLMMessage(role=MessageRole.USER, content="check KPI")],
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+        skills = [
+            types.SimpleNamespace(name="check-kpis", description="Check KPI workflow."),
+            types.SimpleNamespace(name="restart-site", description="Restart workflow."),
+        ]
+
+        class FakeGateway:
+            providers = ("openai",)
+
+            def __init__(self):
+                self.options = None
+                self.system_prompt = None
+                self.tools = None
+
+            async def invoke(self, **kwargs):
+                self.options = kwargs["options"]
+                self.system_prompt = kwargs["system_prompt"]
+                self.tools = kwargs["tools"]
+                return LLMResponse(
+                    provider="openai",
+                    model="gpt-4o",
+                    content="loading selected skill",
+                    finish_reason=FinishReason.STOP,
+                )
+
+        gateway = FakeGateway()
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step"),
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=skills),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
+        ):
+            await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "llm_gateway": gateway,
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "run_config": {"selected_skill": "check-kpis"},
+                    }
+                },
+            )
+
+        self.assertEqual(ToolChoiceMode.SPECIFIC, gateway.options.tool_choice.mode)
+        self.assertEqual("load_skill", gateway.options.tool_choice.tool_name)
+        self.assertFalse(gateway.options.parallel_tool_calls)
+        self.assertIn("check-kpis", gateway.system_prompt)
+        self.assertNotIn("restart-site", gateway.system_prompt)
+        load_skill = next(tool for tool in gateway.tools if tool.name == "load_skill")
+        self.assertEqual(
+            ["check-kpis"],
+            load_skill.input_schema["properties"]["skill_name"]["enum"],
+        )
+
+    async def test_specific_skill_fails_if_it_is_no_longer_ready(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            messages=[LLMMessage(role=MessageRole.USER, content="check KPI")],
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+
+        class FakeGateway:
+            providers = ("openai",)
+
+            async def invoke(self, **kwargs):
+                raise AssertionError("LLM must not run with a revoked selected skill")
+
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step") as complete_step,
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+        ):
+            result = await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "llm_gateway": FakeGateway(),
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "run_config": {"selected_skill": "check-kpis"},
+                    }
+                },
+            )
+
+        self.assertIn("check-kpis", result["execution_error"])
+        self.assertEqual("failed", complete_step.call_args.kwargs["status"])
+
+    async def test_call_llm_gateway_ignores_invalid_run_config_values(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        run_id = uuid.uuid4()
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(run_id),
+            messages=[LLMMessage(role=MessageRole.USER, content="check node")],
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+
+        class FakeGateway:
+            providers = {"openai": object()}
+
+            def __init__(self):
+                self.options = None
+
+            async def invoke(self, **kwargs):
+                self.options = kwargs["options"]
+                return LLMResponse(
+                    provider="openai",
+                    model="gpt-4o",
+                    content="done",
+                    finish_reason=FinishReason.STOP,
+                )
+
+        gateway = FakeGateway()
+
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step"),
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
+        ):
+            result = await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "llm_gateway": gateway,
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "run_config": {
+                            "temperature": "hot",
+                            "max_tokens": "many",
+                            "timeout_seconds": "slow",
+                            "context_window_tokens": "large",
+                            "context_compaction_trigger_ratio": "soon",
+                            "context_compaction_target_ratio": "small",
+                        },
+                    }
+                },
+            )
+
+        self.assertEqual("done", result["latest_response"].content)
+        self.assertIsNone(gateway.options.temperature)
+        self.assertIsNone(gateway.options.max_tokens)
+        self.assertIsNone(gateway.options.timeout_seconds)
+
+    async def test_call_llm_gateway_injects_pending_operator_interventions(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        run_id = uuid.uuid4()
+        intervention_id = uuid.uuid4()
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(run_id),
+            messages=[LLMMessage(role=MessageRole.USER, content="check alarm")],
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+        pending_intervention = types.SimpleNamespace(
+            id=intervention_id,
+            content="đừng hỏi nữa, tự chọn alarm phù hợp",
+        )
+
+        class CapturingGateway:
+            providers = {"openai": object()}
+
+            def __init__(self):
+                self.messages = None
+
+            async def invoke(self, **kwargs):
+                self.messages = kwargs["messages"]
+                return LLMResponse(
+                    provider="openai",
+                    model="gpt-4o",
+                    content="done",
+                    finish_reason=FinishReason.STOP,
+                )
+
+        gateway = CapturingGateway()
+
+        class TrackingDb(FakeDb):
+            def __init__(self):
+                self.commit_count = 0
+
+            def commit(self):
+                self.commit_count += 1
+
+        db = TrackingDb()
+
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step") as complete_step,
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch(
+                "app.agent.nodes.MessageRepository.list_pending_interventions",
+                return_value=[pending_intervention],
+            ),
+            patch("app.agent.nodes.MessageRepository.mark_interventions_injected") as mark_injected,
+        ):
+            result = await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": db,
+                        "llm_gateway": gateway,
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "run_config": {},
+                        "settings": types.SimpleNamespace(),
+                    }
+                },
+            )
+
+        self.assertEqual("done", result["latest_response"].content)
+        self.assertTrue(
+            any(
+                message.role is MessageRole.USER
+                and "[OPERATOR INTERVENTION]" in (message.content or "")
+                and "tự chọn alarm" in (message.content or "")
+                for message in gateway.messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message.role is MessageRole.USER
+                and "[OPERATOR INTERVENTION]" in (message.content or "")
+                for message in result["messages"]
+            )
+        )
+        complete_step.assert_called_once_with(
+            db=db,
+            step_id=step.id,
+            status="completed",
+            summary="done",
+            metadata=unittest.mock.ANY,
+            commit=False,
+        )
+        mark_injected.assert_called_once_with(db, [intervention_id], commit=False)
+        self.assertEqual(1, db.commit_count)
+
+    async def test_failed_llm_turn_rolls_back_without_consuming_interventions(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            messages=[LLMMessage(role=MessageRole.USER, content="check alarm")],
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+        intervention = types.SimpleNamespace(id=uuid.uuid4(), content="use table y")
+
+        class FailingGateway:
+            providers = ("openai",)
+
+            async def invoke(self, **kwargs):
+                raise RuntimeError("provider failed")
+
+        class TrackingDb(FakeDb):
+            def __init__(self):
+                self.rollback_count = 0
+
+            def rollback(self):
+                self.rollback_count += 1
+
+        db = TrackingDb()
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step"),
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch(
+                "app.agent.nodes.MessageRepository.list_pending_interventions",
+                return_value=[intervention],
+            ),
+            patch("app.agent.nodes.MessageRepository.mark_interventions_injected") as mark_injected,
+        ):
+            result = await AgentNodes.call_llm_gateway(
+                state,
+                {
+                    "configurable": {
+                        "db": db,
+                        "llm_gateway": FailingGateway(),
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "run_config": {},
+                        "settings": types.SimpleNamespace(),
+                    }
+                },
+            )
+
+        self.assertEqual("provider failed", result["execution_error"])
+        self.assertEqual(1, db.rollback_count)
+        mark_injected.assert_not_called()
+
+    def test_reliability_router_reenters_llm_when_late_intervention_is_pending(self) -> None:
+        from app.agent.routing import reliability_router
+
+        run_id = uuid.uuid4()
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(run_id),
+            messages=[LLMMessage(role=MessageRole.USER, content="check alarm")],
+            latest_response=LLMResponse(
+                provider="openai",
+                model="gpt-4o",
+                content="final answer",
+                finish_reason=FinishReason.STOP,
+            ),
+        )
+
+        with patch(
+            "app.agent.routing.MessageRepository.list_pending_interventions",
+            return_value=[types.SimpleNamespace(id=uuid.uuid4())],
+        ) as list_pending:
+            route = reliability_router(state, {"configurable": {"db": FakeDb()}})
+
+        self.assertEqual("call_llm_gateway", route)
+        list_pending.assert_called_once()
+
+    def test_reliability_router_ends_when_no_tools_or_pending_interventions(self) -> None:
+        from app.agent.routing import reliability_router
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            messages=[LLMMessage(role=MessageRole.USER, content="check alarm")],
+            latest_response=LLMResponse(
+                provider="openai",
+                model="gpt-4o",
+                content="final answer",
+                finish_reason=FinishReason.STOP,
+            ),
+        )
+
+        with patch(
+            "app.agent.routing.MessageRepository.list_pending_interventions",
+            return_value=[],
+        ):
+            route = reliability_router(state, {"configurable": {"db": FakeDb()}})
+
+        self.assertEqual("end", route)
+
+    def test_reliability_router_accepts_final_answer_on_last_allowed_step(self) -> None:
+        from app.agent.routing import reliability_router
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            current_step_index=10,
+            max_steps=10,
+            messages=[LLMMessage(role=MessageRole.USER, content="check alarm")],
+            latest_response=LLMResponse(
+                provider="openai",
+                model="gpt-4o",
+                content="final answer",
+                finish_reason=FinishReason.STOP,
+            ),
+        )
+
+        with patch(
+            "app.agent.routing.MessageRepository.list_pending_interventions",
+            return_value=[],
+        ):
+            route = reliability_router(state, {"configurable": {"db": FakeDb()}})
+
+        self.assertEqual("end", route)
+
+    def test_reliability_router_returns_invalid_known_tool_call_to_llm_feedback_path(self) -> None:
+        from app.agent.routing import reliability_router
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            current_step_index=1,
+            latest_response=LLMResponse(
+                provider="openai",
+                model="mistral-large",
+                finish_reason=FinishReason.TOOL,
+                tool_calls=[
+                    NormalizedToolCall(
+                        id="call-chained",
+                        name="run_ssh_command",
+                        arguments={
+                            "node_name": "default",
+                            "command": "hostname && uptime",
+                        },
+                    )
+                ],
+            ),
+        )
+
+        route = reliability_router(state, {"configurable": {"db": FakeDb()}})
+
+        self.assertEqual("execute_tools", route)
+
+    def test_reliability_router_keeps_mixed_invalid_and_approval_batch_on_feedback_path(
+        self,
+    ) -> None:
+        from app.agent.routing import reliability_router
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            current_step_index=1,
+            latest_response=LLMResponse(
+                provider="openai",
+                model="mistral-large",
+                finish_reason=FinishReason.TOOL,
+                tool_calls=[
+                    NormalizedToolCall(
+                        id="call-invalid",
+                        name="run_ssh_command",
+                        arguments={"node_name": "default", "command": "hostname && uptime"},
+                    ),
+                    NormalizedToolCall(
+                        id="call-approval",
+                        name="run_ssh_command",
+                        arguments={"node_name": "default", "command": "systemctl restart sshd"},
+                    ),
+                ],
+            ),
+        )
+
+        route = reliability_router(state, {"configurable": {"db": FakeDb()}})
+
+        self.assertEqual("execute_tools", route)
 
     async def test_call_llm_gateway_includes_dynamic_resource_context_from_settings(self) -> None:
         from app.agent.nodes import AgentNodes
@@ -664,6 +1497,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch("app.agent.nodes.RunStepRepository.start_step"),
             patch("app.agent.nodes.RunStepRepository.complete_step"),
             patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
         ):
             result = await AgentNodes.call_llm_gateway(
                 state,
@@ -681,11 +1515,10 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("done", result["latest_response"].content)
         self.assertIn("site-a", gateway.system_prompt)
-        self.assertIn("server tôi", gateway.system_prompt)
-        self.assertIn("query_clickhouse", gateway.system_prompt)
-        self.assertIn("query_postgres", gateway.system_prompt)
-        self.assertIn("MỘT lệnh đơn", gateway.system_prompt)
-        self.assertIn("&&", gateway.system_prompt)
+        self.assertIn("SSH: Khả dụng", gateway.system_prompt)
+        self.assertIn("ClickHouse: Khả dụng", gateway.system_prompt)
+        self.assertIn("External PostgreSQL: Khả dụng", gateway.system_prompt)
+        self.assertIn("Sandbox Python", gateway.system_prompt)
 
     async def test_call_llm_gateway_streams_text_delta_custom_events(self) -> None:
         from app.agent.nodes import AgentNodes
@@ -738,6 +1571,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch("app.agent.nodes.RunStepRepository.start_step"),
             patch("app.agent.nodes.RunStepRepository.complete_step"),
             patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
             patch("app.agent.nodes.get_stream_writer", return_value=custom_events.append),
         ):
             result = await AgentNodes.call_llm_gateway(
@@ -792,6 +1626,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
             patch("app.agent.nodes.RunStepRepository.start_step"),
             patch("app.agent.nodes.RunStepRepository.complete_step") as complete_step,
+            patch("app.agent.nodes.MessageRepository.save_message"),
             patch(
                 "app.agent.nodes.execute_builtin_tool", new=AsyncMock(return_value=("ran", False))
             ) as run_tool,
@@ -801,9 +1636,104 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
                 {"configurable": {"db": FakeDb()}},
             )
 
-        self.assertIn("requires human approval", result["execution_error"])
+        self.assertNotIn("execution_error", result)
+        self.assertIn("TOOL_REQUIRES_APPROVAL", result["messages"][0].content)
+        self.assertIn("requires human approval", result["messages"][0].content)
         complete_step.assert_called_once()
         self.assertEqual("failed", complete_step.call_args.kwargs["status"])
+        run_tool.assert_not_awaited()
+
+    async def test_execute_tools_rejects_invalid_tool_arguments_before_runtime(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        run_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        response = LLMResponse(
+            provider="openai",
+            model="mimo-router-model",
+            finish_reason=FinishReason.TOOL,
+            tool_calls=[
+                NormalizedToolCall(
+                    id="call-invalid",
+                    name="query_clickhouse",
+                    arguments={},
+                )
+            ],
+        )
+        state = AgentState(
+            session_id=str(session_id),
+            run_id=str(run_id),
+            current_step_index=1,
+            latest_response=response,
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+
+        with (
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.RunStepRepository.start_step"),
+            patch("app.agent.nodes.RunStepRepository.complete_step") as complete_step,
+            patch("app.agent.nodes.MessageRepository.save_message"),
+            patch(
+                "app.agent.nodes.execute_builtin_tool", new=AsyncMock(return_value=("ran", False))
+            ) as run_tool,
+        ):
+            result = await AgentNodes.execute_tools(
+                state,
+                {"configurable": {"db": FakeDb()}},
+            )
+
+        self.assertNotIn("execution_error", result)
+        self.assertEqual(1, len(result["messages"]))
+        self.assertTrue(result["messages"][0].tool_is_error)
+        self.assertIn("TOOL_VALIDATION_ERROR", result["messages"][0].content)
+        self.assertIn("Invalid tool arguments", result["messages"][0].content)
+        complete_step.assert_called_once()
+        self.assertEqual("failed", complete_step.call_args.kwargs["status"])
+        run_tool.assert_not_awaited()
+
+    async def test_suspend_for_human_rejects_invalid_tool_arguments_before_approval(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        run_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        response = LLMResponse(
+            provider="openai",
+            model="mimo-router-model",
+            finish_reason=FinishReason.TOOL,
+            tool_calls=[
+                NormalizedToolCall(
+                    id="call-invalid-danger",
+                    name="run_ssh_command",
+                    arguments={"command": "systemctl restart x"},
+                )
+            ],
+        )
+        state = AgentState(
+            session_id=str(session_id),
+            run_id=str(run_id),
+            current_step_index=1,
+            latest_response=response,
+        )
+        error_step = types.SimpleNamespace(id=uuid.uuid4())
+
+        with (
+            patch("app.agent.nodes.ToolCallRepository.get_by_idempotency_key", return_value=None),
+            patch(
+                "app.agent.nodes.RunStepRepository.create_error_step", return_value=error_step
+            ) as create_error_step,
+            patch("app.agent.nodes.ApprovalRepository.create_request") as create_approval,
+            patch(
+                "app.agent.nodes.execute_builtin_tool", new=AsyncMock(return_value=("ran", False))
+            ) as run_tool,
+        ):
+            result = await AgentNodes.suspend_for_human(
+                state,
+                {"configurable": {"db": FakeDb()}},
+            )
+
+        self.assertIn("Invalid tool arguments", result["execution_error"])
+        create_error_step.assert_called_once()
+        create_approval.assert_not_called()
         run_tool.assert_not_awaited()
 
     async def test_suspension_advances_step_index(self) -> None:
@@ -853,7 +1783,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, result["current_step_index"])
         create_request.assert_called_once()
 
-    async def test_mixed_tool_batch_only_requests_approval_for_dangerous_tools(self) -> None:
+    async def test_mixed_tool_batch_requests_approval_for_llm_generated_payloads(self) -> None:
         from app.agent.nodes import AgentNodes
 
         run_id = uuid.uuid4()
@@ -900,7 +1830,23 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
                 "app.agent.nodes.execute_builtin_tool", new=AsyncMock(return_value=("rows", False))
             ) as run_tool,
             patch("app.agent.nodes.ApprovalRepository.create_request") as create_request,
-            patch("app.agent.nodes.interrupt", return_value={"messages": []}),
+            patch(
+                "app.agent.nodes.interrupt",
+                return_value={
+                    "messages": [
+                        LLMMessage(
+                            role=MessageRole.TOOL,
+                            content="approved",
+                            tool_call_id="call-read",
+                        ).model_dump(mode="json"),
+                        LLMMessage(
+                            role=MessageRole.TOOL,
+                            content="approved",
+                            tool_call_id="call-danger",
+                        ).model_dump(mode="json"),
+                    ]
+                },
+            ),
         ):
             result = await AgentNodes.suspend_for_human(
                 state,
@@ -908,8 +1854,87 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(3, result["current_step_index"])
-        create_request.assert_called_once()
-        run_tool.assert_awaited_once()
+        self.assertEqual(2, create_request.call_count)
+        run_tool.assert_not_awaited()
+        self.assertEqual(["call-read", "call-danger"], [m.tool_call_id for m in result["messages"]])
+
+
+class InterventionRepositoryRegressionTests(unittest.TestCase):
+    def test_mark_undelivered_preserves_message_and_records_failure(self) -> None:
+        from app.database.repositories.messages import MessageRepository
+
+        message = types.SimpleNamespace(
+            metadata_json={"kind": "operator_intervention", "intervention_status": "pending"}
+        )
+
+        class TrackingDb:
+            def __init__(self):
+                self.flush_count = 0
+                self.commit_count = 0
+
+            def flush(self):
+                self.flush_count += 1
+
+            def commit(self):
+                self.commit_count += 1
+
+        db = TrackingDb()
+        with patch.object(
+            MessageRepository,
+            "list_pending_interventions",
+            return_value=[message],
+        ):
+            count = MessageRepository.mark_pending_interventions_undelivered(
+                db,
+                uuid.uuid4(),
+                reason="provider failed",
+                commit=False,
+            )
+
+        self.assertEqual(1, count)
+        self.assertEqual("undelivered", message.metadata_json["intervention_status"])
+        self.assertEqual("provider failed", message.metadata_json["delivery_error"])
+        self.assertEqual(1, db.flush_count)
+        self.assertEqual(0, db.commit_count)
+
+    def test_requeue_undelivered_intervention_tracks_original_run(self) -> None:
+        from app.database.repositories.messages import MessageRepository
+
+        old_run_id = uuid.uuid4()
+        new_run_id = uuid.uuid4()
+        message = types.SimpleNamespace(
+            run_id=old_run_id,
+            metadata_json={
+                "kind": "operator_intervention",
+                "intervention_status": "undelivered",
+            },
+        )
+
+        class TrackingDb:
+            def __init__(self):
+                self.commit_count = 0
+
+            def commit(self):
+                self.commit_count += 1
+
+        db = TrackingDb()
+        with patch.object(
+            MessageRepository,
+            "list_undelivered_interventions",
+            return_value=[message],
+            create=True,
+        ):
+            count = MessageRepository.requeue_undelivered_interventions(
+                db,
+                session_id=uuid.uuid4(),
+                run_id=new_run_id,
+            )
+
+        self.assertEqual(1, count)
+        self.assertEqual(new_run_id, message.run_id)
+        self.assertEqual("pending", message.metadata_json["intervention_status"])
+        self.assertEqual(str(old_run_id), message.metadata_json["requeued_from_run_id"])
+        self.assertEqual(1, db.commit_count)
 
 
 class AgentStateRegressionTests(unittest.TestCase):
@@ -957,7 +1982,6 @@ class ApprovalExpiryRegressionTests(unittest.TestCase):
             FakeApprovalDb(approval),
             uuid.uuid4(),
             status="approved",
-            resolved_by="operator",
         )
 
         self.assertIsNone(result)

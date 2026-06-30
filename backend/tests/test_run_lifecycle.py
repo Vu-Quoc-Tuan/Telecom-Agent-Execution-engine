@@ -6,6 +6,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
+from sqlalchemy.dialects import postgresql
+
 from app.common.enums import RunStatus
 
 
@@ -19,6 +21,7 @@ class FakeDb:
         return self.run
 
     def scalar(self, statement):
+        self.statement = statement
         return self.run
 
     def commit(self) -> None:
@@ -82,6 +85,26 @@ class RunRepositoryLifecycleTests(unittest.TestCase):
         self.assertIs(updated, run)
         self.assertEqual(RunStatus.CANCELLED.value, run.status)
         self.assertEqual("Cancelled by operator.", run.error_message)
+
+    def test_repeated_terminal_status_preserves_completed_at(self) -> None:
+        from app.database.repositories.runs import RunRepository
+
+        run = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            status=RunStatus.COMPLETED.value,
+            completed_at=datetime.now(UTC),
+            error_message=None,
+        )
+        db = FakeDb(run)
+
+        RunRepository.update_run_status(
+            db,
+            run.id,
+            status=RunStatus.COMPLETED.value,
+        )
+
+        sql = str(db.statement.compile(dialect=postgresql.dialect()))
+        self.assertIn("coalesce(agent_runs.completed_at, now())", sql.lower())
 
 
 class RunLifecycleServiceTests(unittest.TestCase):

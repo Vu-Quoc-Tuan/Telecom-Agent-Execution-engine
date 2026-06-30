@@ -49,7 +49,9 @@ class ContextWindowCompactionTests(unittest.TestCase):
             LLMMessage(role=MessageRole.TOOL, tool_call_id="call-old", content=old_tool_output),
             LLMMessage(role=MessageRole.USER, content="giờ check node mới"),
             LLMMessage(role=MessageRole.ASSISTANT, content=None, tool_calls=[recent_tool_call]),
-            LLMMessage(role=MessageRole.TOOL, tool_call_id="call-recent", content="load average 0.2"),
+            LLMMessage(
+                role=MessageRole.TOOL, tool_call_id="call-recent", content="load average 0.2"
+            ),
         ]
 
         plan = compact_messages_if_needed(

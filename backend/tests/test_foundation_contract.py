@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from uuid import uuid4
 
 from sqlalchemy import inspect
 
 from app.common.enums import StepType
 from app.config import Settings
+from app.database.models.approval_requests import ApprovalRequest
 from app.database.models.audit_logs import AuditLog
 from app.database.models.chat_messages import ChatMessage
 from app.database.models.run_steps import RunStep
@@ -20,8 +24,28 @@ class SettingsContractTests(unittest.TestCase):
         self.assertEqual("", settings.EXTERNAL_POSTGRES_HOST)
         self.assertEqual("", settings.SSH_HOST)
 
+    def test_build_llm_gateway_normalizes_default_provider_case(self) -> None:
+        from app.config import build_llm_gateway
+
+        settings = Settings(
+            _env_file=None,
+            PROVIDER="OpenAI",
+            OPENAI_API_KEY="sk-test",
+            ANTHROPIC_API_KEY="",
+        )
+
+        gateway = build_llm_gateway(settings)
+
+        self.assertEqual("openai", gateway.get_adapter().provider)
+
 
 class ModelContractTests(unittest.TestCase):
+    def test_approval_request_tracks_multi_confirmation_progress(self) -> None:
+        columns = {column.key for column in inspect(ApprovalRequest).columns}
+
+        self.assertIn("required_confirmations", columns)
+        self.assertIn("confirmation_count", columns)
+
     def test_skill_persists_connector_and_risk_metadata(self) -> None:
         columns = {column.key for column in inspect(Skill).columns}
 
@@ -83,6 +107,108 @@ class RepositoryImportTests(unittest.TestCase):
         self.assertTrue(RunStepRepository)
         self.assertTrue(SessionRepository)
         self.assertTrue(ToolCallRepository)
+
+    def test_skill_repository_can_delete_test_skill_records(self) -> None:
+        from app.database.repositories.skills import SkillRepository
+
+        skill_id = uuid4()
+        skill = SimpleNamespace(id=skill_id)
+
+        class FakeDb:
+            def __init__(self):
+                self.deleted = None
+                self.committed = False
+
+            def get(self, model, record_id):
+                return skill if record_id == skill_id else None
+
+            def delete(self, record):
+                self.deleted = record
+
+            def commit(self):
+                self.committed = True
+
+        db = FakeDb()
+
+        self.assertTrue(SkillRepository.delete_skill(db, skill_id))
+        self.assertIs(skill, db.deleted)
+        self.assertTrue(db.committed)
+        self.assertFalse(SkillRepository.delete_skill(FakeDb(), uuid4()))
+
+    def test_tool_call_repository_aggregates_skill_package_telemetry(self) -> None:
+        from app.database.repositories.tool_calls import ToolCallRepository
+
+        created_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+        class FakeDb:
+            statement = None
+
+            def execute(self, statement):
+                self.statement = statement
+                return self
+
+            def all(self):
+                return [
+                    SimpleNamespace(
+                        matched_skill_name="no-alarm-enrichment",
+                        call_count=2,
+                        average_latency_ms=200,
+                        error_count=1,
+                        last_called_at=created_at,
+                    )
+                ]
+
+        telemetry = ToolCallRepository.get_skill_telemetry(
+            fake_db := FakeDb(),
+            ["no-alarm-enrichment"],
+        )
+
+        self.assertEqual(2, telemetry["no-alarm-enrichment"]["call_count"])
+        self.assertEqual(200, telemetry["no-alarm-enrichment"]["average_latency_ms"])
+        self.assertEqual(0.5, telemetry["no-alarm-enrichment"]["error_rate"])
+        self.assertEqual(1, telemetry["no-alarm-enrichment"]["error_count"])
+        statement_sql = str(fake_db.statement).upper()
+        self.assertIn("GROUP BY", statement_sql)
+        self.assertIn("CREATED_AT", statement_sql)
+
+    def test_complete_step_merges_existing_metadata(self) -> None:
+        from app.database.repositories.run_steps import RunStepRepository
+
+        step = SimpleNamespace(
+            id=uuid4(),
+            status="running",
+            summary=None,
+            metadata_json={"tool_name": "query_clickhouse", "started_by": "agent"},
+            completed_at=None,
+        )
+
+        class FakeDb:
+            def get(self, model, step_id):
+                return step
+
+            def commit(self):
+                pass
+
+            def refresh(self, record):
+                pass
+
+        completed = RunStepRepository.complete_step(
+            FakeDb(),
+            step.id,
+            status="completed",
+            summary="ok",
+            metadata={"usage": {"tokens": 10}, "started_by": "runtime"},
+        )
+
+        self.assertIs(completed, step)
+        self.assertEqual(
+            {
+                "tool_name": "query_clickhouse",
+                "started_by": "runtime",
+                "usage": {"tokens": 10},
+            },
+            step.metadata_json,
+        )
 
 
 if __name__ == "__main__":

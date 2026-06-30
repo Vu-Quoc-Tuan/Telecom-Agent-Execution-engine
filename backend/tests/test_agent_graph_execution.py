@@ -68,7 +68,6 @@ class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
     @patch("app.services.agent_execution.RunRepository.create_run")
     @patch("app.services.agent_execution.RunRepository.increment_step_count")
     @patch("app.services.agent_execution.RunRepository.update_run_status")
-    @patch("app.services.agent_execution.RunRepository.attach_langfuse_trace")
     @patch("app.services.agent_execution.AgentExecutionService.get_agent_app")
     @patch("app.services.agent_execution.AgentExecutionService._serialize_steps")
     @patch("app.services.agent_execution.RunStepRepository.create_error_step")
@@ -77,7 +76,6 @@ class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         mock_err_step,
         mock_serialize,
         mock_get_app,
-        mock_attach_trace,
         mock_update_run,
         mock_inc_step,
         mock_create_run,
@@ -120,7 +118,6 @@ class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
     @patch("app.services.agent_execution.RunRepository.create_run")
     @patch("app.services.agent_execution.RunRepository.increment_step_count")
     @patch("app.services.agent_execution.RunRepository.update_run_status")
-    @patch("app.services.agent_execution.RunRepository.attach_langfuse_trace")
     @patch("app.services.agent_execution.AgentExecutionService.get_agent_app")
     @patch("app.services.agent_execution.AgentExecutionService._serialize_steps")
     @patch("app.services.agent_execution.RunStepRepository.create_error_step")
@@ -129,7 +126,6 @@ class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         mock_err_step,
         mock_serialize,
         mock_get_app,
-        mock_attach_trace,
         mock_update_run,
         mock_inc_step,
         mock_create_run,
@@ -170,22 +166,22 @@ class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("timeline_updated", events[3][0])
         self.assertEqual("run_completed", events[4][0])
 
+    @patch("app.services.agent_execution.MessageRepository.mark_pending_interventions_undelivered")
     @patch("app.services.agent_execution.SessionRepository.get_session_by_id")
     @patch("app.services.agent_execution.MessageRepository.save_message")
     @patch("app.services.agent_execution.RunRepository.create_run")
     @patch("app.services.agent_execution.RunRepository.update_run_status")
     @patch("app.services.agent_execution.AgentExecutionService.get_agent_app")
-    @patch("app.services.agent_execution.RunRepository.attach_langfuse_trace")
     @patch("app.services.agent_execution.RunStepRepository.create_error_step")
     async def test_run_agent_lifecycle_execution_error(
         self,
         mock_err_step,
-        mock_attach_trace,
         mock_get_app,
         mock_update_run,
         mock_create_run,
         mock_save_msg,
         mock_get_session,
+        mock_mark_undelivered,
     ):
         mock_get_session.return_value = True
         fake_run = FakeRunRecord()
@@ -215,6 +211,12 @@ class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0][0], "run_started")
         self.assertEqual(events[-1][0], "run_failed")
         self.assertEqual(events[-1][1]["error"], "Tool execution failed")
+        mock_mark_undelivered.assert_called_once_with(
+            unittest.mock.ANY,
+            fake_run.id,
+            reason="Tool execution failed",
+            commit=False,
+        )
 
 
 if __name__ == "__main__":

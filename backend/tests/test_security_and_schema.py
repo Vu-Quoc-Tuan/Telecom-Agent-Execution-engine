@@ -3,8 +3,9 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from app.agent.safety import AgentSafetyGuard, SkillRiskClassifier
-from app.common.enums import RiskLevel
+from app.agent.safety import AgentSafetyGuard
+from app.common.enums import ExecutionMode
+from app.common.exceptions import SafetyViolationError
 from app.observability.redaction import DataRedactor
 from app.sandbox.domain_validator import (
     SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT,
@@ -37,6 +38,23 @@ class SecurityAnalyzerTests(unittest.TestCase):
             is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
             self.assertFalse(is_clean, module)
             self.assertTrue(any(module in f for f in findings), module)
+
+    def test_blocks_background_execution_primitives(self) -> None:
+        for module in (
+            "asyncio",
+            "concurrent.futures",
+            "multiprocessing",
+            "threading",
+            "sched",
+            "atexit",
+        ):
+            code = f"import {module}\n\ndef run():\n    return 1\n"
+            is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
+            self.assertFalse(is_clean, module)
+            self.assertTrue(
+                any(module.split(".")[0] in finding for finding in findings),
+                module,
+            )
 
     def test_blocks_builtins_subscript_bypass(self) -> None:
         code = "def run(ssh_client):\n    return __builtins__['eval']('1+1')\n"
@@ -71,6 +89,32 @@ class SecurityAnalyzerTests(unittest.TestCase):
 
         self.assertTrue(is_clean, findings)
 
+    def test_allows_read_only_open_of_workspace_args(self) -> None:
+        for snippet in (
+            "import json\nargs = json.load(open('args.json'))\n",
+            "args = open('args.json', 'r').read()\n",
+            "args = open('data/lookup.csv', mode='rt').read()\n",
+            "args = open('args.json', 'rb').read()\n",
+        ):
+            is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(snippet)
+            self.assertTrue(is_clean, f"Rejected safe open: {snippet} -> {findings}")
+
+    def test_blocks_unsafe_open_calls(self) -> None:
+        unsafe_snippets = (
+            "open('/etc/hosts')\n",  # absolute path
+            "open('../secret.txt')\n",  # path traversal
+            "open('out.txt', 'w')\n",  # write mode
+            "open('out.txt', 'a')\n",  # append mode
+            "open('out.txt', 'r+')\n",  # read/write
+            "p = 'args.json'\nopen(p)\n",  # non-literal path
+            "open('args.json', mode=some_var)\n",  # non-literal mode
+            "open()\n",  # no args
+        )
+        for snippet in unsafe_snippets:
+            is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(snippet)
+            self.assertFalse(is_clean, f"Allowed unsafe open: {snippet}")
+            self.assertTrue(any("open()" in f for f in findings), f"{snippet} -> {findings}")
+
 
 class DomainValidatorPromptTests(unittest.IsolatedAsyncioTestCase):
     async def test_llm_domain_judge_uses_dedicated_system_prompt(self) -> None:
@@ -99,6 +143,46 @@ class DomainValidatorPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT, gateway.system_prompt)
         self.assertEqual(0.9, result.domain_score)
 
+    async def test_llm_domain_judge_accepts_common_json_variants(self) -> None:
+        class VariantGateway:
+            async def invoke(self, messages, system_prompt=None):
+                return SimpleNamespace(
+                    content=(
+                        "```json\n"
+                        '{"result": {"score": "85%", "explanation": "telecom alarm enrichment", '
+                        '"suspicious": ["None"]}}\n'
+                        "```"
+                    )
+                )
+
+        result = await TelecomDomainValidator.invoke_llm_domain_judge(
+            VariantGateway(),
+            "no-alarm-enrichment",
+            "Enrich no alarm telecom cases",
+            "def run(): return 'ok'",
+        )
+
+        self.assertEqual(0.85, result.domain_score)
+        self.assertEqual("telecom alarm enrichment", result.reason)
+        self.assertEqual("None", result.suspicious_points)
+
+    async def test_llm_domain_judge_failure_includes_redacted_preview(self) -> None:
+        class BadGateway:
+            async def invoke(self, messages, system_prompt=None):
+                return SimpleNamespace(content="password=secret-value I cannot return JSON")
+
+        result = await TelecomDomainValidator.invoke_llm_domain_judge(
+            BadGateway(),
+            "no-alarm-enrichment",
+            "Enrich no alarm telecom cases",
+            "def run(): return 'ok'",
+        )
+
+        self.assertEqual(0.0, result.domain_score)
+        self.assertIn("Raw preview", result.reason)
+        self.assertIn("password=[REDACTED]", result.reason)
+        self.assertNotIn("secret-value", result.reason)
+
 
 class SafetyGuardTests(unittest.TestCase):
     def test_rejects_command_chaining_even_when_each_fragment_looks_safe(self) -> None:
@@ -114,15 +198,6 @@ class SafetyGuardTests(unittest.TestCase):
 
         self.assertNotIn("secret-value", sanitized)
         self.assertNotIn("abc123", sanitized)
-
-    def test_classifies_mutating_skill_as_dangerous(self) -> None:
-        risk = SkillRiskClassifier.classify(
-            name="restart_service",
-            description="Restart a failed service on a telecom node",
-            command="systemctl restart vdt",
-        )
-
-        self.assertEqual(RiskLevel.DANGEROUS_ACTION, risk)
 
     def test_redacts_unquoted_credentials_in_log_text(self) -> None:
         raw = (
@@ -156,16 +231,125 @@ class SafetyGuardTests(unittest.TestCase):
         self.assertIsNone(err)
 
         # Allowed introspection commands
-        for cmd in ["DESCRIBE TABLE alarm", "DESC alarm_data.station", "SHOW TABLES", "EXPLAIN SELECT 1"]:
+        for cmd in [
+            "DESCRIBE TABLE alarm",
+            "DESC alarm_data.station",
+            "SHOW TABLES",
+            "EXPLAIN SELECT 1",
+        ]:
             is_safe, err = AgentSafetyGuard.verify_read_only_sql(cmd)
             self.assertTrue(is_safe, f"Failed on: {cmd}")
             self.assertIsNone(err)
 
         # Prohibited mutations
-        for cmd in ["INSERT INTO station VALUES (1)", "DROP TABLE station", "UPDATE station SET name = 'abc'"]:
+        for cmd in [
+            "INSERT INTO station VALUES (1)",
+            "DROP TABLE station",
+            "UPDATE station SET name = 'abc'",
+        ]:
             is_safe, err = AgentSafetyGuard.verify_read_only_sql(cmd)
             self.assertFalse(is_safe, f"Allowed prohibited: {cmd}")
             self.assertIsNotNone(err)
+
+    def test_verify_read_only_sql_allows_identifier_like_mutation_keywords(self) -> None:
+        allowed_queries = [
+            "SELECT update_count, delete_count FROM metrics",
+            "SELECT replace(site_name, 'old', 'new') FROM station",
+            "SHOW CREATE TABLE station",
+        ]
+        for sql in allowed_queries:
+            is_safe, err = AgentSafetyGuard.verify_read_only_sql(sql)
+            self.assertTrue(is_safe, f"Rejected read-only query: {sql}: {err}")
+            self.assertIsNone(err)
+
+    def test_verify_read_only_sql_rejects_export_and_explain_mutations(self) -> None:
+        prohibited_queries = [
+            "SELECT * FROM station INTO OUTFILE '/tmp/station.tsv'",
+            "EXPLAIN INSERT INTO station VALUES (1)",
+            "WITH removed AS (DELETE FROM station RETURNING *) SELECT * FROM removed",
+            "WITH data AS (SELECT 1) DELETE FROM station",
+        ]
+        for sql in prohibited_queries:
+            is_safe, err = AgentSafetyGuard.verify_read_only_sql(sql)
+            self.assertFalse(is_safe, f"Allowed prohibited query: {sql}")
+            self.assertIsNotNone(err)
+
+    def test_classify_sql_edge_cases(self) -> None:
+        # Empty SQL raises SafetyViolationError
+        with self.assertRaises(SafetyViolationError):
+            AgentSafetyGuard.classify_sql("")
+        with self.assertRaises(SafetyViolationError):
+            AgentSafetyGuard.classify_sql("   ")
+
+        # Multiple statements raise SafetyViolationError
+        with self.assertRaises(SafetyViolationError):
+            AgentSafetyGuard.classify_sql("SELECT 1; SELECT 2;")
+
+        # Read-only SQL returns ExecutionMode.AUTO_EXECUTE
+        self.assertEqual(
+            ExecutionMode.AUTO_EXECUTE, AgentSafetyGuard.classify_sql("SELECT * FROM station")
+        )
+
+        # Mutation statement returns ExecutionMode.REQUIRE_APPROVAL
+        self.assertEqual(
+            ExecutionMode.REQUIRE_APPROVAL,
+            AgentSafetyGuard.classify_sql("UPDATE station SET name = 'abc'"),
+        )
+        self.assertEqual(
+            ExecutionMode.REQUIRE_APPROVAL, AgentSafetyGuard.classify_sql("DROP TABLE alarms")
+        )
+
+        # Unsupported statements raise SafetyViolationError
+        with self.assertRaises(SafetyViolationError) as ctx:
+            AgentSafetyGuard.classify_sql("INVALID_CMD table")
+        self.assertIn("Unsupported SQL statement", str(ctx.exception))
+
+    def test_classify_ssh_command_edge_cases(self) -> None:
+        # Empty command raises SafetyViolationError
+        with self.assertRaises(SafetyViolationError):
+            AgentSafetyGuard.classify_ssh_command("")
+
+        # Chained command raises SafetyViolationError
+        with self.assertRaises(SafetyViolationError):
+            AgentSafetyGuard.classify_ssh_command("hostname && whoami")
+
+        # Read-only command returns ExecutionMode.AUTO_EXECUTE
+        self.assertEqual(
+            ExecutionMode.AUTO_EXECUTE, AgentSafetyGuard.classify_ssh_command("hostname")
+        )
+        self.assertEqual(ExecutionMode.AUTO_EXECUTE, AgentSafetyGuard.classify_ssh_command("df -h"))
+
+        # Mutation/sensitive command returns ExecutionMode.REQUIRE_APPROVAL
+        self.assertEqual(
+            ExecutionMode.REQUIRE_APPROVAL,
+            AgentSafetyGuard.classify_ssh_command("systemctl restart nginx"),
+        )
+
+    def test_required_ssh_confirmations(self) -> None:
+        # Auto execute -> 0 confirmations
+        self.assertEqual(0, AgentSafetyGuard.required_ssh_confirmations("hostname"))
+        # Standard mutation -> 1 confirmation
+        self.assertEqual(1, AgentSafetyGuard.required_ssh_confirmations("systemctl restart nginx"))
+        # Critical command -> 2 confirmations
+        self.assertEqual(2, AgentSafetyGuard.required_ssh_confirmations("rm -rf /"))
+
+    def test_truncate_output(self) -> None:
+        text = "a" * 20000
+        truncated, was_truncated = AgentSafetyGuard.truncate_output(text, max_characters=1000)
+        self.assertTrue(was_truncated)
+        self.assertEqual(
+            1000
+            + len(
+                "\n\n... [HỆ THỐNG CẮT GIẢM: Nội dung log quá dài đã bị cắt bớt để bảo vệ an toàn bộ nhớ Agent] ..."
+            ),
+            len(truncated),
+        )
+
+        # Not truncated
+        short_text = "hello"
+        truncated, was_truncated = AgentSafetyGuard.truncate_output(short_text, max_characters=1000)
+        self.assertFalse(was_truncated)
+        self.assertEqual("hello", truncated)
 
 
 if __name__ == "__main__":

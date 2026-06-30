@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+import unittest.mock
 import zipfile
 
 from sqlalchemy.exc import IntegrityError
@@ -29,6 +30,7 @@ class FakeSkill:
         self.skill_md = None
         self.frontmatter = None
         self.bundled_files = None
+        self.script_manifest = None
         self.status = None
         self.is_malicious = False
         self.security_review_log = None
@@ -54,6 +56,7 @@ class FakeSkillRepository:
         skill_md: str,
         frontmatter: dict | None = None,
         bundled_files: dict | None = None,
+        script_manifest: dict | None = None,
         version: str = "1.0.0",
     ):
         skill = FakeSkill()
@@ -62,6 +65,7 @@ class FakeSkillRepository:
         skill.skill_md = skill_md
         skill.frontmatter = frontmatter or {}
         skill.bundled_files = bundled_files or {}
+        skill.script_manifest = script_manifest or {}
         skill.version = version
         skill.status = "uploaded"
         self.created.append(skill)
@@ -114,11 +118,17 @@ Instructions here.
             {"scripts/helper.py": "def run():\n    return 1\n"},
         )
 
-        result = await service.upload_skill(
-            db=object(),
-            llm_gateway=FakeLLMGateway(),
-            command=SkillUploadCommand(zip_bytes=zip_bytes),
-        )
+        # Ép sandbox không khả dụng để kiểm thử nhánh pending_sandbox một cách tất định,
+        # không phụ thuộc việc máy chạy test có Docker hay không.
+        with unittest.mock.patch(
+            "app.sandbox.docker_executor.build_sandbox_executor_from_settings",
+            return_value=None,
+        ):
+            result = await service.upload_skill(
+                db=object(),
+                llm_gateway=FakeLLMGateway(),
+                command=SkillUploadCommand(zip_bytes=zip_bytes),
+            )
 
         self.assertEqual(result.status, "PENDING_REVIEW")
         self.assertEqual(repository.created[0].name, "collect-node-alarm")
@@ -127,7 +137,61 @@ Instructions here.
             repository.created[0].bundled_files["scripts/helper.py"]["encoding"],
             "utf-8",
         )
+        manifest = repository.created[0].script_manifest
+        self.assertIn("scripts/helper.py", manifest)
+        self.assertEqual("pending_sandbox", manifest["scripts/helper.py"]["status"])
+        self.assertIn("sha256:", manifest["scripts/helper.py"]["script_hash"])
+        self.assertEqual(
+            {"type": "object", "additionalProperties": True},
+            manifest["scripts/helper.py"]["input_schema"],
+        )
         self.assertEqual(repository.updated[0].status, "testing")
+
+    async def test_sandbox_script_failure_rejects_package_when_sandbox_is_available(self) -> None:
+        from app.sandbox.docker_executor import SandboxExecutionResult
+        from app.services.skills import (
+            SkillUploadCommand,
+            SkillValidationError,
+            SkillValidationService,
+        )
+
+        class FailingSandboxExecutor:
+            async def validate_skill_script(self, *args, **kwargs):
+                return SandboxExecutionResult(
+                    stdout="",
+                    stderr="boom",
+                    exit_code=1,
+                )
+
+        repository = FakeSkillRepository()
+        service = SkillValidationService(skill_repository=repository)
+        skill_md = """---
+name: check-kpis
+description: Check telecom KPI alarms for NOC troubleshooting. alarm alert kpi
+---
+# Check KPIs
+Run `scripts/check.py`.
+"""
+
+        with unittest.mock.patch(
+            "app.sandbox.docker_executor.build_sandbox_executor_from_settings",
+            return_value=FailingSandboxExecutor(),
+        ):
+            with self.assertRaises(SkillValidationError) as ctx:
+                await service.upload_skill(
+                    db=object(),
+                    llm_gateway=FakeLLMGateway(),
+                    command=SkillUploadCommand(
+                        zip_bytes=self._create_zip(
+                            skill_md,
+                            {"scripts/check.py": "print('ok')\n"},
+                        )
+                    ),
+                )
+
+        self.assertEqual("REJECTED", ctx.exception.status)
+        self.assertIn("sandbox validation", ctx.exception.message)
+        self.assertEqual(repository.updated[0].status, "rejected")
 
     async def test_malicious_skill_is_rejected_and_recorded_once(self) -> None:
         from app.services.skills import (
@@ -343,13 +407,20 @@ Follow the NOC checklist.
                 self._zip({"check-kpis/evilSKILL.md": self._skill_md()})
             )
 
-    def test_requires_name_to_match_parent_folder(self) -> None:
-        from app.services.skills import SkillValidationError, SkillValidationService
+    def test_allows_folder_name_to_differ_from_skill_name(self) -> None:
+        from app.services.skills import SkillValidationService
 
-        with self.assertRaises(SkillValidationError):
-            SkillValidationService().parse_package(
-                self._zip({"other-folder/SKILL.md": self._skill_md()})
+        package = SkillValidationService().parse_package(
+            self._zip(
+                {
+                    "NoAlarmEnrichment/SKILL.md": self._skill_md("check-kpis"),
+                    "NoAlarmEnrichment/scripts/check.py": "def run():\n    return 'ok'\n",
+                }
             )
+        )
+
+        self.assertEqual("check-kpis", package.name)
+        self.assertIn("scripts/check.py", package.bundled_files)
 
     def test_rejects_non_mapping_frontmatter(self) -> None:
         from app.services.skills import SkillValidationError, SkillValidationService
