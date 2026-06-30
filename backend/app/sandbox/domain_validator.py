@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.common.utils import extract_json_object
 from app.llm.gateway import LLMGateway
 from app.llm.schemas import LLMMessage, MessageRole
+from app.observability.redaction import DataRedactor
 
 SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT = (
     "Bạn chỉ được phép phản hồi DUY NHẤT một object JSON hợp lệ khớp chính xác "
@@ -93,26 +96,131 @@ class TelecomDomainValidator:
             system_prompt=SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT,
         )
 
-        # Parse chuỗi kết quả sang Pydantic Object để ép kiểu nghiêm ngặt
+        # Parse chuỗi kết quả sang Pydantic Object để ép kiểu nghiêm ngặt.
+        # Một số OpenAI-compatible gateway không luôn tuân thủ system prompt tuyệt đối:
+        # response có thể bị bọc markdown, đổi tên key, hoặc trả score dạng "85%".
+        # Parser bên dưới chịu các biến thể đó nhưng vẫn fail-closed nếu không thấy dữ liệu rõ ràng.
+        raw_content = response.content or ""
         try:
-            data = json.loads(cls._extract_json_object(response.content or ""))
+            data = cls._parse_judge_payload(raw_content)
             return LLMDomainJudgeOutput(**data)
-        except Exception:
+        except Exception as exc:
+            preview = DataRedactor.redact_text(raw_content).replace("\n", " ").strip()[:240]
             return LLMDomainJudgeOutput(
                 domain_score=0.0,
-                reason="Lỗi định dạng phản hồi từ LLM Judge.",
+                reason=(
+                    "Lỗi định dạng phản hồi từ LLM Judge "
+                    f"({type(exc).__name__}). Raw preview: {preview or '<empty>'}"
+                ),
                 suspicious_points="LLM Glitch",
             )
 
+    @classmethod
+    def _parse_judge_payload(cls, content: str) -> dict[str, Any]:
+        data = json.loads(extract_json_object(content))
+        data = cls._unwrap_judge_mapping(data)
+
+        score = cls._first_present(
+            data,
+            "domain_score",
+            "domainScore",
+            "score",
+            "relevance_score",
+            "telecom_score",
+            "telco_score",
+        )
+        reason = cls._first_present(data, "reason", "explanation", "rationale", "justification")
+        suspicious_points = cls._first_present(
+            data,
+            "suspicious_points",
+            "suspiciousPoints",
+            "suspicious",
+            "risks",
+            "concerns",
+        )
+
+        if score is None:
+            raise ValueError("Missing domain score.")
+
+        return {
+            "domain_score": cls._coerce_score(score),
+            "reason": str(reason or "No reason returned by LLM judge."),
+            "suspicious_points": cls._stringify_points(suspicious_points),
+        }
+
+    @classmethod
+    def _unwrap_judge_mapping(cls, data: Any) -> dict[str, Any]:
+        if isinstance(data, list) and data:
+            return cls._unwrap_judge_mapping(data[0])
+        if not isinstance(data, dict):
+            raise ValueError("LLM judge response is not an object.")
+
+        score_keys = {
+            "domain_score",
+            "domainScore",
+            "score",
+            "relevance_score",
+            "telecom_score",
+            "telco_score",
+        }
+        if score_keys.intersection(data):
+            return data
+
+        for key in ("result", "judge", "judgement", "judgment", "analysis", "output"):
+            nested = data.get(key)
+            if isinstance(nested, dict | list):
+                return cls._unwrap_judge_mapping(nested)
+
+        return data
+
     @staticmethod
-    def _extract_json_object(content: str) -> str:
-        """Trích object JSON đầu tiên trong phản hồi, chịu được markdown fence / text thừa."""
-        text = content.strip()
-        if text.startswith("```"):
-            # Gỡ ```json ... ``` nếu provider bọc trong code fence
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return text[start : end + 1]
-        return text
+    def _first_present(data: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in data:
+                return data[key]
+        return None
+
+    @staticmethod
+    def _rescale_bare_number(score: float) -> float:
+        """Diễn giải số trần theo thang đo: (1,10] là thang /10, (10,100] là thang /100."""
+        if score > 1 and score <= 10:
+            return score / 10
+        if score > 10:
+            return score / 100
+        return score
+
+    @classmethod
+    def _coerce_score(cls, value: Any) -> float:
+        if isinstance(value, bool):
+            raise ValueError("Unsupported score type.")
+        if isinstance(value, int | float):
+            score = cls._rescale_bare_number(float(value))
+        elif isinstance(value, str):
+            text = value.strip()
+            percent_match = re.search(r"(-?\d+(?:\.\d+)?)\s*%", text)
+            ratio_match = re.search(r"(-?\d+(?:\.\d+)?)\s*/\s*(10|100)\b", text)
+            number_match = re.search(r"-?\d+(?:\.\d+)?", text)
+            if percent_match:
+                score = float(percent_match.group(1)) / 100
+            elif ratio_match:
+                numerator = float(ratio_match.group(1))
+                denominator = float(ratio_match.group(2))
+                score = numerator / denominator
+            elif number_match:
+                score = cls._rescale_bare_number(float(number_match.group(0)))
+            else:
+                raise ValueError("Score is not numeric.")
+        else:
+            raise ValueError("Unsupported score type.")
+
+        return max(0.0, min(score, 1.0))
+
+    @staticmethod
+    def _stringify_points(value: Any) -> str:
+        if value is None or value == "":
+            return "None"
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "; ".join(str(item) for item in value) or "None"
+        return str(value)

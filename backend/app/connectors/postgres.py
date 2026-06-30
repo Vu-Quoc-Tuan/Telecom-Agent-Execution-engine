@@ -76,6 +76,7 @@ class TelcoPostgresConnector(BaseConnector):
         params: dict | None = None,
     ) -> list[dict[str, Any]]:
         from sqlalchemy.exc import OperationalError
+
         retries = 3
         delay = 1.0
         for attempt in range(retries):

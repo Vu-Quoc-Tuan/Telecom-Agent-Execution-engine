@@ -14,6 +14,36 @@ class AdvancedASTSecurityAnalyzer:
         "requests",
         "httpx",
         "paramiko",
+        # Mạng/giao thức: http.client, ftplib... vẫn mở kết nối ra ngoài dù không
+        # đi qua socket trực tiếp -> chặn để script không exfiltrate dữ liệu.
+        "http",
+        "urllib3",
+        "aiohttp",
+        "websocket",
+        "websockets",
+        "ftplib",
+        "smtplib",
+        "poplib",
+        "imaplib",
+        "telnetlib",
+        "nntplib",
+        "xmlrpc",
+        "asyncore",
+        "asynchat",
+        "ssl",
+        "webbrowser",
+        # Đọc/ghi file qua API ngoài open(): pathlib.Path.read_text(), io.open(),
+        # tempfile, glob... đều bypass được rào open() literal-only -> chặn cả module.
+        "pathlib",
+        "io",
+        "tempfile",
+        "fileinput",
+        "glob",
+        "fnmatch",
+        "linecache",
+        "sqlite3",
+        "dbm",
+        "shelve",
         "pickle",
         "marshal",
         "dill",
@@ -29,10 +59,14 @@ class AdvancedASTSecurityAnalyzer:
         "codeop",
         "pty",
         "platform",
+        "asyncio",
+        "concurrent",
         "multiprocessing",
         "threading",
         "_thread",
+        "sched",
         "signal",
+        "atexit",
         "resource",
         "mmap",
         "fcntl",
@@ -48,7 +82,6 @@ class AdvancedASTSecurityAnalyzer:
         "exec",
         "compile",
         "__import__",
-        "open",
         "getattr",
         "setattr",
         "delattr",
@@ -59,6 +92,12 @@ class AdvancedASTSecurityAnalyzer:
         "breakpoint",
         "input",
     }
+
+    # ✅ open() được phép có điều kiện: skill script chạy trong sandbox cần đọc tham số
+    # từ workspace (ví dụ args.json mà runner ghi vào /home/user/workspace/args.json).
+    # Chỉ cho phép khi: file là chuỗi literal, đường dẫn tương đối an toàn trong workspace,
+    # và mode là chỉ-đọc. Mọi dạng open() khác (biến, ghi/append, đường dẫn tuyệt đối,
+    # vượt thư mục) đều bị chặn — xem _validate_open_call.
 
     # ✅ Một số dunder vô hại khi đứng ở dạng tên module (vd: `if __name__ == "__main__":`).
     # Khi đứng ở dạng thuộc tính (obj.__name__) thì vẫn chặn vì là mắt xích điều hướng class.
@@ -93,7 +132,11 @@ class AdvancedASTSecurityAnalyzer:
 
             # 2. Bẫy các cuộc gọi hàm (Call Nodes)
             elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in cls.DANGEROUS_CALLS:
+                if isinstance(node.func, ast.Name) and node.func.id == "open":
+                    open_error = cls._validate_open_call(node)
+                    if open_error is not None:
+                        errors.append(open_error)
+                elif isinstance(node.func, ast.Name) and node.func.id in cls.DANGEROUS_CALLS:
                     errors.append(
                         f"Dòng {node.lineno}: Tác vụ bị chặn! Không được phép tự gọi hàm nguyên bản '{node.func.id}'."
                     )
@@ -133,3 +176,54 @@ class AdvancedASTSecurityAnalyzer:
     def _is_dunder(identifier: str) -> bool:
         """True nếu định danh có dạng __xxx__ (thuộc tính/biến nội bộ của Python)."""
         return len(identifier) > 4 and identifier.startswith("__") and identifier.endswith("__")
+
+    @classmethod
+    def _validate_open_call(cls, node: ast.Call) -> str | None:
+        """Kiểm tra một lời gọi open(). Trả về thông báo lỗi nếu không an toàn, None nếu hợp lệ.
+
+        Chỉ cho phép đọc file tham số trong workspace sandbox, ví dụ
+        ``open("args.json")`` hoặc ``open("data/lookup.csv")``. Yêu cầu:
+        - tham số path là chuỗi literal (không phải biến/biểu thức),
+        - path tương đối, không tuyệt đối, không chứa '..' hoặc backslash,
+        - mode (nếu có) phải là literal chỉ-đọc, không 'w'/'a'/'x'/'+'.
+        """
+        line = node.lineno
+        deny = (
+            f"Dòng {line}: Tác vụ bị chặn! open() chỉ được phép đọc file tham số "
+            f"tương đối trong workspace (vd args.json) ở chế độ chỉ-đọc."
+        )
+
+        if not node.args:
+            return deny
+        path_node = node.args[0]
+        if not (isinstance(path_node, ast.Constant) and isinstance(path_node.value, str)):
+            return deny
+        path_value = path_node.value
+        if (
+            not path_value
+            or path_value.startswith("/")
+            or "\\" in path_value
+            or ".." in path_value.split("/")
+            or path_value.startswith("~")
+        ):
+            return deny
+
+        mode_value: str | None = None
+        if len(node.args) >= 2:
+            mode_node = node.args[1]
+            if not (isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str)):
+                return deny
+            mode_value = mode_node.value
+        for keyword in node.keywords:
+            if keyword.arg == "mode":
+                if not (
+                    isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str)
+                ):
+                    return deny
+                mode_value = keyword.value.value
+
+        if mode_value is not None:
+            normalized = mode_value.replace("t", "").replace("b", "")
+            if normalized not in {"r"}:
+                return deny
+        return None

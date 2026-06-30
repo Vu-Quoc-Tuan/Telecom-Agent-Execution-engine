@@ -61,14 +61,22 @@ class TelcoSSHConnector(BaseConnector):
         stderr_str = stderr.read().decode("utf-8", errors="ignore")
         return stdout_str, stderr_str
 
-    async def execute_command(self, command: str) -> tuple[str, str]:
+    async def execute_command(
+        self,
+        command: str,
+        *,
+        approval_confirmations: int = 0,
+    ) -> tuple[str, str]:
         """
         Hàm non-blocking chính thức dành cho Kỹ sư gọi trong kịch bản Skill động.
         Ví dụ: stdout, stderr = await ssh_client.execute_command("pm2 status")
         """
         command = AgentSafetyGuard.normalize_ssh_command(command)
         # 1. 🛡️ CHỐT CHẶN AN NINH: Kiểm tra lệnh cấm (rm -rf, shutdown,...) trước khi gửi đi
-        is_safe, error_msg = AgentSafetyGuard.verify_ssh_command(command)
+        is_safe, error_msg = AgentSafetyGuard.verify_ssh_command(
+            command,
+            approval_confirmations=approval_confirmations,
+        )
         if not is_safe:
             raise SafetyViolationError(
                 error_msg or "Blocked by Safety Guard.",
@@ -79,9 +87,21 @@ class TelcoSSHConnector(BaseConnector):
             # 2. Đẩy tác vụ I/O mạng đồng bộ của Paramiko sang Worker Thread để không làm treo API FastAPI
             stdout_str, stderr_str = await asyncio.to_thread(self._sync_execute, command)
         except Exception as e:
+            error_text = str(e)
+            guidance = ""
+            if "known_hosts" in error_text.lower():
+                guidance = (
+                    " Host key chưa được trust. Cấu hình SSH_KNOWN_HOSTS trỏ tới "
+                    "file known_hosts chứa fingerprint của server rồi restart backend."
+                )
             raise ConnectorExecutionError(
-                f"Lỗi kết nối SSH vật lý tới trạm: {str(e)}",
-                details={"host": self.host},
+                f"Lỗi kết nối SSH vật lý tới trạm: {error_text}.{guidance}",
+                details={
+                    "host": self.host,
+                    "port": self.port,
+                    "known_hosts_path": self.known_hosts_path,
+                    "auto_add_host_keys": self.auto_add_host_keys,
+                },
             ) from e
 
         # 3. Rào chắn Output Limit: Cắt giảm dữ liệu nếu log trạm trả về dài quá ngưỡng cho phép
