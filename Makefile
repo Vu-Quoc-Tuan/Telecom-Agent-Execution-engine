@@ -12,7 +12,7 @@ PROMPTFOO_ENV := PROMPTFOO_CONFIG_DIR=/tmp/telecom-promptfoo \
 
 .PHONY: help setup setup-backend setup-frontend \
 	up down restart build rebuild logs ps \
-	backend-shell frontend-shell db-shell migrate init-db \
+	frontend-shell db-shell migrate init-db \
 	dev-backend dev-frontend test test-backend test-evals test-frontend \
 	lint lint-backend lint-frontend format eval eval-online redteam \
 	clean
@@ -20,7 +20,7 @@ PROMPTFOO_ENV := PROMPTFOO_CONFIG_DIR=/tmp/telecom-promptfoo \
 help:
 	@printf "Telecom Agent make targets\n\n"
 	@printf "Docker:\n"
-	@printf "  make up              Build and start postgres, backend, frontend\n"
+	@printf "  make up              Build and start postgres + frontend (backend: make dev-backend)\n"
 	@printf "  make down            Stop compose services\n"
 	@printf "  make restart         Restart compose services\n"
 	@printf "  make build           Build compose images\n"
@@ -28,8 +28,7 @@ help:
 	@printf "  make logs            Follow compose logs\n"
 	@printf "  make ps              Show compose service status\n\n"
 	@printf "Database / shells:\n"
-	@printf "  make migrate         Run alembic upgrade head inside backend container\n"
-	@printf "  make backend-shell   Open shell in backend container\n"
+	@printf "  make migrate         Run alembic upgrade head against the configured DB\n"
 	@printf "  make frontend-shell  Open shell in frontend container\n"
 	@printf "  make db-shell        Open psql in postgres container\n\n"
 	@printf "Local dev:\n"
@@ -40,7 +39,7 @@ help:
 	@printf "  make test            Backend + eval unit tests + frontend lint/build\n"
 	@printf "  make lint            Backend and frontend lint\n"
 	@printf "  make format          Backend ruff format\n"
-	@printf "  make eval            Offline promptfoo eval\n"
+	@printf "  make eval            Promptfoo eval\n"
 	@printf "  make eval-online     Online promptfoo eval; needs EVAL_DATASET_URL\n"
 	@printf "  make redteam         Manual promptfoo redteam; needs REDTEAM_CONFIG\n"
 
@@ -53,7 +52,19 @@ setup-frontend:
 	cd $(FRONTEND_DIR) && npm ci
 
 up:
-	$(COMPOSE) up --build -d
+	@bport=$${BACKEND_PORT:-8000}; \
+	while (exec 3<>/dev/tcp/127.0.0.1/$$bport) 2>/dev/null; do \
+		echo "Backend port $$bport in use, trying $$((bport+1))"; bport=$$((bport+1)); \
+	done; \
+	fport=$${FRONTEND_PORT:-3000}; \
+	while (exec 3<>/dev/tcp/127.0.0.1/$$fport) 2>/dev/null; do \
+		echo "Frontend port $$fport in use, trying $$((fport+1))"; fport=$$((fport+1)); \
+	done; \
+	echo "Starting postgres + frontend (backend tren host: make dev-backend)"; \
+	echo "BACKEND_PORT=$$bport FRONTEND_PORT=$$fport"; \
+	BACKEND_PORT=$$bport FRONTEND_PORT=$$fport \
+	NEXT_PUBLIC_API_BASE_URL=$${NEXT_PUBLIC_API_BASE_URL:-http://127.0.0.1:$$bport/api/v1} \
+	$(COMPOSE) up --build -d postgres frontend
 
 down:
 	$(COMPOSE) down
@@ -66,7 +77,7 @@ build:
 
 rebuild:
 	$(COMPOSE) build --no-cache
-	$(COMPOSE) up -d
+	$(COMPOSE) up -d postgres frontend
 
 logs:
 	$(COMPOSE) logs -f
@@ -75,10 +86,7 @@ ps:
 	$(COMPOSE) ps
 
 migrate init-db:
-	$(COMPOSE) exec backend alembic upgrade head
-
-backend-shell:
-	$(COMPOSE) exec backend sh
+	cd $(BACKEND_DIR) && UV_CACHE_DIR=/tmp/uv-cache uv run alembic upgrade head
 
 frontend-shell:
 	$(COMPOSE) exec frontend sh

@@ -17,26 +17,6 @@ services:
       timeout: 5s
       retries: 5
 
-  backend:
-    build:
-      context: ./backend
-    container_name: telecom_agent_backend
-    restart: unless-stopped
-    env_file:
-      - path: .env
-        required: false
-      - path: .env.external
-        required: false
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-    ports:
-      - "${BACKEND_PORT:-8000}:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   frontend:
     build:
       context: ./frontend
@@ -49,8 +29,9 @@ services:
       NEXT_TELEMETRY_DISABLED: "1"
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
-    depends_on:
-      - backend
+
+# Backend chạy trên HOST bằng `make dev-backend` để có Docker CLI cho run_skill_script.
+# Browser (trên host) gọi backend qua 127.0.0.1:8000.
 
 volumes:
   postgres_app_data:

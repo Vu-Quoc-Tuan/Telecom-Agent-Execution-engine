@@ -46,9 +46,23 @@ curl -X POST http://localhost:8000/api/v1/skills/upload \
   -F 'file=@check-kpis.zip;type=application/zip'
 ```
 
-Uploaded scripts are validated and stored as skill resources; they are not executed directly.
-Infrastructure access remains in the fixed SSH, ClickHouse, and PostgreSQL tools so credentials,
-risk routing, and human approval stay under backend control.
+Uploaded scripts are untrusted until the upload pipeline validates them. The pipeline may use an LLM
+analyzer to propose how each script should be invoked and smoke-tested, but that proposal only
+becomes trusted after backend validation, Cube Sandbox execution, and human review. A script that
+passes those gates can be executed later by path as an approved skill script. The model should call
+the backend with `skill_name`, `script_path`, and JSON arguments; it should not copy script source
+into a free-form code execution tool.
+
+Runtime auto-execution is limited to approved skill scripts and backend-owned built-in
+capabilities. Model-generated Python, shell, SQL, SSH commands, wrappers, or script bodies are not
+pre-approved. They must be rejected or routed to human approval with the exact generated payload,
+even when a static scanner says they look safe. Infrastructure credentials, connector access, risk
+routing, and human approval stay under backend control.
+
+Backend-owned capabilities are fixed runners/templates with JSON arguments, for example
+`get_site_alarm_summary`, `get_site_kpi_snapshot`, `get_site_inventory`, and
+`get_node_health_snapshot`. Free-form `query_*` and `run_ssh_command` calls are proposal paths for
+human approval, not auto-run capabilities.
 
 For SSH, `node_name` should normally be a resolvable host. If operators use logical node names,
 set `SSH_NODE_HOST_MAP` as comma-separated `node=host` pairs, for example
@@ -63,9 +77,15 @@ Chat uses `POST /api/v1/chat/stream` so prompt text is not placed in the URL:
   "session_id": "00000000-0000-0000-0000-000000000000",
   "user_message": "Check current alarms for site-a",
   "provider": "openai",
-  "model": "gpt-4o"
+  "model": "gpt-4o",
+  "skill_mode": "specific",
+  "skill_name": "check-kpis"
 }
 ```
+
+The chat model picker reads `GET /api/v1/chat/options` and exposes the configured OpenAI and
+Claude adapters. Use `skill_mode: "auto"` without `skill_name` to let the agent choose a ready
+skill.
 
 ## Run Operations
 
