@@ -2,12 +2,29 @@
 
 import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ModelPicker, SkillCommandMenu } from "@/components/chat-config-menu";
+import {
+  DatabaseIcon,
+  InterveneIcon,
+  PlusIcon,
+  SendIcon,
+  ServerIcon,
+  SkillsIcon,
+  StopIcon,
+  TerminalIcon,
+  TrashIcon,
+  UploadIcon,
+  CloseIcon,
+} from "@/components/icons";
 import { MarkdownMessage } from "@/components/markdown-message";
 import { apiFetch, apiUrl } from "@/lib/api";
 import { consumeSseStream, ParsedSseEvent } from "@/lib/sse";
 import type {
   ChatMessage,
+  ChatModelOption,
+  ChatOptions,
   ChatSession,
+  ChatSkillOption,
   PendingApproval,
   PersistedChatMessage,
   ResourceItem,
@@ -38,10 +55,210 @@ function stepTone(status: string) {
   return "border-warm-border bg-surface-card";
 }
 
+function isCompletedStatus(status: string) {
+  return ["completed", "success", "done"].includes(status);
+}
+
+function isFailedStatus(status: string) {
+  return ["failed", "error", "rejected"].includes(status);
+}
+
+function statusLabel(status: string) {
+  if (isCompletedStatus(status)) return "Xong";
+  if (isFailedStatus(status)) return "Lỗi";
+  if (status === "running") return "Đang chạy";
+  if (status === "waiting_approval") return "Chờ duyệt";
+  if (status === "pending") return "Đang chờ";
+  return status;
+}
+
+function statusBadgeClass(status: string) {
+  if (isCompletedStatus(status)) {
+    return "border-status-sage/30 bg-status-sage/10 text-status-sage";
+  }
+  if (isFailedStatus(status)) {
+    return "border-status-crimson/30 bg-status-crimson/10 text-status-crimson";
+  }
+  if (["running", "pending", "waiting_approval"].includes(status)) {
+    return "border-accent-active/30 bg-accent-active/10 text-accent-active";
+  }
+  return "border-warm-border bg-code-block text-secondary-text";
+}
+
+function stepTypeLabel(step: TimelineStep) {
+  if (step.step_type === "llm_call") return "Reason";
+  if (step.step_type === "tool_call") return step.tool_name ?? "Tool";
+  if (step.step_type === "approval") return "Approval";
+  if (step.step_type === "error") return "Error";
+  return step.step_type.replaceAll("_", " ");
+}
+
+function stepIcon(step: TimelineStep) {
+  if (step.step_type === "llm_call") {
+    return (
+      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} aria-hidden>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+      </svg>
+    );
+  }
+  if (step.step_type === "tool_call") {
+    return (
+      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} aria-hidden>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+        <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+      </svg>
+    );
+  }
+  if (step.step_type === "approval") {
+    return (
+      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} aria-hidden>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+      </svg>
+    );
+  }
+  if (step.step_type === "error") {
+    return (
+      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} aria-hidden>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+      </svg>
+    );
+  }
+  return <span className="h-2 w-2 rounded-full bg-current" aria-hidden />;
+}
+
+function compactText(value: string, maxLength = 900) {
+  const compacted = value.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (compacted.length <= maxLength) return compacted;
+  return `${compacted.slice(0, maxLength).trimEnd()}\n...`;
+}
+
+function formatStepValue(value: unknown, maxLength = 900) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "string") return compactText(value, maxLength);
+  try {
+    return compactText(JSON.stringify(value, null, 2), maxLength);
+  } catch {
+    return compactText(String(value), maxLength);
+  }
+}
+
+function getStepTitle(step: TimelineStep) {
+  return step.display_title || step.name || step.tool_name || "Agent step";
+}
+
+function getStepSummary(step: TimelineStep) {
+  if (step.step_type === "llm_call") {
+    return step.summary || (step.status === "running" ? "Agent đang đọc ngữ cảnh và chọn hành động tiếp theo." : "Agent đã hoàn tất lượt suy luận.");
+  }
+  if (step.step_type === "approval") {
+    return step.summary || "Tác vụ cần người vận hành phê duyệt trước khi chạy.";
+  }
+  if (step.step_type === "tool_call") {
+    if (step.status === "running") return "Đang gọi skill/tool và chờ kết quả.";
+    if (step.status === "failed") return step.summary || "Tool trả lỗi.";
+    return step.summary || "Tool đã trả kết quả cho agent.";
+  }
+  return step.summary || "Bước đã được ghi nhận trong timeline.";
+}
+
+function pickString(value: Record<string, unknown> | null | undefined, key: string) {
+  const raw = value?.[key];
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+}
+
+function formatCount(value: number) {
+  return new Intl.NumberFormat("vi-VN").format(value);
+}
+
+function summarizeLoaderOutput(step: TimelineStep, rawOutput: string) {
+  const skillName =
+    pickString(step.tool_input, "skill_name") ??
+    rawOutput.match(/<skill_content\s+name="([^"]+)"/)?.[1] ??
+    "skill";
+  const resourceCount = rawOutput.match(/<file>/g)?.length ?? 0;
+  const lines = rawOutput.split("\n").filter(Boolean).length;
+  const resourceText = resourceCount ? ` · ${formatCount(resourceCount)} file resource` : "";
+  return `Đã nạp skill "${skillName}" · ${formatCount(rawOutput.length)} ký tự hướng dẫn · ${formatCount(lines)} dòng${resourceText}.`;
+}
+
+function summarizeSkillFileOutput(step: TimelineStep, rawOutput: string) {
+  const skillName = pickString(step.tool_input, "skill_name");
+  const filePath = pickString(step.tool_input, "file_path") ?? "resource";
+  const binary = rawOutput.startsWith("data:");
+  const size = binary ? `${formatCount(rawOutput.length)} ký tự data URL` : `${formatCount(rawOutput.length)} ký tự`;
+  return `Đã đọc ${filePath}${skillName ? ` từ skill "${skillName}"` : ""} · ${size}.`;
+}
+
+function formatToolOutput(step: TimelineStep) {
+  if (step.tool_output === null || step.tool_output === undefined) return null;
+  if (isFailedStatus(step.status) || step.is_error) {
+    return formatStepValue(step.tool_output, 520);
+  }
+  if (step.tool_name === "load_skill") return summarizeLoaderOutput(step, step.tool_output);
+  if (step.tool_name === "read_skill_file") {
+    return summarizeSkillFileOutput(step, step.tool_output);
+  }
+  if (step.tool_output === "") return "";
+  return formatStepValue(step.tool_output, 520);
+}
+
+function isSkillLoaderStep(step: TimelineStep) {
+  if (isFailedStatus(step.status) || step.is_error) return false;
+  return step.tool_name === "load_skill" || step.tool_name === "read_skill_file";
+}
+
+function currentThinkingStatus(steps: TimelineStep[], loading: boolean, streaming: boolean) {
+  if (loading) return "Đang tải timeline của run";
+  const runningStep = steps.find((step) => step.status === "running");
+  const failedStep = steps.find((step) => isFailedStatus(step.status) || step.is_error);
+  if (runningStep?.step_type === "llm_call") {
+    const hasToolResult = steps.some(
+      (step) => step.step_type === "tool_call" && isCompletedStatus(step.status),
+    );
+    return hasToolResult
+      ? "AI đang tổng hợp kết quả từ các tool"
+      : "AI đang đọc ngữ cảnh và chọn bước tiếp theo";
+  }
+  if (runningStep?.step_type === "tool_call") return `AI đang gọi ${runningStep.tool_name ?? runningStep.name}`;
+  if (runningStep?.step_type === "approval") return "Đang chờ bạn xác nhận tác vụ";
+  if (failedStep) return "Luồng xử lý gặp lỗi ở một node";
+  if (streaming) return "AI đang tổng hợp câu trả lời";
+  if (steps.length) return "Các node đã chạy xong, đang hiển thị kết quả";
+  return "Timeline sẽ xuất hiện khi backend bắt đầu chạy";
+}
+
 function ResourceIcon({ kind }: { kind: ResourceItem["kind"] }) {
-  if (kind === "ssh") return <span aria-hidden>⌁</span>;
-  if (kind === "clickhouse") return <span aria-hidden>▦</span>;
-  return <span aria-hidden>▣</span>;
+  if (kind === "ssh") return <TerminalIcon className="h-4 w-4" />;
+  if (kind === "clickhouse") return <DatabaseIcon className="h-4 w-4" />;
+  return <ServerIcon className="h-4 w-4" />;
+}
+
+function approvalToolName(approval: PendingApproval) {
+  if (approval.tool_name) return approval.tool_name;
+  return "tool";
+}
+
+function approvalInputRows(approval: PendingApproval) {
+  const input = approval.tool_input ?? {};
+  const rows: Array<[string, string]> = [];
+  const fieldMap: Array<[string, string]> = [
+    ["node_name", "Node"],
+    ["command", "Command"],
+    ["sql", "SQL"],
+    ["skill_name", "Skill"],
+    ["file_path", "File"],
+  ];
+
+  for (const [key, label] of fieldMap) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) rows.push([label, value]);
+  }
+
+  if (!rows.length && Object.keys(input).length) {
+    rows.push(["Payload", JSON.stringify(input, null, 2)]);
+  }
+
+  return rows;
 }
 
 function Sidebar({
@@ -67,7 +284,7 @@ function Sidebar({
           onClick={onCreate}
           className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-warm-border bg-surface-card text-sm font-medium transition hover:border-accent-active hover:bg-main-background"
         >
-          <span aria-hidden>+</span>
+          <PlusIcon className="h-4 w-4" />
           Phiên hội thoại mới
         </button>
       </div>
@@ -101,7 +318,7 @@ function Sidebar({
                       aria-label={`Xóa ${session.title}`}
                       className="rounded p-1 text-secondary-text opacity-0 transition hover:bg-code-block hover:text-status-crimson group-hover:opacity-100"
                     >
-                      ♲
+                      <TrashIcon className="h-4 w-4" />
                     </button>
                   </div>
                 ))}
@@ -110,15 +327,18 @@ function Sidebar({
           ) : null,
         )}
       </div>
-      <nav className="grid grid-cols-2 gap-2 border-t border-warm-border p-3 text-xs">
-        <Link className="rounded-md px-2 py-2 text-center hover:bg-main-background" href="/admin/skills">
-          Skills
+      <nav className="grid grid-cols-2 gap-2 border-t border-warm-border p-3">
+        <Link
+          className="flex items-center justify-center gap-1.5 rounded-lg border border-warm-border bg-main-background/50 py-2.5 text-center font-mono text-[10px] font-semibold uppercase tracking-wider text-secondary-text transition-all duration-200 hover:border-accent-active/40 hover:bg-accent-active/5 hover:text-accent-active hover:shadow-sm"
+          href="/admin/skills"
+        >
+          <SkillsIcon className="h-3.5 w-3.5" /> Skills
         </Link>
         <Link
-          className="rounded-md px-2 py-2 text-center hover:bg-main-background"
+          className="flex items-center justify-center gap-1.5 rounded-lg border border-warm-border bg-main-background/50 py-2.5 text-center font-mono text-[10px] font-semibold uppercase tracking-wider text-secondary-text transition-all duration-200 hover:border-accent-active/40 hover:bg-accent-active/5 hover:text-accent-active hover:shadow-sm"
           href="/admin/skills/upload"
         >
-          Upload
+          <UploadIcon className="h-3.5 w-3.5" /> Upload
         </Link>
       </nav>
     </aside>
@@ -130,71 +350,88 @@ function ApprovalCard({
   onResolve,
 }: {
   approval: PendingApproval;
-  onResolve: (action: "approve" | "reject", note: string) => void;
+  onResolve: (action: "approved" | "rejected") => void;
 }) {
-  const [note, setNote] = useState("");
-  const resolved = approval.status !== "pending";
+  const toolName = approvalToolName(approval);
+  const inputRows = approvalInputRows(approval);
+  const requiredConfirmations = Math.max(1, approval.required_confirmations || 1);
+  const confirmationCount = Math.max(0, approval.confirmation_count || 0);
+  const isCritical = requiredConfirmations > 1;
+  const approveLabel = isCritical
+    ? confirmationCount + 1 < requiredConfirmations
+      ? `Xác nhận lần ${confirmationCount + 1}`
+      : "Xác nhận lần 2 và chạy"
+    : "Cho chạy";
 
   return (
     <div
       className={`rounded-lg border p-4 ${
-        resolved
-          ? "border-status-sage bg-status-sage/5"
+        isCritical
+          ? "border-status-crimson bg-status-crimson/5"
           : "border-accent-active bg-[#fff8eb]"
       }`}
     >
       <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-bold uppercase text-primary-text">
-            PHÊ DUYỆT TÁC VỤ HẠ TẦNG CỐT LÕI
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-bold uppercase text-primary-text">
+            Cần duyệt: {toolName}
           </h3>
           <p className="mt-1 text-sm text-secondary-text">
-            Agent đang yêu cầu quyền tiếp tục một tác vụ có rủi ro ghi/đổi trạng thái.
+            {isCritical
+              ? "Tác vụ đặc biệt nguy hiểm cần xác nhận tăng cường trước khi chạy."
+              : "Tác vụ có thay đổi trạng thái cần xác nhận trước khi chạy."}
           </p>
         </div>
-        <span className="rounded-md bg-code-block px-2 py-1 font-mono text-[11px] text-secondary-text">
-          {approval.status}
+        <span
+          className={`shrink-0 rounded-md border px-2 py-1 text-[11px] font-semibold ${
+            isCritical
+              ? "border-status-crimson/30 bg-status-crimson/10 text-status-crimson"
+              : "border-accent-active/30 bg-accent-active/10 text-accent-active"
+          }`}
+        >
+          {isCritical
+            ? `Xác nhận ${confirmationCount}/${requiredConfirmations}`
+            : "Chờ duyệt"}
         </span>
       </div>
-      <dl className="grid gap-2 text-sm sm:grid-cols-3">
-        <div>
-          <dt className="text-[11px] uppercase text-secondary-text">Approval ID</dt>
-          <dd className="truncate font-mono">{approval.approval_request_id}</dd>
-        </div>
-        <div>
-          <dt className="text-[11px] uppercase text-secondary-text">Run</dt>
-          <dd className="truncate font-mono">{approval.run_id ?? "streaming-run"}</dd>
-        </div>
-        <div>
-          <dt className="text-[11px] uppercase text-secondary-text">Lý do AI</dt>
-          <dd>{approval.reason}</dd>
-        </div>
-      </dl>
-      <textarea
-        value={resolved ? approval.note ?? "" : note}
-        disabled={resolved}
-        onChange={(event) => setNote(event.target.value)}
-        placeholder="Ghi chú của người trực ca..."
-        className="mt-4 min-h-20 w-full resize-none rounded-lg border border-warm-border bg-surface-card p-3 text-sm disabled:bg-main-background"
-      />
-      {!resolved ? (
-        <div className="mt-3 grid grid-cols-2 gap-3">
-          <button
-            type="button"
-            onClick={() => onResolve("reject", note)}
-            className="h-11 rounded-lg bg-code-block text-sm font-semibold text-primary-text transition hover:bg-warm-border"
-          >
-            Từ chối lệnh
-          </button>
-          <button
-            type="button"
-            onClick={() => onResolve("approve", note)}
-            className="h-11 rounded-lg bg-accent-active text-sm font-semibold text-white transition hover:bg-[#b86205]"
-          >
-            Xác nhận cho chạy
-          </button>
-        </div>
-      ) : null}
+
+      {inputRows.length ? (
+        <dl className="space-y-2">
+          {inputRows.map(([label, value]) => (
+            <div key={label} className="grid gap-1 text-sm sm:grid-cols-[96px_1fr] sm:items-start">
+              <dt className="text-[11px] font-semibold uppercase text-secondary-text">{label}</dt>
+              <dd className="min-w-0 break-words rounded-md bg-surface-card px-2.5 py-2 font-mono text-xs text-primary-text">
+                {value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      ) : (
+        <p className="rounded-md bg-surface-card px-2.5 py-2 text-sm text-primary-text">
+          Không có payload thực thi để hiển thị.
+        </p>
+      )}
+
+      <div className="mt-3 grid grid-cols-2 gap-3">
+        <button
+          type="button"
+          onClick={() => onResolve("rejected")}
+          className="h-10 rounded-lg bg-code-block text-sm font-semibold text-primary-text transition hover:bg-warm-border"
+        >
+          Từ chối
+        </button>
+        <button
+          type="button"
+          onClick={() => onResolve("approved")}
+          className={`h-10 rounded-lg text-sm font-semibold text-white transition ${
+            isCritical
+              ? "bg-status-crimson hover:opacity-90"
+              : "bg-accent-active hover:bg-[#b86205]"
+          }`}
+        >
+          {approveLabel}
+        </button>
+      </div>
     </div>
   );
 }
@@ -203,40 +440,302 @@ function TimelinePanel({ steps }: { steps: TimelineStep[] }) {
   if (!steps.length) {
     return (
       <div className="rounded-lg border border-dashed border-warm-border p-4 text-sm text-secondary-text">
-        Chưa có bước LangGraph. Khi run bắt đầu, timeline sẽ sáng từng node ở đây.
+        Chưa có bước chạy. Khi run bắt đầu, các node thực thi sẽ xuất hiện ở đây.
       </div>
     );
   }
 
   return (
-    <ol className="ml-2 border-l-2 border-warm-border pl-4">
-      {steps.map((step) => (
-        <li key={step.id} className="relative pb-4">
-          <span
-            className={`absolute -left-[25px] top-0 flex h-4 w-4 items-center justify-center rounded-full border text-[9px] ${stepTone(
-              step.status,
-            )}`}
-          >
-            {step.status === "running" ? (
-              <span className="h-2 w-2 animate-spin rounded-full border border-accent-active border-t-transparent" />
-            ) : step.status === "completed" ? (
-              "✓"
-            ) : (
-              ""
-            )}
-          </span>
-          <details className="rounded-lg border border-warm-border bg-surface-card p-3">
-            <summary className="cursor-pointer text-sm font-medium">
-              {step.step_index + 1}. {step.name}
-              <span className="ml-2 font-mono text-[11px] text-secondary-text">{step.status}</span>
-            </summary>
-            <pre className="mt-3 overflow-x-auto rounded bg-code-block p-3 font-mono text-xs leading-5 text-primary-text">
-              {JSON.stringify(step, null, 2)}
-            </pre>
-          </details>
-        </li>
-      ))}
+    <ol className="space-y-4">
+      {steps.map((step, index) => {
+        const input = formatStepValue(step.tool_input, 420);
+        const output = formatToolOutput(step);
+        const isTool = step.step_type === "tool_call";
+        const outputIsSummary = isSkillLoaderStep(step);
+
+        return (
+          <li key={step.id} className="relative grid grid-cols-[32px_1fr] gap-3">
+            <div className="relative flex justify-center pt-2">
+              {index > 0 ? (
+                <span className="absolute -top-4 h-6 w-px bg-warm-border" />
+              ) : null}
+              <span
+                className={`z-10 flex h-8 w-8 items-center justify-center rounded-full border text-[10px] font-semibold shadow-sm ${stepTone(
+                  step.status,
+                )}`}
+              >
+                {step.status === "running" ? (
+                  <span className="h-3 w-3 animate-spin rounded-full border border-accent-active border-t-transparent" />
+                ) : (
+                  stepIcon(step)
+                )}
+              </span>
+              {index < steps.length - 1 ? (
+                <span className="absolute top-10 h-[calc(100%+1rem)] w-px bg-warm-border" />
+              ) : null}
+            </div>
+
+            <article
+              className={`relative min-w-0 rounded-lg border bg-surface-card p-3 shadow-sm ${
+                step.status === "running"
+                  ? "border-accent-active ring-1 ring-accent-active/20"
+                  : isFailedStatus(step.status) || step.is_error
+                    ? "border-status-crimson/40"
+                    : "border-warm-border"
+              }`}
+            >
+              <span className="absolute -left-[7px] top-5 h-3 w-3 rounded-full border border-warm-border bg-surface-card" />
+              <div className="flex min-w-0 items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-md bg-code-block px-2 py-0.5 text-[10px] font-semibold uppercase text-secondary-text">
+                      {isTool ? "Tool" : stepTypeLabel(step)}
+                    </span>
+                    {outputIsSummary ? (
+                      <span className="rounded-md border border-warm-border px-2 py-0.5 text-[10px] font-medium text-secondary-text">
+                        Skill loader
+                      </span>
+                    ) : null}
+                  </div>
+                  <h3 className="mt-2 truncate text-sm font-semibold text-primary-text">
+                    {getStepTitle(step)}
+                  </h3>
+                </div>
+                <span className={`shrink-0 rounded-full border px-2 py-1 text-[11px] font-semibold ${statusBadgeClass(step.status)}`}>
+                  {statusLabel(step.status)}
+                </span>
+              </div>
+
+              {isTool ? (
+                <div className="mt-3 grid gap-2">
+                  {input ? (
+                    <section className="rounded-md bg-code-block/70 px-3 py-2">
+                      <p className="mb-1 text-[10px] font-semibold uppercase text-secondary-text">
+                        Input
+                      </p>
+                      <pre className="max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-5 text-primary-text">
+                        {input}
+                      </pre>
+                    </section>
+                  ) : null}
+                  {output !== null ? (
+                    <section
+                      className={`rounded-md px-3 py-2 ${
+                        outputIsSummary
+                          ? "bg-code-block/70 text-primary-text"
+                          : "bg-terminal-bg text-terminal-fg"
+                      }`}
+                    >
+                      <p
+                        className={`mb-1 text-[10px] font-semibold uppercase ${
+                          outputIsSummary ? "text-secondary-text" : "text-terminal-fg/65"
+                        }`}
+                      >
+                        Output{step.output_truncated && !outputIsSummary ? " · đã rút gọn" : ""}
+                      </p>
+                      <pre className="max-h-40 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-5">
+                        {output}
+                      </pre>
+                    </section>
+                  ) : (
+                    <p className="rounded-md bg-code-block/60 px-3 py-2 text-xs text-secondary-text">
+                      Chưa có output.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="mt-3 max-h-48 overflow-y-auto pr-1 text-xs leading-6 text-secondary-text/90 border-l border-warm-border/50 pl-2 message-markdown">
+                  <MarkdownMessage content={getStepSummary(step)} />
+                </div>
+              )}
+            </article>
+          </li>
+        );
+      })}
     </ol>
+  );
+}
+
+function PhaseChip({
+  label,
+  active,
+  done,
+}: {
+  label: string;
+  active: boolean;
+  done: boolean;
+}) {
+  return (
+    <span
+      className={`inline-flex min-w-0 items-center justify-center rounded-md border px-2 py-1 text-[10px] font-semibold uppercase ${
+        active
+          ? "border-accent-active/40 bg-accent-active/10 text-accent-active"
+          : done
+            ? "border-status-sage/25 bg-status-sage/10 text-status-sage"
+            : "border-warm-border bg-surface-card text-secondary-text"
+      }`}
+    >
+      {label}
+    </span>
+  );
+}
+
+type RunTimelineResponse = {
+  run_id: string;
+  status: string;
+  model?: string | null;
+  steps: TimelineStep[];
+};
+
+function ThinkingPanel({
+  steps,
+  open,
+  loading,
+  streaming,
+  onToggle,
+}: {
+  steps: TimelineStep[];
+  open: boolean;
+  loading: boolean;
+  streaming: boolean;
+  onToggle: () => void;
+}) {
+  const completed = steps.filter((step) => isCompletedStatus(step.status)).length;
+  const failed = steps.filter((step) => isFailedStatus(step.status) || step.is_error).length;
+  const runningStep = steps.find((step) => step.status === "running");
+  const statusText = failed
+    ? `${failed} lỗi`
+    : steps.length
+      ? `${completed}/${steps.length} node xong`
+      : loading
+        ? "Đang tải"
+        : "Chưa có node";
+  const progress = steps.length ? Math.round((completed / steps.length) * 100) : 0;
+  const thinkingStatus = currentThinkingStatus(steps, loading, streaming);
+  const hasReason = steps.some((step) => step.step_type === "llm_call");
+  const hasTool = steps.some((step) => step.step_type === "tool_call");
+  const hasApproval = steps.some((step) => step.step_type === "approval");
+
+  return (
+    <section className="rounded-lg border border-warm-border/80 bg-code-block/45">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left"
+        aria-expanded={open}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <span
+            className={`h-2 w-2 shrink-0 rounded-full ${
+              failed
+                ? "bg-status-crimson"
+                : streaming || runningStep || loading
+                  ? "animate-pulse bg-accent-active"
+                  : "bg-status-sage"
+            }`}
+          />
+          <span className="truncate text-xs font-semibold text-primary-text">AI đang xử lý</span>
+          <span className="truncate text-[11px] text-secondary-text">{statusText}</span>
+        </span>
+        <span className="shrink-0 font-mono text-xs text-secondary-text">{open ? "−" : "+"}</span>
+      </button>
+      {open ? (
+        <div className="border-t border-warm-border px-3 pb-3 pt-2.5">
+          <p className="text-xs leading-5 text-primary-text">{thinkingStatus}</p>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface-card">
+            <span
+              className={`block h-full rounded-full ${
+                failed ? "bg-status-crimson" : "bg-accent-active"
+              }`}
+              style={{ width: steps.length ? `${Math.max(progress, runningStep ? 8 : 0)}%` : "0%" }}
+            />
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-1.5">
+            <PhaseChip
+              label="Reason"
+              active={runningStep?.step_type === "llm_call"}
+              done={hasReason && !steps.some((step) => step.step_type === "llm_call" && step.status === "running")}
+            />
+            <PhaseChip
+              label="Tool"
+              active={runningStep?.step_type === "tool_call"}
+              done={hasTool && !steps.some((step) => step.step_type === "tool_call" && step.status === "running")}
+            />
+            <PhaseChip
+              label="Duyệt"
+              active={runningStep?.step_type === "approval"}
+              done={hasApproval && !steps.some((step) => step.step_type === "approval" && step.status === "running")}
+            />
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function AssistantMessageBubble({
+  message,
+  isSelected,
+  steps,
+  timelineLoading,
+  thinkingOpen,
+  onToggleThinking,
+  onSelectTimeline,
+}: {
+  message: ChatMessage;
+  isSelected: boolean;
+  steps: TimelineStep[];
+  timelineLoading: boolean;
+  thinkingOpen: boolean;
+  onToggleThinking: () => void;
+  onSelectTimeline: () => void;
+}) {
+  const hasTimeline = Boolean(message.run_id);
+  const showThinking = hasTimeline && message.status === "streaming";
+
+  return (
+    <div
+      onClick={hasTimeline ? onSelectTimeline : undefined}
+      className={`flex w-full max-w-[min(760px,92%)] flex-col gap-2 rounded-lg border px-4 py-3 transition ${
+        hasTimeline ? "cursor-pointer" : ""
+      } ${
+        message.status === "error"
+          ? "border-status-crimson/40 bg-status-crimson/5 hover:border-status-crimson/60"
+          : isSelected
+            ? "border-accent-active bg-surface-card ring-1 ring-accent-active/30"
+            : "border-warm-border bg-surface-card hover:border-accent-active/50"
+      }`}
+    >
+      {showThinking ? (
+        <ThinkingPanel
+          steps={steps}
+          open={thinkingOpen || message.status === "streaming"}
+          loading={timelineLoading}
+          streaming={message.status === "streaming"}
+          onToggle={onToggleThinking}
+        />
+      ) : null}
+
+      <div className="min-w-0">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <span className="text-[11px] font-semibold uppercase text-secondary-text">
+            Kết luận
+          </span>
+          {hasTimeline ? (
+            <span
+              className={`text-[9px] font-mono uppercase tracking-wider transition ${
+                isSelected
+                  ? "text-accent-active font-semibold"
+                  : "text-secondary-text/60"
+              }`}
+            >
+              {isSelected ? "● Đang xem bước" : "○ Click để xem chi tiết bước"}
+            </span>
+          ) : null}
+        </div>
+        <MarkdownMessage content={message.content} />
+      </div>
+    </div>
   );
 }
 
@@ -301,7 +800,7 @@ function RightRail({ steps, resources, activeTab, setActiveTab }: {
             activeTab === "timeline" ? "bg-code-block text-primary-text" : "text-secondary-text"
           }`}
         >
-          Mạch tư duy
+          Bước chạy
         </button>
         <button
           type="button"
@@ -331,14 +830,32 @@ export default function ChatPage() {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [steps, setSteps] = useState<TimelineStep[]>([]);
+  const [selectedTimelineRunId, setSelectedTimelineRunId] = useState<string | null>(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [resources, setResources] = useState<ResourceItem[]>([]);
   const [streaming, setStreaming] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"timeline" | "resources">("timeline");
   const [approval, setApproval] = useState<PendingApproval | null>(null);
+  const [chatOptions, setChatOptions] = useState<ChatOptions>({
+    default_model: null,
+    models: [],
+    skills: [],
+    capabilities: [],
+  });
+  const [selectedModel, setSelectedModel] = useState<
+    Pick<ChatModelOption, "provider" | "model"> | null
+  >(null);
+  const [selectedSkillName, setSelectedSkillName] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+  const activeAssistantIdRef = useRef<string | null>(null);
+  const streamGenerationRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const historyRequestRef = useRef(0);
+  const selectedTimelineRunIdRef = useRef<string | null>(null);
 
   const resourceQuery = useMemo(() => {
     const match = prompt.match(/(^|\s)@([\w.-]*)$/);
@@ -354,6 +871,14 @@ export default function ChatPage() {
     );
   }, [resourceQuery, resources]);
 
+  const skillQuery = useMemo(() => {
+    if (streaming) return null;
+    const match = prompt.match(/(^|\s)\/([\w.-]*)$/);
+    return match ? match[2] : null;
+  }, [prompt, streaming]);
+
+  const selectedSkill = chatOptions.skills.find((skill) => skill.name === selectedSkillName);
+
   const loadSessionMessages = useCallback(async (sessionId: string) => {
     const requestId = historyRequestRef.current + 1;
     historyRequestRef.current = requestId;
@@ -361,6 +886,12 @@ export default function ChatPage() {
     setError(null);
     setApproval(null);
     setSteps([]);
+    setSelectedTimelineRunId(null);
+    selectedTimelineRunIdRef.current = null;
+    setExpandedThinking({});
+    setActiveRunId(null);
+    activeRunIdRef.current = null;
+    activeAssistantIdRef.current = null;
     setMessages([]);
 
     if (sessionId.startsWith("session-")) {
@@ -386,6 +917,7 @@ export default function ChatPage() {
             role: message.role,
             content: message.content,
             status: message.status === "failed" ? "error" : "done",
+            run_id: message.run_id,
           })),
       );
     } catch (exc) {
@@ -407,16 +939,46 @@ export default function ChatPage() {
     apiFetch<ResourceItem[]>("/resources")
       .then(setResources)
       .catch(() => setResources([]));
+    apiFetch<ChatOptions>("/chat/options")
+      .then((options) => {
+        setChatOptions(options);
+        setSelectedModel(
+          (current) =>
+            current ?? options.default_model ?? options.models.find((model) => model.available) ?? null,
+        );
+      })
+      .catch(() => setChatOptions({ default_model: null, models: [], skills: [], capabilities: [] }));
   }, [loadSessionMessages]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, approval]);
 
+  useEffect(() => {
+    selectedTimelineRunIdRef.current = selectedTimelineRunId;
+  }, [selectedTimelineRunId]);
+
   function updateAssistant(messageId: string, updater: (message: ChatMessage) => ChatMessage) {
     setMessages((current) =>
       current.map((message) => (message.id === messageId ? updater(message) : message)),
     );
+  }
+
+  async function loadRunTimeline(runId: string | null | undefined) {
+    if (!runId) return;
+    setActiveTab("timeline");
+    setSelectedTimelineRunId(runId);
+    selectedTimelineRunIdRef.current = runId;
+    setTimelineLoading(true);
+    setError(null);
+    try {
+      const timeline = await apiFetch<RunTimelineResponse>(`/runs/${runId}/timeline`);
+      setSteps(timeline.steps);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Không tải được mạch tư duy của run.");
+    } finally {
+      setTimelineLoading(false);
+    }
   }
 
   async function createSession() {
@@ -433,6 +995,12 @@ export default function ChatPage() {
     setMessages([]);
     setLoadingMessages(false);
     setSteps([]);
+    setSelectedTimelineRunId(null);
+    selectedTimelineRunIdRef.current = null;
+    setExpandedThinking({});
+    setActiveRunId(null);
+    activeRunIdRef.current = null;
+    activeAssistantIdRef.current = null;
     setApproval(null);
 
     try {
@@ -469,6 +1037,12 @@ export default function ChatPage() {
       setActiveSessionId(null);
       setMessages([]);
       setSteps([]);
+      setSelectedTimelineRunId(null);
+      selectedTimelineRunIdRef.current = null;
+      setExpandedThinking({});
+      setActiveRunId(null);
+      activeRunIdRef.current = null;
+      activeAssistantIdRef.current = null;
     }
     if (!sessionId.startsWith("session-")) {
       await apiFetch(`/sessions/${sessionId}`, { method: "DELETE" }).catch((exc: Error) =>
@@ -477,9 +1051,25 @@ export default function ChatPage() {
     }
   }
 
-  function handleSseEvent(event: ParsedSseEvent, assistantId: string) {
+  function handleSseEvent(
+    event: ParsedSseEvent,
+    assistantId: string,
+    streamGeneration?: number,
+  ) {
+    if (streamGeneration !== undefined && streamGenerationRef.current !== streamGeneration) {
+      return;
+    }
     const payload = event.data;
     if (event.event === "run_started") {
+      const runId = typeof payload.run_id === "string" ? payload.run_id : null;
+      if (runId) {
+        setSelectedTimelineRunId(runId);
+        selectedTimelineRunIdRef.current = runId;
+        setActiveRunId(runId);
+        activeRunIdRef.current = runId;
+        setExpandedThinking((current) => ({ ...current, [runId]: true }));
+        updateAssistant(assistantId, (message) => ({ ...message, run_id: runId }));
+      }
       setActiveTab("timeline");
       setStreaming(true);
     }
@@ -492,14 +1082,40 @@ export default function ChatPage() {
       }));
     }
     if (event.event === "timeline_updated" && Array.isArray(payload.steps)) {
-      setSteps(payload.steps as TimelineStep[]);
+      const selectedRunId = selectedTimelineRunIdRef.current;
+      const runId = typeof payload.run_id === "string" ? payload.run_id : selectedRunId;
+      if (!selectedRunId || selectedRunId === runId) {
+        setSteps(payload.steps as TimelineStep[]);
+      }
     }
     if (event.event === "run_suspended") {
+      const requiredConfirmations =
+        typeof payload.required_confirmations === "number"
+          ? payload.required_confirmations
+          : 1;
+      const confirmationCount =
+        typeof payload.confirmation_count === "number" ? payload.confirmation_count : 0;
+      updateAssistant(assistantId, (message) => ({
+        ...message,
+        content:
+          message.content ||
+          (confirmationCount > 0
+            ? `Đã ghi nhận xác nhận ${confirmationCount}/${requiredConfirmations}. Tác vụ chưa được thực thi.`
+            : "Tác vụ đang chờ người vận hành phê duyệt và chưa được thực thi."),
+        status: "done",
+      }));
       setStreaming(false);
       setApproval({
         approval_request_id: String(payload.approval_request_id ?? ""),
         run_id: typeof payload.run_id === "string" ? payload.run_id : undefined,
-        reason: typeof payload.reason === "string" ? payload.reason : "Backend suspended run.",
+        tool_name: typeof payload.tool_name === "string" ? payload.tool_name : null,
+        tool_input:
+          payload.tool_input && typeof payload.tool_input === "object" && !Array.isArray(payload.tool_input)
+            ? (payload.tool_input as Record<string, unknown>)
+            : null,
+        risk_level: typeof payload.risk_level === "string" ? payload.risk_level : null,
+        required_confirmations: requiredConfirmations,
+        confirmation_count: confirmationCount,
         status: "pending",
       });
     }
@@ -509,8 +1125,17 @@ export default function ChatPage() {
         ...message,
         content: message.content || finalAnswer,
         status: "done",
+        run_id: typeof payload.run_id === "string" ? payload.run_id : message.run_id,
       }));
+      if (typeof payload.run_id === "string") {
+        setExpandedThinking((current) => ({ ...current, [payload.run_id as string]: false }));
+        if (activeRunIdRef.current === payload.run_id) {
+          activeRunIdRef.current = null;
+          setActiveRunId(null);
+        }
+      }
       setStreaming(false);
+      setApproval(null);
       apiFetch<ChatSession[]>("/sessions").then(setSessions).catch(() => undefined);
     }
     if (event.event === "run_failed" || event.event === "error") {
@@ -520,17 +1145,59 @@ export default function ChatPage() {
         content: current.content ? `${current.content}\n\n${message}` : message,
         status: "error",
       }));
+      activeRunIdRef.current = null;
+      setActiveRunId(null);
       setStreaming(false);
+      setApproval(null);
     }
   }
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = prompt.trim();
-    if (!content || streaming) return;
+    if (!content) return;
 
     setError(null);
     setApproval(null);
+
+    if (streaming) {
+      const runId = activeRunIdRef.current;
+      if (!runId) {
+        setError("Run chưa sẵn sàng nhận can thiệp. Đợi sự kiện run_started rồi thử lại.");
+        return;
+      }
+      try {
+        const queued = await apiFetch<PersistedChatMessage>(`/runs/${runId}/interventions`, {
+          method: "POST",
+          body: JSON.stringify({ content, requested_by: "operator_admin" }),
+        });
+        setMessages((current) => {
+          const activeAssistantId = activeAssistantIdRef.current;
+          const activeAssistant = activeAssistantId
+            ? current.find((message) => message.id === activeAssistantId)
+            : undefined;
+          const withoutActiveAssistant = activeAssistantId
+            ? current.filter((message) => message.id !== activeAssistantId)
+            : current;
+          return [
+            ...withoutActiveAssistant,
+            {
+              id: queued.id,
+              role: "user",
+              content: queued.content,
+              status: queued.status === "failed" ? "error" : "done",
+              run_id: queued.run_id,
+            },
+            ...(activeAssistant ? [activeAssistant] : []),
+          ];
+        });
+        setPrompt("");
+      } catch (exc) {
+        setError(exc instanceof Error ? exc.message : "Không queue được can thiệp vào run.");
+      }
+      return;
+    }
+
     const sessionId = activeSessionId?.startsWith("session-")
       ? await createSession()
       : activeSessionId ?? (await createSession());
@@ -544,6 +1211,11 @@ export default function ChatPage() {
     setMessages((current) => [...current, userMessage, assistantMessage]);
     setPrompt("");
     setStreaming(true);
+    activeRunIdRef.current = null;
+    setActiveRunId(null);
+    activeAssistantIdRef.current = assistantMessage.id;
+    const streamGeneration = streamGenerationRef.current + 1;
+    streamGenerationRef.current = streamGeneration;
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -552,10 +1224,19 @@ export default function ChatPage() {
       const response = await fetch(apiUrl("/chat/stream"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, user_message: content }),
+        body: JSON.stringify({
+          session_id: sessionId,
+          user_message: content,
+          provider: selectedModel?.provider,
+          model: selectedModel?.model,
+          skill_mode: selectedSkillName ? "specific" : "auto",
+          ...(selectedSkillName ? { skill_name: selectedSkillName } : {}),
+        }),
         signal: controller.signal,
       });
-      await consumeSseStream(response, (sseEvent) => handleSseEvent(sseEvent, assistantMessage.id));
+      await consumeSseStream(response, (sseEvent) =>
+        handleSseEvent(sseEvent, assistantMessage.id, streamGeneration),
+      );
     } catch (exc) {
       if (controller.signal.aborted) {
         updateAssistant(assistantMessage.id, (message) => ({
@@ -563,7 +1244,7 @@ export default function ChatPage() {
           content: message.content || "Đã dừng stream theo yêu cầu người trực.",
           status: "done",
         }));
-      } else {
+      } else if (streamGenerationRef.current === streamGeneration) {
         const message = exc instanceof Error ? exc.message : "Không mở được SSE stream.";
         setError(message);
         updateAssistant(assistantMessage.id, (current) => ({
@@ -573,38 +1254,36 @@ export default function ChatPage() {
         }));
       }
     } finally {
-      setStreaming(false);
-      abortRef.current = null;
+      if (streamGenerationRef.current === streamGeneration) {
+        setStreaming(false);
+        abortRef.current = null;
+        activeAssistantIdRef.current = null;
+      }
     }
   }
 
-  async function resolveApproval(action: "approve" | "reject", note: string) {
+  async function resolveApproval(action: "approved" | "rejected") {
     if (!approval) return;
-    setApproval({ ...approval, status: action === "approve" ? "approved" : "rejected", note });
+    const currentApproval = approval;
+    setApproval(null);
     const assistantMessage: ChatMessage = {
       id: id("assistant"),
       role: "assistant",
       content: "",
-      status: action === "approve" ? "streaming" : "done",
+      status: "streaming",
+      run_id: currentApproval.run_id,
     };
-    if (action === "reject") {
-      setMessages((current) => [
-        ...current,
-        { ...assistantMessage, content: "Tác vụ đã bị từ chối và run được khóa tại điểm duyệt." },
-      ]);
-    } else {
-      setMessages((current) => [...current, assistantMessage]);
-    }
+    setMessages((current) => [...current, assistantMessage]);
 
     const controller = new AbortController();
     abortRef.current = controller;
-    setStreaming(action === "approve");
+    setStreaming(true);
 
     try {
-      const response = await fetch(apiUrl(`/approvals/${approval.approval_request_id}/resolve`), {
+      const response = await fetch(apiUrl(`/approvals/${currentApproval.approval_request_id}/resolve`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, note }),
+        body: JSON.stringify({ action }),
         signal: controller.signal,
       });
       await consumeSseStream(response, (sseEvent) => handleSseEvent(sseEvent, assistantMessage.id));
@@ -616,6 +1295,7 @@ export default function ChatPage() {
         content: current.content || message,
         status: "error",
       }));
+      setApproval(currentApproval);
     } finally {
       setStreaming(false);
       abortRef.current = null;
@@ -624,6 +1304,35 @@ export default function ChatPage() {
 
   function pickResource(resource: ResourceItem) {
     setPrompt((current) => current.replace(/(^|\s)@([\w.-]*)$/, `$1@${resource.name} `));
+  }
+
+  function pickSkill(skill: ChatSkillOption) {
+    setSelectedSkillName(skill.name);
+    setPrompt((current) => current.replace(/(^|\s)\/[\w.-]*$/, "$1").trimEnd());
+  }
+
+  async function stopActiveRun() {
+    const runId = activeRunIdRef.current;
+    const assistantId = activeAssistantIdRef.current;
+    if (runId) {
+      await apiFetch(`/runs/${runId}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({
+          reason: "Run stopped by operator from chat UI.",
+          requested_by: "operator_admin",
+        }),
+      }).catch((exc: Error) => setError(exc.message));
+    }
+    abortRef.current?.abort();
+    if (assistantId) {
+      updateAssistant(assistantId, (message) => ({
+        ...message,
+        content: message.content || "Đã dừng stream theo yêu cầu người trực.",
+        status: "done",
+      }));
+    }
+    activeRunIdRef.current = null;
+    setActiveRunId(null);
   }
 
   return (
@@ -642,8 +1351,12 @@ export default function ChatPage() {
             <p className="text-xs text-secondary-text">SSE token stream · HITL approval · run timeline</p>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="h-2 w-2 rounded-full bg-status-sage" />
-            Backend stream ready
+            <span
+              className={`h-2 w-2 rounded-full ${
+                activeRunId ? "animate-pulse bg-accent-active" : "bg-status-sage"
+              }`}
+            />
+            {activeRunId ? "Agent đang chạy · có thể can thiệp" : "Backend stream ready"}
           </div>
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-6">
@@ -668,24 +1381,51 @@ export default function ChatPage() {
               </div>
             ) : null}
 
-            {messages.map((message) => (
-              <article
-                key={message.id}
-                className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
-              >
-                <div
-                  className={`max-w-[82%] rounded-lg border px-4 py-3 ${
-                    message.role === "user"
-                      ? "border-accent-active/30 bg-accent-active text-white"
-                      : message.status === "error"
-                        ? "border-status-crimson/40 bg-status-crimson/5"
-                        : "border-warm-border bg-surface-card"
-                  }`}
+            {messages.map((message) => {
+              const isSelected =
+                Boolean(message.run_id) && selectedTimelineRunId === message.run_id;
+              const runSteps = isSelected ? steps : [];
+
+              return (
+                <article
+                  key={message.id}
+                  className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
                 >
-                  <MarkdownMessage content={message.content} />
-                </div>
-              </article>
-            ))}
+                  {message.role === "user" ? (
+                    <div className="max-w-[min(680px,82%)] rounded-lg border border-accent-active/30 bg-accent-active px-4 py-3 text-white">
+                      <MarkdownMessage content={message.content} />
+                    </div>
+                  ) : (
+                    <AssistantMessageBubble
+                      message={message}
+                      isSelected={isSelected}
+                      steps={runSteps}
+                      timelineLoading={timelineLoading}
+                      thinkingOpen={
+                        message.run_id ? Boolean(expandedThinking[message.run_id]) : false
+                      }
+                      onToggleThinking={() => {
+                        if (!message.run_id) return;
+                        setExpandedThinking((current) => ({
+                          ...current,
+                          [message.run_id as string]: !current[message.run_id as string],
+                        }));
+                        if (!isSelected) void loadRunTimeline(message.run_id);
+                      }}
+                      onSelectTimeline={() => {
+                        if (!message.run_id) return;
+                        if (isSelected) {
+                          setSelectedTimelineRunId(null);
+                          setSteps([]);
+                        } else {
+                          void loadRunTimeline(message.run_id);
+                        }
+                      }}
+                    />
+                  )}
+                </article>
+              );
+            })}
 
             {approval ? <ApprovalCard approval={approval} onResolve={resolveApproval} /> : null}
             {error ? (
@@ -716,14 +1456,38 @@ export default function ChatPage() {
                 ))}
               </div>
             ) : null}
-            <div className="flex items-end gap-3 rounded-xl border border-warm-border bg-surface-card p-2">
+            <SkillCommandMenu
+              skills={chatOptions.skills}
+              query={skillQuery}
+              selectedSkillName={selectedSkillName}
+              onSelect={pickSkill}
+            />
+            <div className="rounded-xl border border-warm-border bg-surface-card p-2 focus-within:border-accent-active">
+              {selectedSkill ? (
+                <div className="px-2 pt-1">
+                  <span className="inline-flex max-w-full items-center gap-1 rounded-md bg-main-background px-2 py-1 text-xs text-primary-text">
+                    <span className="truncate">/{selectedSkill.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSkillName(null)}
+                      aria-label={`Bỏ chọn skill ${selectedSkill.name}`}
+                      className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-secondary-text transition hover:bg-code-block hover:text-primary-text"
+                    >
+                      <CloseIcon className="h-3.5 w-3.5" />
+                    </button>
+                  </span>
+                </div>
+              ) : null}
               <textarea
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
-                disabled={streaming}
                 rows={2}
-                placeholder="Hỏi agent, ví dụ: kiểm tra lag trên @hanoi-core-01..."
-                className="max-h-36 min-h-14 flex-1 resize-none border-0 bg-transparent px-2 py-3 text-sm outline-none placeholder:text-secondary-text disabled:cursor-not-allowed"
+                placeholder={
+                  streaming
+                    ? "Agent đang chạy. Gõ chỉ đạo mới để can thiệp, hoặc để trống rồi bấm dừng..."
+                    : "Hỏi agent, ví dụ: kiểm tra lag trên @hanoi-core-01..."
+                }
+                className="max-h-36 min-h-14 w-full resize-none border-0 bg-transparent px-2 py-3 text-sm outline-none placeholder:text-secondary-text"
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
@@ -731,16 +1495,38 @@ export default function ChatPage() {
                   }
                 }}
               />
-              <button
-                type={streaming ? "button" : "submit"}
-                onClick={streaming ? () => abortRef.current?.abort() : undefined}
-                className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-lg font-semibold text-white ${
-                  streaming ? "bg-primary-text" : "bg-accent-active hover:bg-[#b86205]"
-                }`}
-                aria-label={streaming ? "Dừng stream" : "Gửi câu lệnh"}
-              >
-                {streaming ? "■" : "↗"}
-              </button>
+              <div className="flex min-w-0 items-center justify-between gap-2 border-t border-warm-border pt-2">
+                <ModelPicker
+                  models={chatOptions.models}
+                  selectedModel={selectedModel}
+                  disabled={streaming}
+                  onSelectModel={setSelectedModel}
+                />
+                <button
+                  type={streaming && !prompt.trim() ? "button" : "submit"}
+                  onClick={streaming && !prompt.trim() ? () => void stopActiveRun() : undefined}
+                  className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-white transition ${
+                    streaming && !prompt.trim()
+                      ? "bg-primary-text hover:bg-primary-text/85"
+                      : "bg-accent-active hover:bg-[#b86205]"
+                  }`}
+                  aria-label={
+                    streaming && prompt.trim()
+                      ? "Gửi chỉ đạo can thiệp"
+                      : streaming
+                        ? "Dừng stream"
+                        : "Gửi câu lệnh"
+                  }
+                >
+                  {streaming && !prompt.trim() ? (
+                    <StopIcon className="h-4 w-4" />
+                  ) : streaming ? (
+                    <InterveneIcon className="h-[18px] w-[18px]" />
+                  ) : (
+                    <SendIcon className="h-[18px] w-[18px]" />
+                  )}
+                </button>
+              </div>
             </div>
           </div>
         </form>
