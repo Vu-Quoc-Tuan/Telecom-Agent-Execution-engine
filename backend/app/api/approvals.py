@@ -19,7 +19,6 @@ router = APIRouter()
 
 class ResolveApprovalBody(BaseModel):
     action: str
-    note: str | None = None
 
 
 @router.get("/pending")
@@ -52,8 +51,6 @@ async def resolve_and_resume(
                 llm_gateway=get_llm_gateway(),
                 approval_id=approval_id,
                 action=body.action,
-                resolved_by="operator_admin",
-                note=body.note,
             )
             async for event_type, payload in raw_generator:
                 envelope = TelecomStreamEventMapper.map_raw_payload_to_envelope(event_type, payload)

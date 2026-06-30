@@ -42,12 +42,11 @@ class ApprovalService:
             "approval_id": str(req.id),
             "run_id": str(req.run_id),
             "status": req.status,
-            "reason": req.reason,
             "requested_at": req.requested_at.isoformat(),
             "expires_at": req.expires_at.isoformat() if req.expires_at else None,
             "resolved_at": req.resolved_at.isoformat() if req.resolved_at else None,
-            "resolved_by": req.resolved_by,
-            "resolution_note": req.resolution_note,
+            "required_confirmations": req.required_confirmations,
+            "confirmation_count": req.confirmation_count,
             "timeline_step": timeline_step,
             "skill_details": skill_details,
         }
@@ -55,7 +54,3 @@ class ApprovalService:
     @staticmethod
     def list_all_pending_requests(db: Session) -> list[ApprovalRequest]:
         return ApprovalRepository.get_pending_requests(db)
-
-    @staticmethod
-    def list_requests_by_agent_run(db: Session, run_id: uuid.UUID) -> list[ApprovalRequest]:
-        return ApprovalRepository.get_requests_by_run(db, run_id)

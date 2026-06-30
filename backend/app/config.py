@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -21,15 +20,16 @@ class Settings(BaseSettings):
     PROVIDER: str = "openai"
     OPENAI_API_URL: str = "https://api.openai.com/v1"
     OPENAI_API_KEY: str = Field(default="", repr=False)
+    OPENAI_SUPPORTS_TOOL_STRICT: bool | None = None
     ANTHROPIC_API_KEY: str = Field(default="", repr=False)
-    MODEL_NAME: str = "gpt-4o"
+    ANTHROPIC_API_URL: str = "https://api.anthropic.com"
+    OPENAI_MODEL_NAME: str = "gpt-4o"
     ANTHROPIC_MODEL_NAME: str = "claude-3-5-sonnet-20241022"
     TEMPERATURE: float = 0.1
     LLM_TIMEOUT_SECONDS: float = 60.0
     LLM_MAX_RETRIES: int = 2
-    LLM_MAX_TOKENS: int = 1024
+    LLM_MAX_TOKENS: int = 4096
     AGENT_MAX_STEPS: int = 10
-    LLM_DEFAULT_HEADERS: str = ""
     CONTEXT_WINDOW_TOKENS: int = 200_000
     CONTEXT_COMPACTION_TRIGGER_RATIO: float = 0.65
     CONTEXT_COMPACTION_TARGET_RATIO: float = 0.45
@@ -66,12 +66,23 @@ class Settings(BaseSettings):
     SSH_KNOWN_HOSTS: str = ""
     SSH_AUTO_ADD_HOST_KEYS: bool = False
 
+    # Sandbox chạy run_skill_script bằng Docker container trên host.
+    # SANDBOX_ENABLED=false để tắt hẳn; image/limits tuỳ chỉnh nếu cần.
+    SANDBOX_ENABLED: bool = True
+    SANDBOX_IMAGE: str = "python:3.12-slim"
+    SANDBOX_TIMEOUT_SECONDS: int = 30
+    SANDBOX_MEMORY: str = "256m"
+    SANDBOX_CPUS: str = "1.0"
+
     EXTERNAL_CONNECTOR_TIMEOUT_SECONDS: int = 15
     QUERY_MAX_RESULT_ROWS: int = 1000
 
     LANGFUSE_PUBLIC_KEY: str = ""
     LANGFUSE_SECRET_KEY: str = Field(default="", repr=False)
     LANGFUSE_HOST: str = "https://cloud.langfuse.com"
+    # Prompt Management: label được fetch và TTL cache (giây) cho prompt từ Langfuse.
+    LANGFUSE_PROMPT_LABEL: str = "production"
+    LANGFUSE_PROMPT_CACHE_TTL_SECONDS: int = 300
 
     RUN_TIMEOUT_SECONDS: int = 3600
     RUN_TIMEOUT_SWEEPER_ENABLED: bool = True
@@ -96,6 +107,11 @@ class Settings(BaseSettings):
             if not (isinstance(value, str) and not value.strip())
         }
 
+    @model_validator(mode="after")
+    def normalize_provider_name(self) -> Settings:
+        self.PROVIDER = self.PROVIDER.strip().lower()
+        return self
+
     @property
     def database_url(self) -> str:
         if self.DATABASE_URL:
@@ -116,16 +132,11 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     @property
-    def llm_default_headers(self) -> dict[str, str]:
-        if not self.LLM_DEFAULT_HEADERS:
-            return {}
-        try:
-            parsed = json.loads(self.LLM_DEFAULT_HEADERS)
-        except json.JSONDecodeError:
-            return {}
-        if not isinstance(parsed, dict):
-            return {}
-        return {str(key): str(value) for key, value in parsed.items()}
+    def openai_supports_tool_strict(self) -> bool:
+        if self.OPENAI_SUPPORTS_TOOL_STRICT is not None:
+            return self.OPENAI_SUPPORTS_TOOL_STRICT
+        normalized_url = self.OPENAI_API_URL.rstrip("/")
+        return normalized_url in {"https://api.openai.com", "https://api.openai.com/v1"}
 
 
 settings = Settings()
@@ -141,13 +152,13 @@ def build_llm_gateway(configuration: Settings):
         adapters.append(
             OpenAICompatibleAdapter(
                 OpenAICompatibleConfig(
-                    model=configuration.MODEL_NAME,
+                    model=configuration.OPENAI_MODEL_NAME,
                     api_key=configuration.OPENAI_API_KEY,
                     base_url=configuration.OPENAI_API_URL,
                     timeout_seconds=configuration.LLM_TIMEOUT_SECONDS,
                     max_retries=configuration.LLM_MAX_RETRIES,
                     default_max_tokens=configuration.LLM_MAX_TOKENS,
-                    default_headers=configuration.llm_default_headers,
+                    supports_tool_strict=configuration.openai_supports_tool_strict,
                 )
             )
         )
@@ -157,6 +168,7 @@ def build_llm_gateway(configuration: Settings):
                 AnthropicConfig(
                     model=configuration.ANTHROPIC_MODEL_NAME,
                     api_key=configuration.ANTHROPIC_API_KEY,
+                    base_url=configuration.ANTHROPIC_API_URL,
                     timeout_seconds=configuration.LLM_TIMEOUT_SECONDS,
                     max_retries=configuration.LLM_MAX_RETRIES,
                     default_max_tokens=configuration.LLM_MAX_TOKENS,
@@ -164,9 +176,10 @@ def build_llm_gateway(configuration: Settings):
             )
         )
 
+    configured_provider = (configuration.PROVIDER or "").strip().lower()
     default_provider = (
-        configuration.PROVIDER
-        if any(adapter.provider == configuration.PROVIDER for adapter in adapters)
+        configured_provider
+        if any(adapter.provider == configured_provider for adapter in adapters)
         else None
     )
     return LLMGateway(adapters=adapters, default_provider=default_provider)

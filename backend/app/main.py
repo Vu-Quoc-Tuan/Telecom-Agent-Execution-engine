@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.agent.checkpointer import WorkflowCheckpointer
 from app.agent.graph import build_telecom_agent
@@ -29,6 +30,11 @@ def sweep_timed_out_runs_once() -> int:
     return len(timed_out_runs)
 
 
+def verify_database_connectivity() -> None:
+    with SessionLocal() as db:
+        db.execute(text("SELECT 1"))
+
+
 async def timeout_sweeper_loop() -> None:
     while True:
         await asyncio.sleep(settings.RUN_TIMEOUT_SWEEPER_INTERVAL_SECONDS)
@@ -44,6 +50,7 @@ async def timeout_sweeper_loop() -> None:
 
 @asynccontextmanager
 async def telecom_agent_lifespan(app: FastAPI):
+    verify_database_connectivity()
     checkpointer = WorkflowCheckpointer(settings=settings)
     try:
         saver = await checkpointer.initialize()

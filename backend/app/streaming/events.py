@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -31,8 +32,18 @@ class TimelineStepItem(BaseModel):
     step_index: int
     step_type: str
     name: str
+    display_title: str | None = None
+    display_order: int | None = None
     summary: str | None = None
     status: str
+    tool_name: str | None = None
+    connector_name: str | None = None
+    risk_level: str | None = None
+    tool_status: str | None = None
+    tool_input: dict[str, Any] | None = None
+    tool_output: str | None = None
+    is_error: bool | None = None
+    output_truncated: bool | None = None
 
 
 class TimelineUpdatedPayload(BaseStreamPayload):
@@ -46,7 +57,11 @@ class TextDeltaPayload(BaseStreamPayload):
 
 class RunSuspendedPayload(BaseStreamPayload):
     approval_request_id: str
-    reason: str
+    tool_name: str | None = None
+    tool_input: dict[str, Any] | None = None
+    risk_level: str | None = None
+    required_confirmations: int = 1
+    confirmation_count: int = 0
 
 
 class RunResumedPayload(BaseStreamPayload):

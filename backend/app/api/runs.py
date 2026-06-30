@@ -10,15 +10,20 @@ from sqlalchemy.orm import Session
 from app.common.enums import RunStatus
 from app.config import settings
 from app.database.connection import get_db
-from app.database.repositories.run_steps import RunStepRepository
 from app.database.repositories.runs import RunRepository
 from app.services.runs import RunLifecycleService
+from app.services.timeline import serialize_timeline_steps
 
 router = APIRouter()
 
 
 class CancelRunBody(BaseModel):
     reason: str | None = None
+    requested_by: str = "operator_admin"
+
+
+class QueueInterventionBody(BaseModel):
+    content: str = Field(min_length=1, max_length=20_000)
     requested_by: str = "operator_admin"
 
 
@@ -83,6 +88,34 @@ def cancel_run(
     }
 
 
+@router.post("/{run_id}/interventions")
+def queue_run_intervention(
+    run_id: uuid.UUID,
+    body: QueueInterventionBody,
+    db: Session = Depends(get_db),
+):
+    message = RunLifecycleService.queue_intervention(
+        db=db,
+        run_id=run_id,
+        content=body.content,
+        requested_by=body.requested_by,
+    )
+    if message is None:
+        raise HTTPException(status_code=409, detail="Run không còn ở trạng thái nhận can thiệp.")
+
+    return {
+        "id": str(message.id),
+        "session_id": str(message.session_id),
+        "run_id": str(message.run_id) if message.run_id else None,
+        "role": message.role,
+        "content": message.content,
+        "status": message.status,
+        "sequence_no": message.sequence_no,
+        "metadata": message.metadata_json,
+        "created_at": message.created_at.isoformat(),
+    }
+
+
 @router.get("/{run_id}/timeline")
 def get_run_timeline_steps(run_id: uuid.UUID, db: Session = Depends(get_db)):
     """Frontend gọi API này khi kỹ sư bấm f5 lại trang hoặc chuyển session để vẽ lại Timeline cột phải"""
@@ -90,21 +123,9 @@ def get_run_timeline_steps(run_id: uuid.UUID, db: Session = Depends(get_db)):
     if not run_record:
         raise HTTPException(status_code=404, detail="Lượt chạy không tồn tại.")
 
-    steps = RunStepRepository.get_steps_by_run(db, run_id)
     return {
         "run_id": str(run_record.id),
         "status": run_record.status,
         "model": run_record.model,
-        "steps": [
-            {
-                "id": str(s.id),
-                "step_index": s.step_index,
-                "step_type": s.step_type,
-                "name": s.name,
-                "summary": s.summary,
-                "status": s.status,
-                "started_at": s.started_at.isoformat() if s.started_at else None,
-            }
-            for s in steps
-        ],
+        "steps": serialize_timeline_steps(db, run_id),
     }

@@ -12,4 +12,6 @@ api_router.include_router(
 )
 api_router.include_router(skills.router, prefix="/skills", tags=["Dynamic Skill Registry"])
 api_router.include_router(runs.router, prefix="/runs", tags=["Agent Run Timeline"])
-api_router.include_router(resources.router, prefix="/resources", tags=["Runtime Resource Inventory"])
+api_router.include_router(
+    resources.router, prefix="/resources", tags=["Runtime Resource Inventory"]
+)

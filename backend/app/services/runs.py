@@ -8,8 +8,10 @@ from sqlalchemy.orm import Session
 
 from app.common.enums import RunStatus
 from app.database.models.agent_runs import AgentRun
+from app.database.models.chat_messages import ChatMessage
 from app.database.repositories.approvals import ApprovalRepository
 from app.database.repositories.audit_logs import AuditLogRepository
+from app.database.repositories.messages import MessageRepository
 from app.database.repositories.run_steps import RunStepRepository
 from app.database.repositories.runs import RunRepository
 from app.database.repositories.tool_calls import ToolCallRepository
@@ -23,6 +25,31 @@ class RunLifecycleTransition:
 
 
 class RunLifecycleService:
+    @staticmethod
+    def queue_intervention(
+        *,
+        db: Session,
+        run_id: uuid.UUID,
+        content: str,
+        requested_by: str,
+    ) -> ChatMessage | None:
+        run = RunRepository.get_run(db, run_id)
+        if run is None or not RunRepository.is_active_status(run.status):
+            return None
+
+        return MessageRepository.save_message(
+            db=db,
+            session_id=run.session_id,
+            run_id=run_id,
+            role="user",
+            content=content,
+            metadata={
+                "kind": "operator_intervention",
+                "intervention_status": "pending",
+                "requested_by": requested_by,
+            },
+        )
+
     @staticmethod
     def cancel_run(
         *,
@@ -79,8 +106,6 @@ class RunLifecycleService:
         ApprovalRepository.cancel_pending_by_run(
             db,
             run_id=run_id,
-            resolved_by=requested_by,
-            note=message,
             commit=False,
         )
         AuditLogRepository.log_event(
@@ -141,8 +166,6 @@ class RunLifecycleService:
             ApprovalRepository.cancel_pending_by_run(
                 db,
                 run_id=run.id,
-                resolved_by="system",
-                note=message,
                 commit=False,
             )
             AuditLogRepository.log_event(

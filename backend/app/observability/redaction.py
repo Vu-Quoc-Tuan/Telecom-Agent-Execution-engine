@@ -4,10 +4,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.common.security_patterns import PRIVATE_KEY_PATTERN, SECRET_KEY_PATTERN, SENSITIVE_KEYS
+
 
 class DataRedactor:
     # 🕵️ Quét Regex tìm kiếm các chuỗi nhạy cảm dạng mật mã hoặc khóa bảo mật
-    SECRET_KEY_PATTERN = r"password|passwd|pwd|secret|api[_-]?key|token|private_key"
     REDACT_PATTERNS = [
         (
             re.compile(
@@ -25,10 +26,7 @@ class DataRedactor:
         ),
         (re.compile(r"(--password|--token|-p)\s+([^\s]+)", re.IGNORECASE), r"\1 [REDACTED]"),
         (
-            re.compile(
-                r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-                re.IGNORECASE,
-            ),
+            PRIVATE_KEY_PATTERN,
             r"[REDACTED PRIVATE KEY]",
         ),
     ]
@@ -49,12 +47,11 @@ class DataRedactor:
         if not data:
             return data
 
-        sensitive_keys = {"password", "passwd", "api_key", "secret", "token", "private_key", "auth"}
         cleaned = {}
 
         for k, v in data.items():
             normalized_key = k.lower().replace("-", "_")
-            if normalized_key in sensitive_keys:
+            if normalized_key in SENSITIVE_KEYS:
                 cleaned[k] = "[REDACTED]"
             elif isinstance(v, dict):
                 cleaned[k] = cls.redact_dict(v)

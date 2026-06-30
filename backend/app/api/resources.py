@@ -1,25 +1,13 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from fastapi import APIRouter
 
+from app.common.config_parsing import parse_node_host_map
 from app.config import settings
 
 router = APIRouter()
-
-
-def _parse_node_host_map(raw_value: str) -> dict[str, str]:
-    if not raw_value.strip():
-        return {}
-    try:
-        parsed = json.loads(raw_value)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
-    return {str(key): str(value) for key, value in parsed.items()}
 
 
 def _resource(
@@ -49,7 +37,7 @@ def list_runtime_resources():
     resources: list[dict[str, Any]] = []
 
     ssh_nodes = [node.strip() for node in settings.SSH_ALLOWED_NODES.split(",") if node.strip()]
-    node_host_map = _parse_node_host_map(settings.SSH_NODE_HOST_MAP)
+    node_host_map = parse_node_host_map(settings.SSH_NODE_HOST_MAP)
     if ssh_nodes:
         for node_name in ssh_nodes:
             resources.append(
@@ -82,7 +70,7 @@ def list_runtime_resources():
             name=settings.CLICKHOUSE_HOST or "clickhouse-default",
             kind="clickhouse",
             configured=bool(settings.CLICKHOUSE_HOST and settings.CLICKHOUSE_USER),
-            access="read_only",
+            access="read_write",
             region=settings.CLICKHOUSE_DATABASE,
             metadata={"port": settings.CLICKHOUSE_PORT, "database": settings.CLICKHOUSE_DATABASE},
         )
@@ -93,7 +81,7 @@ def list_runtime_resources():
             name=settings.EXTERNAL_POSTGRES_HOST or "external-postgres-default",
             kind="postgres",
             configured=bool(settings.EXTERNAL_POSTGRES_HOST and settings.EXTERNAL_POSTGRES_USER),
-            access="read_only",
+            access="read_write",
             region=settings.EXTERNAL_POSTGRES_DATABASE,
             metadata={
                 "port": settings.EXTERNAL_POSTGRES_PORT,

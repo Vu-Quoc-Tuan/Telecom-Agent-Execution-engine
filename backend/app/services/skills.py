@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import json
 import mimetypes
 import re
 import stat
@@ -15,7 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agent.safety import AgentSafetyGuard
+from app.agent.tool_validation import validate_json_value_against_schema
 from app.common.enums import SkillStatus
+from app.common.utils import extract_json_object
 from app.database.repositories.skills import SkillRepository
 from app.sandbox.domain_validator import TelecomDomainValidator
 from app.sandbox.security_analyzer import AdvancedASTSecurityAnalyzer
@@ -238,8 +242,132 @@ class SkillValidationService:
                 skill_id=str(skill.id),
             )
 
-        logs.append("[VONG 4] Pending human review.")
-        skill = self._persist_package_or_conflict(db, package)
+        logs.append("[VONG 4] LLM-assisted script run-spec proposal started.")
+        script_manifest = await self._build_initial_script_manifest(
+            llm_gateway,
+            package,
+            logs,
+        )
+        if script_manifest:
+            logs.append(f"[VONG 4] Prepared run specs for {len(script_manifest)} Python script(s).")
+        else:
+            logs.append("[VONG 4] No Python scripts found in package.")
+
+        # ─── VÒNG 5: Sandbox Validation (chạy thử script Python nếu sandbox khả dụng) ───
+        logs.append("[VONG 5] Docker sandbox script smoke testing started.")
+        sandbox_passed = True
+        python_scripts = self._python_scripts(package)
+        if python_scripts:
+            try:
+                from app.config import settings as app_settings
+                from app.sandbox.docker_executor import build_sandbox_executor_from_settings
+
+                sandbox_executor = build_sandbox_executor_from_settings(app_settings)
+                if sandbox_executor is not None:
+                    for script_path in python_scripts:
+                        logs.append(f"[VONG 5] Smoke testing script: {script_path}")
+                        try:
+                            manifest_entry = script_manifest[script_path]
+                            result = await sandbox_executor.validate_skill_script(
+                                script_path=script_path,
+                                arguments=manifest_entry.get("smoke_test", {}).get("arguments", {}),
+                                bundled_files=package.bundled_files,
+                                timeout_seconds=int(
+                                    manifest_entry.get("limits", {}).get("timeout_seconds", 15)
+                                ),
+                            )
+                            if result.exit_code != 0:
+                                sandbox_passed = False
+                                error_info = result.stderr or f"Exit code {result.exit_code}"
+                                manifest_entry["status"] = "failed"
+                                manifest_entry["sandbox_result"] = {
+                                    "exit_code": result.exit_code,
+                                    "stderr": error_info[:1000],
+                                    "timed_out": result.timed_out,
+                                }
+                                logs.append(
+                                    f"[VONG 5] Script '{script_path}' FAILED sandbox validation: "
+                                    f"{error_info[:500]}"
+                                )
+                            else:
+                                output_error = self._validate_output_contract(
+                                    script_path=script_path,
+                                    manifest_entry=manifest_entry,
+                                    stdout=result.stdout or "",
+                                )
+                                if output_error:
+                                    sandbox_passed = False
+                                    manifest_entry["status"] = "failed"
+                                    manifest_entry["sandbox_result"] = {
+                                        "exit_code": result.exit_code,
+                                        "stdout_preview": (result.stdout or "")[:1000],
+                                        "timed_out": result.timed_out,
+                                        "output_contract_error": output_error,
+                                    }
+                                    logs.append(
+                                        f"[VONG 5] Script '{script_path}' FAILED output contract: "
+                                        f"{output_error[:500]}"
+                                    )
+                                else:
+                                    manifest_entry["status"] = "passed"
+                                    manifest_entry["sandbox_result"] = {
+                                        "exit_code": result.exit_code,
+                                        "stdout_preview": (result.stdout or "")[:1000],
+                                        "timed_out": result.timed_out,
+                                    }
+                                    logs.append(
+                                        f"[VONG 5] Script '{script_path}' passed sandbox validation."
+                                    )
+                        except Exception as exc:
+                            sandbox_passed = False
+                            script_manifest[script_path]["status"] = "failed"
+                            script_manifest[script_path]["sandbox_result"] = {
+                                "exit_code": 1,
+                                "stderr": str(exc)[:1000],
+                                "timed_out": False,
+                            }
+                            logs.append(
+                                f"[VONG 5] Script '{script_path}' sandbox validation error: {exc}"
+                            )
+                else:
+                    logs.append(
+                        "[VONG 5] Docker sandbox not available; scripts remain pending_sandbox "
+                        "and will not be runtime-callable."
+                    )
+            except Exception as exc:
+                logs.append(f"[VONG 5] Sandbox validation unavailable: {exc}")
+        else:
+            logs.append("[VONG 5] No Python scripts found in package, skipping sandbox validation.")
+
+        if not sandbox_passed:
+            logs.append(
+                "[KET LUAN] Rejected because one or more scripts failed sandbox validation."
+            )
+            skill = self._persist_package_or_conflict(
+                db,
+                package,
+                script_manifest=script_manifest,
+            )
+            self.skill_repository.update_sandbox_result(
+                db,
+                skill_id=skill.id,
+                status=SkillStatus.REJECTED.value,
+                review_log="\n".join(logs),
+                is_malicious=False,
+            )
+            raise SkillValidationError(
+                status="REJECTED",
+                message="Skill script failed sandbox validation.",
+                logs=logs,
+                skill_id=str(skill.id),
+            )
+
+        logs.append("[VONG 6] Pending human review.")
+        skill = self._persist_package_or_conflict(
+            db,
+            package,
+            script_manifest=script_manifest,
+        )
         self.skill_repository.update_sandbox_result(
             db,
             skill_id=skill.id,
@@ -367,12 +495,6 @@ class SkillValidationService:
                 "Tên skill phải gồm chữ thường, số và dấu '-', tối đa 64 ký tự, không có '--'.",
                 f"Invalid Agent Skills name: {name!r}.",
             )
-        if skill_root != PurePosixPath(".") and skill_root.name != name:
-            self._raise_validation(
-                "Tên skill phải trùng với tên thư mục chứa SKILL.md.",
-                f"Skill name '{name}' does not match parent directory '{skill_root.name}'.",
-            )
-
         description = frontmatter.get("description")
         if not isinstance(description, str) or not description.strip() or len(description) > 1024:
             self._raise_validation(
@@ -468,7 +590,261 @@ class SkillValidationService:
                     )
         return is_malicious
 
-    def _persist_package(self, db: Session, package: ParsedSkillPackage):
+    def _python_scripts(self, package: ParsedSkillPackage) -> dict[str, dict[str, Any]]:
+        return {
+            path: record
+            for path, record in package.bundled_files.items()
+            if path.startswith("scripts/")
+            and path.endswith(".py")
+            and record.get("encoding") == "utf-8"
+        }
+
+    async def _build_initial_script_manifest(
+        self,
+        llm_gateway,
+        package: ParsedSkillPackage,
+        logs: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        python_scripts = self._python_scripts(package)
+        if not python_scripts:
+            return {}
+
+        manifest = {
+            path: self._default_script_manifest_entry(path, str(record.get("content", "")))
+            for path, record in python_scripts.items()
+        }
+
+        try:
+            proposal = await self._invoke_llm_run_spec_analyzer(llm_gateway, package)
+        except Exception as exc:
+            logs.append(f"[VONG 4] LLM run-spec analyzer unavailable: {exc}.")
+            return manifest
+
+        if not proposal:
+            logs.append("[VONG 4] LLM run-spec analyzer returned no usable proposal.")
+            return manifest
+
+        for path, entry in manifest.items():
+            proposed = proposal.get(path)
+            if not isinstance(proposed, dict):
+                continue
+            purpose = proposed.get("purpose")
+            if isinstance(purpose, str) and purpose.strip():
+                entry["purpose"] = purpose.strip()[:500]
+            smoke_test = proposed.get("smoke_test")
+            if isinstance(smoke_test, dict):
+                args = smoke_test.get("arguments")
+                if isinstance(args, dict):
+                    entry["smoke_test"]["arguments"] = args
+            input_schema = self._sanitize_input_schema(proposed.get("input_schema"))
+            if input_schema is not None:
+                entry["input_schema"] = input_schema
+            output_contract = self._sanitize_output_contract(proposed.get("output_contract"))
+            if output_contract is not None:
+                entry["output_contract"] = output_contract
+            runtime = proposed.get("runtime")
+            if isinstance(runtime, dict):
+                arguments_mode = runtime.get("arguments_mode")
+                if arguments_mode in {"args_json", "none"}:
+                    entry["runtime"]["arguments_mode"] = arguments_mode
+            limits = proposed.get("limits")
+            if isinstance(limits, dict):
+                timeout = limits.get("timeout_seconds")
+                if isinstance(timeout, int) and 1 <= timeout <= 120:
+                    entry["limits"]["timeout_seconds"] = timeout
+        logs.append("[VONG 4] LLM run-spec proposal merged into script manifest.")
+        return manifest
+
+    def _default_script_manifest_entry(self, script_path: str, content: str) -> dict[str, Any]:
+        return {
+            "status": "pending_sandbox",
+            "script_hash": self._sha256_text(content),
+            "purpose": f"Python script {script_path}",
+            "runtime": {
+                "type": "python_script",
+                "script_path": script_path,
+                "arguments_mode": "args_json",
+            },
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+            "output_contract": {"mode": "text"},
+            "smoke_test": {"arguments": {}},
+            "limits": {
+                "timeout_seconds": 15,
+                "max_output_chars": 15000,
+            },
+        }
+
+    async def _invoke_llm_run_spec_analyzer(
+        self,
+        llm_gateway,
+        package: ParsedSkillPackage,
+    ) -> dict[str, Any]:
+        from app.llm.schemas import LLMMessage, MessageRole
+
+        scripts = self._python_scripts(package)
+        script_payload = {
+            path: str(record.get("content", ""))[:4000] for path, record in scripts.items()
+        }
+        prompt = (
+            "Read this Agent Skill and propose a minimal JSON object keyed by script path. "
+            "Each value may include: purpose, runtime.arguments_mode ('args_json' or 'none'), "
+            "input_schema using a small JSON Schema subset, smoke_test.arguments object, "
+            "output_contract ({mode:'text'} or {mode:'json', schema:{...}}), "
+            "and limits.timeout_seconds. "
+            "Do not propose commands that execute anything except the given script path.\n\n"
+            f"Skill name: {package.name}\n"
+            f"Description: {package.description}\n"
+            f"SKILL.md body:\n{package.body[:6000]}\n\n"
+            f"Scripts JSON:\n{json.dumps(script_payload, ensure_ascii=False)}"
+        )
+        response = await llm_gateway.invoke(
+            messages=[LLMMessage(role=MessageRole.USER, content=prompt)],
+            system_prompt=(
+                "Return only a JSON object. Unknown fields are ignored. "
+                "If unsure, return an empty object."
+            ),
+        )
+        raw = response.content or ""
+        try:
+            data = json.loads(extract_json_object(raw))
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def _validate_output_contract(
+        self,
+        *,
+        script_path: str,
+        manifest_entry: dict[str, Any],
+        stdout: str,
+    ) -> str | None:
+        contract = manifest_entry.get("output_contract")
+        if not isinstance(contract, dict):
+            return None
+        mode = contract.get("mode", "text")
+        if mode == "text":
+            return None
+        if mode != "json":
+            return f"Unsupported output contract mode: {mode}."
+        try:
+            parsed = json.loads(stdout.strip())
+        except Exception as exc:
+            return f"stdout is not valid JSON: {exc}"
+        schema = contract.get("schema")
+        if isinstance(schema, dict):
+            try:
+                validate_json_value_against_schema(
+                    value=parsed,
+                    schema=schema,
+                    path=f"{script_path}.stdout",
+                )
+            except Exception as exc:
+                return str(getattr(exc, "message", exc))
+        return None
+
+    def _sanitize_output_contract(self, raw_contract: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_contract, dict):
+            return None
+        mode = raw_contract.get("mode")
+        if mode == "text":
+            return {"mode": "text"}
+        if mode != "json":
+            return None
+        sanitized: dict[str, Any] = {"mode": "json"}
+        schema = self._sanitize_json_schema_node(raw_contract.get("schema"), depth=0)
+        if schema is not None:
+            sanitized["schema"] = schema
+        return sanitized
+
+    def _sanitize_input_schema(self, raw_schema: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_schema, dict) or raw_schema.get("type") != "object":
+            return None
+
+        sanitized: dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": (
+                raw_schema["additionalProperties"]
+                if isinstance(raw_schema.get("additionalProperties"), bool)
+                else True
+            ),
+        }
+        raw_properties = raw_schema.get("properties")
+        properties: dict[str, Any] = {}
+        if isinstance(raw_properties, dict):
+            for key, value in raw_properties.items():
+                if not isinstance(key, str) or not re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_-]{0,63}", key
+                ):
+                    continue
+                sanitized_value = self._sanitize_json_schema_node(value, depth=1)
+                if sanitized_value is not None:
+                    properties[key] = sanitized_value
+                if len(properties) >= 50:
+                    break
+        if properties:
+            sanitized["properties"] = properties
+
+        raw_required = raw_schema.get("required")
+        if isinstance(raw_required, list):
+            required = [
+                item for item in raw_required if isinstance(item, str) and item in properties
+            ][:50]
+            if required:
+                sanitized["required"] = required
+        return sanitized
+
+    def _sanitize_json_schema_node(
+        self,
+        raw_schema: Any,
+        *,
+        depth: int,
+    ) -> dict[str, Any] | None:
+        if depth > 4 or not isinstance(raw_schema, dict):
+            return None
+        schema_type = raw_schema.get("type")
+        if schema_type not in {"string", "integer", "number", "boolean", "object", "array", "null"}:
+            return None
+
+        sanitized: dict[str, Any] = {"type": schema_type}
+        if isinstance(raw_schema.get("enum"), list):
+            enum_values = [
+                item
+                for item in raw_schema["enum"]
+                if item is None or isinstance(item, str | int | float | bool)
+            ][:50]
+            if enum_values:
+                sanitized["enum"] = enum_values
+        if schema_type in {"integer", "number"}:
+            for key in ("minimum", "maximum"):
+                value = raw_schema.get(key)
+                if isinstance(value, int | float) and not isinstance(value, bool):
+                    sanitized[key] = value
+        if schema_type == "object":
+            nested = self._sanitize_input_schema(raw_schema)
+            if nested is not None:
+                sanitized.update(nested)
+        if schema_type == "array":
+            items = self._sanitize_json_schema_node(raw_schema.get("items"), depth=depth + 1)
+            if items is not None:
+                sanitized["items"] = items
+        return sanitized
+
+    @staticmethod
+    def _sha256_text(content: str) -> str:
+        return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
+
+    def _persist_package(
+        self,
+        db: Session,
+        package: ParsedSkillPackage,
+        *,
+        script_manifest: dict[str, Any] | None = None,
+    ):
         return self.skill_repository.create_uploaded_skill(
             db=db,
             name=package.name,
@@ -476,12 +852,19 @@ class SkillValidationService:
             skill_md=package.body,
             frontmatter=package.frontmatter,
             bundled_files=package.bundled_files,
+            script_manifest=script_manifest or {},
             version=package.version,
         )
 
-    def _persist_package_or_conflict(self, db: Session, package: ParsedSkillPackage):
+    def _persist_package_or_conflict(
+        self,
+        db: Session,
+        package: ParsedSkillPackage,
+        *,
+        script_manifest: dict[str, Any] | None = None,
+    ):
         try:
-            return self._persist_package(db, package)
+            return self._persist_package(db, package, script_manifest=script_manifest)
         except IntegrityError as exc:
             db.rollback()
             raise SkillValidationError(

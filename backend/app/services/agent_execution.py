@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -22,11 +23,13 @@ from app.database.repositories.messages import MessageRepository
 from app.database.repositories.run_steps import RunStepRepository
 from app.database.repositories.runs import RunRepository
 from app.database.repositories.sessions import SessionRepository
+from app.database.repositories.skills import SkillRepository
 from app.database.repositories.tool_calls import ToolCallRepository
 from app.llm.gateway import LLMGateway
 from app.llm.schemas import LLMMessage, LLMRequestOptions, MessageRole
 from app.observability.langfuse import telemetry_tracker
 from app.observability.tracing import TelecomTaskTracer
+from app.services.timeline import serialize_timeline_steps
 
 
 class AgentExecutionService:
@@ -52,12 +55,25 @@ class AgentExecutionService:
         user_content: str,
         provider: str = "openai",
         model: str = "gpt-4o",
+        selected_skill: str | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-        started_at = datetime.now(UTC)
         session = SessionRepository.get_session_by_id(db, session_id)
         if not session:
             yield "error", {"message": "Session does not exist or has been deleted."}
             return
+
+        if selected_skill:
+            skill = SkillRepository.get_skill_by_name(db, selected_skill)
+            if not skill or skill.status != "ready":
+                yield (
+                    "error",
+                    {"message": f"Skill '{selected_skill}' does not exist or is not ready."},
+                )
+                return
+
+        initial_run_config = cls._default_run_config()
+        if selected_skill:
+            initial_run_config["selected_skill"] = selected_skill
 
         user_db_msg = MessageRepository.save_message(
             db=db,
@@ -71,41 +87,47 @@ class AgentExecutionService:
             session_id=session_id,
             provider=provider,
             model=model,
-            config_dict=cls._default_run_config(),
-            prompt_version=TELECOM_AGENT_PROMPT_VERSION,
+            config_dict=initial_run_config,
+            prompt_version=telemetry_tracker.get_active_prompt_version(
+                TELECOM_AGENT_PROMPT_VERSION
+            ),
         )
         user_db_msg.run_id = run_record.id
         db.commit()
+        MessageRepository.requeue_undelivered_interventions(
+            db,
+            session_id=session_id,
+            run_id=run_record.id,
+        )
+        session_history = MessageRepository.get_chat_history(db, session_id)
 
         yield (
             "run_started",
             {"run_id": str(run_record.id), "session_id": str(session_id), "status": "running"},
         )
 
-        # Gắn vết Langfuse vào lượt chạy để Frontend render link Dashboard giám sát.
         trace_id = run_record.id.hex
-        RunRepository.attach_langfuse_trace(
-            db,
-            run_record.id,
-            trace_id=trace_id,
-            trace_url=telemetry_tracker.get_trace_url(trace_id),
-        )
-
         # 🛡️ DLP: che mặt nạ secret/PII trước khi nội dung rời hệ thống sang LLM bên thứ 3.
         # Bản gốc người dùng gõ vẫn được lưu nguyên trong chat_messages ở trên để hiển thị.
         sanitized_content = AgentSafetyGuard.sanitize_input_prompt(user_content)
+        telemetry_tracker.trace_run_start(
+            session_id=str(session_id),
+            run_id=trace_id,
+            input_content=sanitized_content,
+        )
 
         run_config = cls._run_config(run_record)
         graph_config = cls._graph_config(
             db,
             llm_gateway,
             session_id,
+            run_id=run_record.id,
             provider=provider,
             model=model,
             run_config=run_config,
         )
         initial_state = {
-            "messages": [LLMMessage(role=MessageRole.USER, content=sanitized_content)],
+            "messages": cls._llm_messages_from_history(session_history),
             "session_id": str(session_id),
             "run_id": str(run_record.id),
             "current_step_index": 0,
@@ -151,6 +173,11 @@ class AgentExecutionService:
                         error_message=str(execution_error),
                         source="agent_graph",
                     )
+                    telemetry_tracker.trace_run_end(
+                        run_id=trace_id,
+                        output_content=error_message,
+                        status="failed",
+                    )
                     yield (
                         "run_failed",
                         {
@@ -170,13 +197,10 @@ class AgentExecutionService:
                         db, run_record.id, status=RunStatus.WAITING_APPROVAL.value
                     )
                     approval = pending_approvals[0]
+                    tool_call = ToolCallRepository.get_tool_call(db, approval.tool_call_id)
                     yield (
                         "run_suspended",
-                        {
-                            "run_id": str(run_record.id),
-                            "approval_request_id": str(approval.id),
-                            "reason": approval.reason,
-                        },
+                        cls._build_run_suspended_event(run_record.id, approval, tool_call),
                     )
                     return
 
@@ -187,6 +211,11 @@ class AgentExecutionService:
                     )
                     terminal_error = cls._terminal_error_message(updated_run)
                     if terminal_error:
+                        telemetry_tracker.trace_run_end(
+                            run_id=trace_id,
+                            output_content=terminal_error,
+                            status="failed",
+                        )
                         yield (
                             "run_failed",
                             {"run_id": str(run_record.id), "error": terminal_error},
@@ -201,20 +230,21 @@ class AgentExecutionService:
                     )
                     # Tự động cập nhật tiêu đề cuộc chat nếu tiêu đề hiện tại là mặc định ("New Session" hoặc trống)
                     session_title = getattr(session, "title", None)
-                    if session_title is None or session_title.strip() == "" or session_title.strip() == "New Session":
+                    if (
+                        session_title is None
+                        or session_title.strip() == ""
+                        or session_title.strip() == "New Session"
+                    ):
                         try:
                             # Hỏi LLM sinh tiêu đề ngắn gọn
                             title_prompt = (
                                 "Tóm tắt câu hỏi hoặc yêu cầu sau thành một tiêu đề ngắn gọn, súc tích (khoảng 3-6 từ), "
                                 "chuyên nghiệp để đặt tên cho cuộc chat viễn thông này. Chỉ trả về đúng tiêu đề, "
-                                f"không thêm bất kỳ từ giải thích nào khác:\n\n\"{sanitized_content}\""
+                                f'không thêm bất kỳ từ giải thích nào khác:\n\n"{sanitized_content}"'
                             )
-                            # Đồng bộ hóa logic chọn provider giống như trong nodes.py để tránh lỗi không khớp casing (OpenAI vs openai)
-                            target_provider = provider
-                            if provider and provider.lower() in llm_gateway.providers:
-                                target_provider = provider.lower()
-                                options = LLMRequestOptions(model=model, temperature=0.1)
-                            elif provider in llm_gateway.providers:
+                            # Đồng bộ hóa logic chọn provider giống như trong nodes.py.
+                            target_provider = provider.strip().lower() if provider else None
+                            if target_provider in llm_gateway.providers:
                                 options = LLMRequestOptions(model=model, temperature=0.1)
                             else:
                                 target_provider = None
@@ -223,7 +253,7 @@ class AgentExecutionService:
                             title_resp = await llm_gateway.invoke(
                                 provider=target_provider,
                                 messages=[LLMMessage(role=MessageRole.USER, content=title_prompt)],
-                                options=options
+                                options=options,
                             )
                             if title_resp and title_resp.content:
                                 new_title = title_resp.content.strip().strip('"').strip("'").strip()
@@ -235,15 +265,14 @@ class AgentExecutionService:
                                         db.commit()
                         except Exception as e:
                             import logging
-                            logging.getLogger("telecom-agent").error(f"Title auto-update failed: {e}", exc_info=True)
-                    cls._push_llm_telemetry(
-                        str(session_id),
-                        trace_id,
-                        model,
-                        initial_state["messages"],
-                        latest_response,
-                        start_time=started_at,
-                        end_time=datetime.now(UTC),
+
+                            logging.getLogger("telecom-agent").error(
+                                f"Title auto-update failed: {e}", exc_info=True
+                            )
+                    telemetry_tracker.trace_run_end(
+                        run_id=trace_id,
+                        output_content=assistant_text,
+                        status="completed",
                     )
                     yield (
                         "run_completed",
@@ -258,6 +287,11 @@ class AgentExecutionService:
                     error_message=error_message,
                     source="agent_graph",
                 )
+                telemetry_tracker.trace_run_end(
+                    run_id=trace_id,
+                    output_content=error_message,
+                    status="failed",
+                )
                 yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
         except Exception as exc:
             error_message = cls._mark_run_failed(
@@ -265,6 +299,11 @@ class AgentExecutionService:
                 run_record.id,
                 error_message=str(exc),
                 source="agent_lifecycle",
+            )
+            telemetry_tracker.trace_run_end(
+                run_id=trace_id,
+                output_content=error_message,
+                status="failed",
             )
             yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
 
@@ -275,8 +314,6 @@ class AgentExecutionService:
         llm_gateway: LLMGateway,
         approval_id: uuid.UUID,
         action: str,
-        resolved_by: str,
-        note: str | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         if action not in {"approved", "rejected"}:
             yield "error", {"message": "Approval action must be 'approved' or 'rejected'."}
@@ -304,16 +341,33 @@ class AgentExecutionService:
             db,
             approval_id,
             status=action,
-            resolved_by=resolved_by,
-            note=note,
         )
         if approval is None:
             yield "error", {"message": "Approval expired or was resolved concurrently."}
             return
 
+        if (
+            action == "approved"
+            and approval.status == "pending"
+            and hasattr(approval, "required_confirmations")
+        ):
+            yield (
+                "run_suspended",
+                cls._build_run_suspended_event(run_record.id, approval, tool_call),
+            )
+            return
+
         session_id = run_record.session_id
         if action == "rejected":
-            output = f"Rejected by human operator. Reason: {note or 'No note provided.'}"
+            output = json.dumps(
+                {
+                    "status": "rejected",
+                    "code": "HUMAN_REJECTED",
+                    "message": "The human operator rejected this tool call. It was not executed.",
+                    "reason": "Rejected by operator.",
+                },
+                ensure_ascii=False,
+            )
             RunStepRepository.complete_step(
                 db=db, step_id=tool_call.run_step_id, status="failed", summary=output
             )
@@ -346,6 +400,7 @@ class AgentExecutionService:
                     arguments=tool_call.arguments_json,
                     db=db,
                     settings=app_settings,
+                    approval_confirmations=getattr(approval, "confirmation_count", 1),
                 )
                 status = "completed"
                 error_message = None
@@ -401,6 +456,7 @@ class AgentExecutionService:
             db,
             llm_gateway,
             session_id,
+            run_id=run_record.id,
             provider=run_record.provider,
             model=run_record.model,
             run_config=run_config,
@@ -414,6 +470,7 @@ class AgentExecutionService:
         ]
         if remaining_pending:
             next_approval = remaining_pending[0]
+            tool_call = ToolCallRepository.get_tool_call(db, next_approval.tool_call_id)
             RunRepository.update_run_status(
                 db,
                 run_record.id,
@@ -421,11 +478,7 @@ class AgentExecutionService:
             )
             yield (
                 "run_suspended",
-                {
-                    "run_id": str(run_record.id),
-                    "approval_request_id": str(next_approval.id),
-                    "reason": "Other tool calls in this batch still require review.",
-                },
+                cls._build_run_suspended_event(run_record.id, next_approval, tool_call),
             )
             return
 
@@ -482,7 +535,10 @@ class AgentExecutionService:
                         resume={
                             "messages": [
                                 message.model_dump(mode="json") for message in new_tool_messages
-                            ]
+                            ],
+                            "approval_rejected": any(
+                                request.status == "rejected" for request in batch_requests
+                            ),
                         }
                     ),
                     config=graph_config,
@@ -518,6 +574,11 @@ class AgentExecutionService:
                         error_message=str(execution_error),
                         source="agent_resume",
                     )
+                    telemetry_tracker.trace_run_end(
+                        run_id=run_record.id.hex,
+                        output_content=error_message,
+                        status="failed",
+                    )
                     yield (
                         "run_failed",
                         {
@@ -526,9 +587,26 @@ class AgentExecutionService:
                         },
                     )
                     return
+
+                pending_approvals = [
+                    approval
+                    for approval in ApprovalRepository.get_pending_requests(db)
+                    if approval.run_id == run_record.id
+                ]
+                if pending_approvals:
+                    RunRepository.update_run_status(
+                        db, run_record.id, status=RunStatus.WAITING_APPROVAL.value
+                    )
+                    approval = pending_approvals[0]
+                    tool_call = ToolCallRepository.get_tool_call(db, approval.tool_call_id)
+                    yield (
+                        "run_suspended",
+                        cls._build_run_suspended_event(run_record.id, approval, tool_call),
+                    )
+                    return
                 assistant_text = (
                     latest_response.content
-                    if latest_response
+                    if (latest_response and latest_response.content is not None)
                     else "Tác vụ sau phê duyệt xử lý xong."
                 )
                 updated_run = RunRepository.update_run_status(
@@ -536,6 +614,11 @@ class AgentExecutionService:
                 )
                 terminal_error = cls._terminal_error_message(updated_run)
                 if terminal_error:
+                    telemetry_tracker.trace_run_end(
+                        run_id=run_record.id.hex,
+                        output_content=terminal_error,
+                        status="failed",
+                    )
                     yield (
                         "run_failed",
                         {"run_id": str(run_record.id), "error": terminal_error},
@@ -548,16 +631,12 @@ class AgentExecutionService:
                     role="assistant",
                     content=assistant_text,
                 )
-                if latest_response:
-                    cls._push_llm_telemetry(
-                        str(session_id),
-                        run_record.id.hex,
-                        run_record.model,
-                        new_tool_messages,
-                        latest_response,
-                        start_time=started_at,
-                        end_time=datetime.now(UTC),
-                    )
+
+                telemetry_tracker.trace_run_end(
+                    run_id=run_record.id.hex,
+                    output_content=assistant_text,
+                    status="completed",
+                )
                 yield (
                     "run_completed",
                     {"run_id": str(run_record.id), "final_answer": assistant_text},
@@ -569,6 +648,11 @@ class AgentExecutionService:
                 error_message=str(exc),
                 source="agent_resume",
             )
+            telemetry_tracker.trace_run_end(
+                run_id=run_record.id.hex,
+                output_content=error_message,
+                status="failed",
+            )
             yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
 
     @classmethod
@@ -578,13 +662,14 @@ class AgentExecutionService:
         llm_gateway: LLMGateway,
         session_id: uuid.UUID,
         *,
+        run_id: uuid.UUID,
         provider: str | None = None,
         model: str | None = None,
         run_config: dict[str, Any] | None = None,
     ) -> RunnableConfig:
         return {
             "configurable": {
-                "thread_id": str(session_id),
+                "thread_id": str(run_id),
                 "db": db,
                 "llm_gateway": llm_gateway,
                 "provider": provider,
@@ -593,6 +678,27 @@ class AgentExecutionService:
                 "settings": app_settings,
             }
         }
+
+    @staticmethod
+    def _llm_messages_from_history(history: list[Any]) -> list[LLMMessage]:
+        messages: list[LLMMessage] = []
+        for row in history:
+            if row.role not in {MessageRole.USER.value, MessageRole.ASSISTANT.value}:
+                continue
+            metadata = getattr(row, "metadata_json", None)
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("kind") == "operator_intervention"
+                and metadata.get("intervention_status") in {"pending", "undelivered"}
+            ):
+                continue
+            messages.append(
+                LLMMessage(
+                    role=MessageRole(row.role),
+                    content=AgentSafetyGuard.sanitize_input_prompt(str(row.content or "")),
+                )
+            )
+        return messages[-40:]
 
     @staticmethod
     async def _get_graph_state(agent_app, *, config: RunnableConfig):
@@ -605,11 +711,7 @@ class AgentExecutionService:
 
     @staticmethod
     def _normalize_graph_stream_chunk(chunk) -> tuple[str, Any]:
-        if (
-            isinstance(chunk, tuple)
-            and len(chunk) == 2
-            and chunk[0] in {"updates", "custom"}
-        ):
+        if isinstance(chunk, tuple) and len(chunk) == 2 and chunk[0] in {"updates", "custom"}:
             return chunk
         return "updates", chunk
 
@@ -650,30 +752,6 @@ class AgentExecutionService:
         return value if value > 0 else default
 
     @staticmethod
-    def _push_llm_telemetry(
-        session_id: str,
-        run_id: str,
-        model: str,
-        messages,
-        latest_response,
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
-    ) -> None:
-        """Đẩy telemetry token/prompt/answer lên Langfuse (no-op nếu chưa cấu hình credentials)."""
-        usage = getattr(latest_response, "usage", None)
-        telemetry_tracker.trace_llm_generation(
-            session_id=session_id,
-            run_id=run_id,
-            model_name=model,
-            prompt_messages=[m.model_dump() if hasattr(m, "model_dump") else m for m in messages],
-            completion_content=latest_response.content or "",
-            prompt_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
-            completion_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-    @staticmethod
     def _terminal_error_message(run_record) -> str | None:
         if run_record is None:
             return None
@@ -698,28 +776,44 @@ class AgentExecutionService:
             run_id,
             status=RunStatus.FAILED.value,
             error_msg=error_message,
+            commit=False,
         )
         terminal_error = cls._terminal_error_message(updated_run)
         if terminal_error:
+            db.rollback()
             return terminal_error
+        MessageRepository.mark_pending_interventions_undelivered(
+            db,
+            run_id,
+            reason=error_message,
+            commit=False,
+        )
         RunStepRepository.create_error_step(
             db=db,
             run_id=run_id,
             summary=error_message,
             metadata={"source": source},
+            commit=False,
         )
+        db.commit()
         return error_message
 
     @staticmethod
     def _serialize_steps(db: Session, run_id: uuid.UUID) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": str(step.id),
-                "step_index": step.step_index,
-                "step_type": step.step_type,
-                "name": step.name,
-                "summary": step.summary,
-                "status": step.status,
-            }
-            for step in RunStepRepository.get_steps_by_run(db, run_id)
-        ]
+        return serialize_timeline_steps(db, run_id)
+
+    @staticmethod
+    def _build_run_suspended_event(
+        run_id: uuid.UUID,
+        approval: Any,
+        tool_call: Any | None,
+    ) -> dict[str, Any]:
+        return {
+            "run_id": str(run_id),
+            "approval_request_id": str(approval.id),
+            "tool_name": tool_call.skill_name if tool_call else None,
+            "tool_input": tool_call.arguments_json if tool_call else None,
+            "risk_level": tool_call.risk_level if tool_call else None,
+            "required_confirmations": getattr(approval, "required_confirmations", 1),
+            "confirmation_count": getattr(approval, "confirmation_count", 0),
+        }
