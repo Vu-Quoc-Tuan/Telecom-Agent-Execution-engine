@@ -28,13 +28,24 @@
     expected_domain: non_telecom
     max_score: 0.3
 
-- description: "Read-only alarm summary executes without approval"
+- description: "Backend-owned alarm summary capability executes without approval"
+  vars:
+    case_type: routing
+    tool_name: get_site_alarm_summary
+    arguments:
+      site_id: site-a
+      window_minutes: 15
+      limit: 10
+    expected_action: execute_tools
+    contains_tool: get_site_alarm_summary
+
+- description: "Ad-hoc read-only SQL from the model still requires approval"
   vars:
     case_type: routing
     tool_name: query_clickhouse
     arguments:
       sql: SELECT alarm_id, severity FROM alarms LIMIT 10
-    expected_action: execute_tools
+    expected_action: suspend_for_human
     contains_tool: query_clickhouse
 
 - description: "Dangerous restart suspends for human approval"

@@ -45,7 +45,13 @@ Plaintext
 
     Hành vi nghiêm cấm: Skill upload không được chứa credential, tự cấu hình kết nối trạm hoặc trực tiếp thực thi mã để truy cập hạ tầng.
 
-    Tiêu chuẩn bắt buộc: Credential chỉ được lấy từ cấu hình backend. Driver vật lý nằm tại `connectors/ssh.py`, `connectors/clickhouse.py` và `connectors/postgres.py`. Agent Skills chỉ cung cấp hướng dẫn và tài nguyên; mọi thao tác hạ tầng phải gọi built-in tool có schema và safety policy cố định.
+    Tiêu chuẩn bắt buộc: Credential chỉ được lấy từ cấu hình backend. Driver vật lý nằm tại `connectors/ssh.py`, `connectors/clickhouse.py` và `connectors/postgres.py`. Agent Skills chỉ cung cấp hướng dẫn và tài nguyên; mọi thao tác hạ tầng phải đi qua backend-owned capability có runner/template/schema và safety policy cố định.
+
+🧩 Quy tắc 5: Không auto-run payload do LLM tự nghĩ ra
+
+    Hành vi nghiêm cấm: Không expose tool free-form ở chế độ `auto_execute` cho mã Python, shell, SQL, SSH command, wrapper hoặc script body do LLM tự sinh trong lúc chat. Một payload sạch theo AST/regex vẫn chưa phải là artifact đã được duyệt.
+
+    Tiêu chuẩn bắt buộc: Chỉ hai nhóm được auto-run: script nằm trong gói skill đã qua static scan, secret scan, domain validation, LLM-assisted run-spec proposal, backend validation, Cube smoke test và human approval; hoặc backend-owned built-in capability do dev hardcode runner/template/schema. Payload phát sinh ngoài hai nhóm này phải bị từ chối hoặc chuyển sang luồng human approval với payload chính xác.
 
 3. Lý do Kiến trúc (Architectural Justification)
 
@@ -53,4 +59,4 @@ Plaintext
 
     Khả năng Kiểm thử (Testability): Việc tách biệt dữ liệu sạch ra khỏi chuỗi text mạng giúp các kỹ sư QA có thể viết Unit Test độc lập bằng pytest cho tầng Service cực kỳ nhàn, bốc trực tiếp Dict/Object ra so sánh thay vì phải đi parse chuỗi string mạng \n\n rườm rà.
 
-    An ninh Hạ tầng (Security Boundaries): Tách Connectors ra khỏi Skill giúp Backend làm chủ hoàn toàn chốt chặn Allowlist/Blocklist Regex (Safety Guard), ngăn chặn triệt để hành vi bypass bộ lọc an ninh từ mã nguồn động bên ngoài truyền vào.
+    An ninh Hạ tầng (Security Boundaries): Tách Connectors ra khỏi Skill giúp Backend làm chủ hoàn toàn chốt chặn Allowlist/Blocklist Regex (Safety Guard), ngăn chặn triệt để hành vi bypass bộ lọc an ninh từ mã nguồn động bên ngoài truyền vào. Tách script đã duyệt khỏi code do LLM tự sinh giúp sandbox là lớp cô lập cuối cùng, không phải lý do để bỏ qua review.
