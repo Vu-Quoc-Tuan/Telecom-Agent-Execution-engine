@@ -25,10 +25,9 @@ class LLMAdapterConfig(BaseModel):
     base_url: str | None = None
     timeout_seconds: float = Field(default=60.0, gt=0)
     max_retries: int = Field(default=2, ge=0)
-    default_max_tokens: int = Field(default=1024, gt=0)
+    default_max_tokens: int = Field(default=4096, gt=0)
 
     default_params: dict[str, Any] = Field(default_factory=dict)
-    default_headers: dict[str, str] = Field(default_factory=dict)
 
 
 class BaseLLMAdapter(ABC):

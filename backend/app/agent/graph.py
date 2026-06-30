@@ -36,6 +36,7 @@ def build_telecom_agent(*, checkpointer=None):
         "call_llm_gateway",
         reliability_router,
         {
+            "call_llm_gateway": "call_llm_gateway",
             "execute_tools": "execute_tools",
             "suspend_for_human": "suspend_for_human",
             "fail": "fail",

@@ -29,9 +29,7 @@ class StreamEventType(StrEnum):
 
 
 class ToolChoiceMode(StrEnum):
-    AUTO = "auto"
     NONE = "none"
-    REQUIRED = "required"
     SPECIFIC = "specific"
 
 
@@ -39,7 +37,7 @@ class ToolChoiceMode(StrEnum):
 class ToolChoice(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: ToolChoiceMode = ToolChoiceMode.AUTO
+    mode: ToolChoiceMode
     tool_name: str | None = None
 
     @model_validator(mode="after")
@@ -74,7 +72,6 @@ class NormalizedToolCall(BaseModel):
     id: str
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
-    raw_arguments: str | None = None
 
 
 class LLMMessage(BaseModel):
@@ -157,12 +154,7 @@ class LLMRequestOptions(BaseModel):
     tool_choice: ToolChoice | None = None
     parallel_tool_calls: bool | None = None
 
-    seed: int | None = None
     timeout_seconds: float | None = Field(default=None, gt=0)
-
-    extra_headers: dict[str, str] = Field(default_factory=dict)
-    extra_query: dict[str, Any] = Field(default_factory=dict)
-    extra_body: dict[str, Any] = Field(default_factory=dict)
 
 
 class LLMResponse(BaseModel):
@@ -180,8 +172,6 @@ class LLMResponse(BaseModel):
     tool_calls: list[NormalizedToolCall] = Field(default_factory=list)
     usage: TokenUsage = Field(default_factory=TokenUsage)
     finish_reason: FinishReason = FinishReason.UNKNOWN
-
-    raw_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolCallDelta(BaseModel):

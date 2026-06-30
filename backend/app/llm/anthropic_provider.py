@@ -17,7 +17,6 @@ from app.llm.exceptions import (
     LLMRateLimitError,
     LLMResponseFormatError,
     LLMTimeoutError,
-    LLMUnsupportedFeatureError,
 )
 from app.llm.schemas import (
     FinishReason,
@@ -178,12 +177,10 @@ class AnthropicAdapter(BaseLLMAdapter):
         options: LLMRequestOptions,
     ) -> dict[str, Any]:
         choice = options.tool_choice
-        if choice is None or choice.mode is ToolChoiceMode.AUTO:
+        if choice is None:
             payload: dict[str, Any] = {"type": "auto"}
         elif choice.mode is ToolChoiceMode.NONE:
             payload = {"type": "none"}
-        elif choice.mode is ToolChoiceMode.REQUIRED:
-            payload = {"type": "any"}
         else:
             payload = {"type": "tool", "name": choice.tool_name}
 
@@ -202,13 +199,6 @@ class AnthropicAdapter(BaseLLMAdapter):
         provider_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         options = options or LLMRequestOptions()
-
-        if options.seed is not None:
-            raise LLMUnsupportedFeatureError(
-                "Anthropic Messages API does not support the normalized seed option",
-                provider=self.provider,
-                code="seed_not_supported",
-            )
 
         illegal = self._RESERVED_REQUEST_KEYS.intersection(provider_kwargs)
         if illegal:
@@ -256,13 +246,6 @@ class AnthropicAdapter(BaseLLMAdapter):
             params["tools"] = self._serialize_tools(tools)
             params["tool_choice"] = self._serialize_tool_choice(options)
 
-        if options.extra_headers:
-            params["extra_headers"] = options.extra_headers
-        if options.extra_query:
-            params["extra_query"] = options.extra_query
-        if options.extra_body:
-            params["extra_body"] = options.extra_body
-
         params.update(provider_kwargs)
         return params
 
@@ -294,11 +277,8 @@ class AnthropicAdapter(BaseLLMAdapter):
     def _normalize_response(self, message: Any) -> LLMResponse:
         text_parts: list[str] = []
         tool_calls: list[NormalizedToolCall] = []
-        content_types: list[str] = []
-
         for block in message.content:
             block_type = getattr(block, "type", "unknown")
-            content_types.append(block_type)
             if block_type == "text":
                 text_parts.append(block.text)
             elif block_type == "tool_use":
@@ -307,7 +287,6 @@ class AnthropicAdapter(BaseLLMAdapter):
                         id=block.id,
                         name=block.name,
                         arguments=dict(block.input),
-                        raw_arguments=self._json_dumps(block.input),
                     )
                 )
 
@@ -319,19 +298,15 @@ class AnthropicAdapter(BaseLLMAdapter):
             tool_calls=tool_calls,
             usage=self._normalize_usage(getattr(message, "usage", None)),
             finish_reason=self._normalize_finish_reason(getattr(message, "stop_reason", None)),
-            raw_metadata={
-                "stop_sequence": getattr(message, "stop_sequence", None),
-                "content_block_types": content_types,
-            },
         )
 
     def _parse_streamed_tool_arguments(
         self,
-        raw_arguments: str,
+        argument_payload: str,
         *,
         tool_name: str,
-    ) -> tuple[dict[str, Any], str]:
-        raw = raw_arguments or "{}"
+    ) -> dict[str, Any]:
+        raw = argument_payload or "{}"
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -342,7 +317,7 @@ class AnthropicAdapter(BaseLLMAdapter):
                 cause=exc,
                 details={
                     "tool_name": tool_name,
-                    "raw_arguments": raw,
+                    "argument_payload": raw,
                 },
             ) from exc
 
@@ -353,10 +328,10 @@ class AnthropicAdapter(BaseLLMAdapter):
                 code="tool_arguments_not_object",
                 details={
                     "tool_name": tool_name,
-                    "raw_arguments": raw,
+                    "argument_payload": raw,
                 },
             )
-        return parsed, raw
+        return parsed
 
     def _map_exception(self, exc: Exception) -> Exception:
         request_id = getattr(exc, "request_id", None)
@@ -591,7 +566,7 @@ class AnthropicAdapter(BaseLLMAdapter):
             for index in sorted(tool_buffers):
                 buffer = tool_buffers[index]
                 name = buffer["name"]
-                arguments, raw_arguments = self._parse_streamed_tool_arguments(
+                arguments = self._parse_streamed_tool_arguments(
                     buffer["arguments"],
                     tool_name=name,
                 )
@@ -600,7 +575,6 @@ class AnthropicAdapter(BaseLLMAdapter):
                         id=buffer["id"] or f"tool_call_{index}",
                         name=name,
                         arguments=arguments,
-                        raw_arguments=raw_arguments,
                     )
                 )
 

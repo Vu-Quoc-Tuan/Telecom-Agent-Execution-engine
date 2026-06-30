@@ -39,7 +39,7 @@ class WorkflowCheckpointer:
             return self.saver
 
         if self.backend == "memory":
-            self.saver = InMemorySaver()
+            self.saver = InMemorySaver(serde=build_checkpoint_serializer())
             return self.saver
 
         if self.backend != "postgres":

@@ -47,6 +47,7 @@ class OpenAICompatibleConfig(LLMAdapterConfig):
         "max_completion_tokens",
     ] = "max_tokens"
     include_stream_usage: bool = False
+    supports_tool_strict: bool = True
 
 
 class OpenAICompatibleAdapter(BaseLLMAdapter):
@@ -73,8 +74,6 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             client_kwargs["organization"] = config.organization
         if config.project:
             client_kwargs["project"] = config.project
-        if config.default_headers:
-            client_kwargs["default_headers"] = config.default_headers
 
         self._client = AsyncOpenAI(**client_kwargs)
 
@@ -96,7 +95,13 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             if message.role is MessageRole.ASSISTANT:
                 payload: dict[str, Any] = {
                     "role": "assistant",
-                    "content": message.content,
+                    # Some OpenAI-compatible routers/models reject assistant history
+                    # messages that contain both natural-language text and tool_calls.
+                    # The causal link required by Chat Completions is the tool_calls
+                    # array itself; prior assistant text has already been streamed and
+                    # persisted for UI display, so omit it from tool-call transcript
+                    # turns to keep follow-up requests provider-compatible.
+                    "content": None if message.tool_calls else message.content,
                 }
                 if message.tool_calls:
                     payload["tool_calls"] = [
@@ -133,22 +138,26 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
 
         return output
 
-    @staticmethod
     def _serialize_tools(
+        self,
         tools: Sequence[LLMToolDefinition],
     ) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                    "strict": tool.strict,
-                },
+        serialized = []
+        for tool in tools:
+            func = {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
             }
-            for tool in tools
-        ]
+            if self.config.supports_tool_strict and tool.strict:
+                func["strict"] = True
+            serialized.append(
+                {
+                    "type": "function",
+                    "function": func,
+                }
+            )
+        return serialized
 
     @staticmethod
     def _serialize_tool_choice(
@@ -202,8 +211,6 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             params["top_p"] = options.top_p
         if options.stop is not None:
             params["stop"] = options.stop
-        if options.seed is not None:
-            params["seed"] = options.seed
         if options.timeout_seconds is not None:
             params["timeout"] = options.timeout_seconds
 
@@ -215,12 +222,6 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             if options.parallel_tool_calls is not None:
                 params["parallel_tool_calls"] = options.parallel_tool_calls
 
-        if options.extra_headers:
-            params["extra_headers"] = options.extra_headers
-        if options.extra_query:
-            params["extra_query"] = options.extra_query
-        if options.extra_body:
-            params["extra_body"] = options.extra_body
         if stream and self.config.include_stream_usage:
             params["stream_options"] = {"include_usage": True}
 
@@ -229,14 +230,14 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
 
     def _parse_tool_arguments(
         self,
-        raw_arguments: str | dict[str, Any] | None,
+        argument_payload: str | dict[str, Any] | None,
         *,
         tool_name: str,
-    ) -> tuple[dict[str, Any], str | None]:
-        if isinstance(raw_arguments, dict):
-            return raw_arguments, self._json_dumps(raw_arguments)
+    ) -> dict[str, Any]:
+        if isinstance(argument_payload, dict):
+            return argument_payload
 
-        raw = raw_arguments or "{}"
+        raw = argument_payload or "{}"
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -247,7 +248,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                 cause=exc,
                 details={
                     "tool_name": tool_name,
-                    "raw_arguments": raw,
+                    "argument_payload": raw,
                 },
             ) from exc
 
@@ -258,10 +259,10 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                 code="tool_arguments_not_object",
                 details={
                     "tool_name": tool_name,
-                    "raw_arguments": raw,
+                    "argument_payload": raw,
                 },
             )
-        return parsed, raw
+        return parsed
 
     @staticmethod
     def _normalize_finish_reason(
@@ -309,7 +310,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
 
         for raw_call in message.tool_calls or []:
             function = raw_call.function
-            arguments, raw_arguments = self._parse_tool_arguments(
+            arguments = self._parse_tool_arguments(
                 function.arguments,
                 tool_name=function.name,
             )
@@ -318,7 +319,6 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                     id=raw_call.id,
                     name=function.name,
                     arguments=arguments,
-                    raw_arguments=raw_arguments,
                 )
             )
 
@@ -330,13 +330,6 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             tool_calls=tool_calls,
             usage=self._normalize_usage(getattr(completion, "usage", None)),
             finish_reason=self._normalize_finish_reason(choice.finish_reason),
-            raw_metadata={
-                "system_fingerprint": getattr(
-                    completion,
-                    "system_fingerprint",
-                    None,
-                )
-            },
         )
 
     def _map_exception(self, exc: Exception) -> Exception:
@@ -513,10 +506,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                     name_delta = getattr(function, "name", None)
                     arguments_delta = getattr(function, "arguments", None)
                     if name_delta:
-                        if not buffer["name"]:
-                            buffer["name"] = name_delta
-                        elif not buffer["name"].endswith(name_delta):
-                            buffer["name"] += name_delta
+                        buffer["name"] += name_delta
                     if arguments_delta:
                         buffer["arguments"] += arguments_delta
 
@@ -540,7 +530,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             for index in sorted(tool_buffers):
                 buffer = tool_buffers[index]
                 name = buffer["name"]
-                arguments, raw_arguments = self._parse_tool_arguments(
+                arguments = self._parse_tool_arguments(
                     buffer["arguments"],
                     tool_name=name,
                 )
@@ -549,7 +539,6 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                         id=buffer["id"] or f"tool_call_{index}",
                         name=name,
                         arguments=arguments,
-                        raw_arguments=raw_arguments,
                     )
                 )
 

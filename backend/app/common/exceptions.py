@@ -19,13 +19,6 @@ class SafetyViolationError(TelecomAgentException):
         super().__init__(message, code="SAFETY_VIOLATION_LIMIT", details=details)
 
 
-class SkillCompilationError(TelecomAgentException):
-    """Ném ra khi hàm exec() không thể biên dịch chuỗi text Python của kỹ sư tải lên"""
-
-    def __init__(self, message: str, details: dict[str, Any] | None = None):
-        super().__init__(message, code="DYNAMIC_COMPILE_FAILED", details=details)
-
-
 class SkillRuntimeError(TelecomAgentException):
     """Ném ra khi kịch bản kĩ thuật đang chạy trên trạm thì bị crash nửa chừng"""
 

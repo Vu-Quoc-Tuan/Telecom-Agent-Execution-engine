@@ -49,3 +49,6 @@ class AgentState(BaseModel):
 
     # Lưu vết lỗi hệ thống nếu tiến trình gõ trạm hoặc chạy code bị crash
     execution_error: str | None = None
+
+    # Set only for the single LLM turn that explains a human rejection.
+    approval_rejected: bool = False

@@ -9,11 +9,9 @@ class SkillStatus(StrEnum):
     REJECTED = "rejected"
 
 
-class RiskLevel(StrEnum):
-    READ_ONLY = "read_only"
-    SAFE_ACTION = "safe_action"
-    DANGEROUS_ACTION = "dangerous_action"
-    PROHIBITED = "prohibited"
+class ExecutionMode(StrEnum):
+    AUTO_EXECUTE = "auto_execute"
+    REQUIRE_APPROVAL = "require_approval"
 
 
 class RunStatus(StrEnum):

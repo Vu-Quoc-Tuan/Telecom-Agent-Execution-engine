@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from typing import Any
 
 from app.llm.base import BaseLLMAdapter
@@ -105,18 +105,20 @@ class LLMGateway:
         system_prompt: str | None = None,
         tools: Sequence[LLMToolDefinition] | None = None,
         options: LLMRequestOptions | None = None,
+        provider_options: Mapping[str, LLMRequestOptions] | None = None,
         **provider_kwargs: Any,
     ) -> LLMResponse:
         errors: list[LLMError] = []
 
         for selected in self._provider_order(provider, fallback_providers):
             adapter = self.get_adapter(selected)
+            selected_options = (provider_options or {}).get(adapter.provider, options)
             try:
                 return await adapter.invoke(
                     messages,
                     system_prompt=system_prompt,
                     tools=tools,
-                    options=options,
+                    options=selected_options,
                     **provider_kwargs,
                 )
             except LLMError as error:
@@ -136,19 +138,21 @@ class LLMGateway:
         system_prompt: str | None = None,
         tools: Sequence[LLMToolDefinition] | None = None,
         options: LLMRequestOptions | None = None,
+        provider_options: Mapping[str, LLMRequestOptions] | None = None,
         **provider_kwargs: Any,
     ) -> AsyncIterator[LLMStreamChunk]:
         errors: list[LLMError] = []
 
         for selected in self._provider_order(provider, fallback_providers):
             adapter = self.get_adapter(selected)
+            selected_options = (provider_options or {}).get(adapter.provider, options)
             emitted = False
             try:
                 async for chunk in adapter.stream(
                     messages,
                     system_prompt=system_prompt,
                     tools=tools,
-                    options=options,
+                    options=selected_options,
                     **provider_kwargs,
                 ):
                     emitted = True
@@ -172,13 +176,4 @@ class LLMGateway:
         if errors:
             raise RuntimeError(f"Failed to close {len(errors)} LLM adapter(s)") from errors[0]
 
-    async def __aenter__(self) -> "LLMGateway":
-        return self
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: object | None,
-    ) -> None:
-        await self.close()

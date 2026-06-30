@@ -75,9 +75,6 @@ class LLMResponseFormatError(LLMError):
     pass
 
 
-class LLMUnsupportedFeatureError(LLMError):
-    pass
-
 
 class LLMAllProvidersFailedError(LLMError):
     def __init__(self, *, errors: list[LLMError]) -> None:

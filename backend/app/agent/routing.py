@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import uuid
 from typing import Literal
 
 from langchain_core.runnables import RunnableConfig
 
 from app.agent.builtin_tools import BUILTIN_TOOL_NAMES, classify_builtin_risk
 from app.agent.state import AgentState
+from app.common.exceptions import TelecomAgentException
+from app.database.repositories.messages import MessageRepository
 
 
 def decide_tool_route(
@@ -15,7 +18,9 @@ def decide_tool_route(
 ) -> Literal["execute_tools", "suspend_for_human", "fail"]:
     if not all_skills_ready or "prohibited" in risk_levels:
         return "fail"
-    if "dangerous_action" in risk_levels:
+    # classify_builtin_risk phát ra "require_approval" cho mọi payload ad-hoc do LLM
+    # sinh (SSH/SQL). Giữ "dangerous_action" để tương thích nhãn cũ truyền từ ngoài vào.
+    if "dangerous_action" in risk_levels or "require_approval" in risk_levels:
         return "suspend_for_human"
     return "execute_tools"
 
@@ -23,24 +28,52 @@ def decide_tool_route(
 def reliability_router(
     state: AgentState,
     config: RunnableConfig,
-) -> Literal["execute_tools", "suspend_for_human", "fail", "end"]:
+) -> Literal["execute_tools", "suspend_for_human", "fail", "end", "call_llm_gateway"]:
     """Route tool calls without mutating persistent state from the router."""
     if state.execution_error:
         return "end"
+
+    response = state.latest_response
+
+    # Không có tool call: hoặc đã ra câu trả lời cuối, hoặc cần quay lại LLM nếu có
+    # can thiệp của operator được xếp hàng trong lúc run đang chạy.
+    if not response or not response.tool_calls:
+        db = config["configurable"]["db"]
+        pending = MessageRepository.list_pending_interventions(db, uuid.UUID(state.run_id))
+        if pending:
+            return "call_llm_gateway"
+        return "end"
+
     if state.current_step_index >= state.max_steps:
         return "fail"
 
-    response = state.latest_response
-    if not response or not response.tool_calls:
-        return "end"
+    db = config["configurable"]["db"]
+    from app.database.repositories.skills import SkillRepository
+    try:
+        ready_skill_names = {s.name for s in SkillRepository.list_ready_skills(db)}
+    except Exception:
+        ready_skill_names = set()
 
     risk_levels: list[str] = []
     all_skills_ready = True
+    has_invalid_call = False
     for tool_call in response.tool_calls:
         if tool_call.name not in BUILTIN_TOOL_NAMES:
-            all_skills_ready = False
+            if tool_call.name in ready_skill_names:
+                has_invalid_call = True
+            else:
+                all_skills_ready = False
             continue
-        risk_levels.append(classify_builtin_risk(tool_call.name, tool_call.arguments))
+        try:
+            risk_levels.append(classify_builtin_risk(tool_call.name, tool_call.arguments))
+        except TelecomAgentException:
+            # Tool call không hợp lệ (payload cấm/sai schema): không crash router.
+            has_invalid_call = True
+
+    # Batch có tool call không hợp lệ → ưu tiên đẩy sang execute_tools để node tự
+    # validate và phản hồi lỗi lại cho LLM (feedback path), trước khi xét suspend.
+    if has_invalid_call and all_skills_ready:
+        return "execute_tools"
 
     return decide_tool_route(
         risk_levels=risk_levels,
