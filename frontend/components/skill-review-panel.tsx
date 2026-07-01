@@ -156,115 +156,113 @@ export function SkillReviewPanel({
   const allScriptsPassed = scripts.every(([, entry]) => entry.status === "passed");
 
   return (
-    <div className="fixed inset-0 z-20 flex justify-end bg-black/20" onClick={onClose}>
-      <aside
-        aria-label={`Review skill ${skill.name}`}
-        className="h-full w-full max-w-3xl overflow-y-auto border-l border-warm-border bg-surface-card shadow-xl"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <header className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-warm-border bg-surface-card px-5 py-4">
-          <div className="min-w-0">
-            <div className="mb-2 flex flex-wrap items-center gap-2">
-              <span className={`rounded px-2 py-1 text-xs font-semibold ${statusTone(skill.status)}`}>
-                {skill.status}
-              </span>
-              <span className="font-mono text-xs text-secondary-text">v{skill.version}</span>
-            </div>
-            <h2 className="break-words text-lg font-semibold">{skill.name}</h2>
-            <p className="mt-1 text-sm leading-5 text-secondary-text">{skill.description}</p>
+    <div
+      role="region"
+      aria-label={`Review skill ${skill.name}`}
+      className="flex flex-col h-full w-full bg-surface-card"
+    >
+      <header className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-warm-border bg-surface-card px-5 py-4 shrink-0">
+        <div className="min-w-0">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <span className={`rounded px-2 py-1 text-xs font-semibold ${statusTone(skill.status)}`}>
+              {skill.status}
+            </span>
+            <span className="font-mono text-xs text-secondary-text">v{skill.version}</span>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close skill review"
-            className="rounded-md p-2 text-secondary-text transition hover:bg-code-block hover:text-primary-text"
-          >
-            <CloseIcon className="h-5 w-5" />
-          </button>
-        </header>
-
-        <div className="space-y-6 p-5">
-          <section>
-            <h3 className="mb-2 text-sm font-semibold">SKILL.md instructions</h3>
-            <CodeBlock>{skill.skill_md}</CodeBlock>
-          </section>
-
-          <section>
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <h3 className="text-sm font-semibold">Package inventory</h3>
-              <span className="font-mono text-xs text-secondary-text">{files.length} files</span>
-            </div>
-            <div className="overflow-hidden border border-warm-border">
-              {files.length ? files.map(([path, file]) => (
-                <div key={path} className="flex items-center justify-between gap-3 border-b border-warm-border px-3 py-2 text-xs last:border-b-0">
-                  <span className="min-w-0 break-all font-mono">{path}</span>
-                  <span className="shrink-0 text-secondary-text">{file.media_type || file.encoding || "unknown"} · {file.size ?? 0} B</span>
-                </div>
-              )) : (
-                <p className="p-3 text-sm text-secondary-text">No bundled resources.</p>
-              )}
-            </div>
-          </section>
-
-          <section>
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <h3 className="text-sm font-semibold">Script validation evidence</h3>
-              {scripts.length > 0 && allScriptsPassed ? (
-                <span className="flex items-center gap-1 text-xs font-semibold text-status-sage">
-                  <CheckIcon className="h-3.5 w-3.5" /> All passed
-                </span>
-              ) : null}
-            </div>
-            {scripts.length ? (
-              <div className="overflow-hidden border border-warm-border">
-                {scripts.map(([path, entry]) => (
-                  <ScriptEvidence key={path} path={path} entry={entry} skill={skill} />
-                ))}
-              </div>
-            ) : (
-              <p className="border border-warm-border p-3 text-sm text-secondary-text">
-                This skill has no runnable Python scripts.
-              </p>
-            )}
-          </section>
-
-          <section>
-            <h3 className="mb-2 text-sm font-semibold">Validation audit log</h3>
-            <CodeBlock>{skill.security_review_log || "Backend has not recorded an audit log."}</CodeBlock>
-          </section>
-
-          <label className="block">
-            <span className="text-sm font-semibold">Reviewer note</span>
-            <textarea
-              value={note}
-              onChange={(event) => onNoteChange(event.target.value)}
-              className="mt-2 min-h-24 w-full resize-y rounded-md border border-warm-border bg-main-background p-3 text-sm"
-              placeholder="Reason for approving or rejecting this package"
-            />
-          </label>
+          <h2 className="break-words text-lg font-semibold">{skill.name}</h2>
+          <p className="mt-1 text-sm leading-5 text-secondary-text">{skill.description}</p>
         </div>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close skill review"
+          className="rounded-md p-2 text-secondary-text transition hover:bg-code-block hover:text-primary-text"
+        >
+          <CloseIcon className="h-5 w-5" />
+        </button>
+      </header>
 
-        <footer className="sticky bottom-0 grid grid-cols-2 gap-3 border-t border-warm-border bg-surface-card p-4">
-          {skill.status === "testing" ? (
-            <button
-              type="button"
-              onClick={() => onReview("approve")}
-              disabled={!allScriptsPassed}
-              title={!allScriptsPassed ? "Every script must pass validation before approval" : undefined}
-              className="h-11 rounded-md bg-accent-active text-sm font-semibold text-white hover:bg-[#b86205] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Approve package
-            </button>
-          ) : <span />}
+      <div className="flex-1 overflow-y-auto space-y-6 p-5">
+        <section>
+          <h3 className="mb-2 text-sm font-semibold">SKILL.md instructions</h3>
+          <CodeBlock>{skill.skill_md}</CodeBlock>
+        </section>
+
+        <section>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold">Package inventory</h3>
+            <span className="font-mono text-xs text-secondary-text">{files.length} files</span>
+          </div>
+          <div className="overflow-hidden border border-warm-border">
+            {files.length ? files.map(([path, file]) => (
+              <div key={path} className="flex items-center justify-between gap-3 border-b border-warm-border px-3 py-2 text-xs last:border-b-0">
+                <span className="min-w-0 break-all font-mono">{path}</span>
+                <span className="shrink-0 text-secondary-text">{file.media_type || file.encoding || "unknown"} · {file.size ?? 0} B</span>
+              </div>
+            )) : (
+              <p className="p-3 text-sm text-secondary-text">No bundled resources.</p>
+            )}
+          </div>
+        </section>
+
+        <section>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold">Script validation evidence</h3>
+            {scripts.length > 0 && allScriptsPassed ? (
+              <span className="flex items-center gap-1 text-xs font-semibold text-status-sage">
+                <CheckIcon className="h-3.5 w-3.5" /> All passed
+              </span>
+            ) : null}
+          </div>
+          {scripts.length ? (
+            <div className="overflow-hidden border border-warm-border">
+              {scripts.map(([path, entry]) => (
+                <ScriptEvidence key={path} path={path} entry={entry} skill={skill} />
+              ))}
+            </div>
+          ) : (
+            <p className="border border-warm-border p-3 text-sm text-secondary-text">
+              This skill has no runnable Python scripts.
+            </p>
+          )}
+        </section>
+
+        <section>
+          <h3 className="mb-2 text-sm font-semibold">Validation audit log</h3>
+          <CodeBlock>{skill.security_review_log || "Backend has not recorded an audit log."}</CodeBlock>
+        </section>
+
+        <label className="block">
+          <span className="text-sm font-semibold">Reviewer note</span>
+          <textarea
+            value={note}
+            onChange={(event) => onNoteChange(event.target.value)}
+            className="mt-2 min-h-24 w-full resize-y rounded-md border border-warm-border bg-main-background p-3 text-sm"
+            placeholder="Reason for approving or rejecting this package"
+          />
+        </label>
+      </div>
+
+      <footer className="sticky bottom-0 grid grid-cols-2 gap-3 border-t border-warm-border bg-surface-card p-4 shrink-0">
+        {skill.status === "testing" ? (
           <button
             type="button"
-            onClick={() => onReview("reject")}
-            className="h-11 rounded-md bg-status-crimson text-sm font-semibold text-white hover:bg-[#dc2626]"
+            onClick={() => onReview("approve")}
+            disabled={!allScriptsPassed}
+            title={!allScriptsPassed ? "Every script must pass validation before approval" : undefined}
+            className="h-11 rounded-md bg-accent-active text-sm font-semibold text-white hover:bg-[#b86205] disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {skill.status === "ready" ? "Emergency lock" : "Reject package"}
+            Approve package
           </button>
-        </footer>
-      </aside>
+        ) : <span />}
+        <button
+          type="button"
+          onClick={() => onReview("reject")}
+          className="h-11 rounded-md bg-status-crimson text-sm font-semibold text-white hover:bg-[#dc2626]"
+        >
+          {skill.status === "ready" ? "Emergency lock" : "Reject package"}
+        </button>
+      </footer>
     </div>
   );
 }

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { ChangeEvent, FormEvent, useMemo, useState } from "react";
 import { apiUrl } from "@/lib/api";
-import { ArrowLeftIcon, SkillsIcon, UploadIcon } from "@/components/icons";
+import { ArrowLeftIcon, SkillsIcon, UploadIcon, TelecomLogo } from "@/components/icons";
 
 type UploadResult = {
   status: string;
@@ -157,10 +157,13 @@ export default function SkillUploadPage() {
 
   return (
     <main className="flex min-h-screen flex-col bg-main-background text-primary-text">
-      <header className="flex h-14 items-center justify-between border-b border-warm-border px-5">
-        <div>
-          <h1 className="text-sm font-semibold">Upload & thẩm định Skill</h1>
-          <p className="text-xs text-secondary-text">Zip package · metadata preview · sandbox review</p>
+      <header className="flex h-14 shrink-0 items-center justify-between border-b border-warm-border bg-surface-card px-5 z-10">
+        <div className="flex items-center gap-3">
+          <TelecomLogo className="h-6 w-6 text-accent-active" />
+          <div className="flex flex-col">
+            <h1 className="text-sm font-semibold text-primary-text leading-tight">Thẩm định Skill Agent</h1>
+            <p className="text-[10px] text-secondary-text">zip package · metadata preview · sandbox review</p>
+          </div>
         </div>
         <nav className="flex items-center gap-2">
           <Link

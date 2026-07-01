@@ -59,8 +59,6 @@ export type PendingApproval = {
   tool_name?: string | null;
   tool_input?: Record<string, unknown> | null;
   risk_level?: string | null;
-  required_confirmations: number;
-  confirmation_count: number;
   status: "pending" | "approved" | "rejected";
 };
 

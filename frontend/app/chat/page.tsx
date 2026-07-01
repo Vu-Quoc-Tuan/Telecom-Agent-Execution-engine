@@ -15,6 +15,7 @@ import {
   TrashIcon,
   UploadIcon,
   CloseIcon,
+  TelecomLogo,
 } from "@/components/icons";
 import { MarkdownMessage } from "@/components/markdown-message";
 import { apiFetch, apiUrl } from "@/lib/api";
@@ -264,13 +265,11 @@ function approvalInputRows(approval: PendingApproval) {
 function Sidebar({
   sessions,
   activeSessionId,
-  onCreate,
   onSelect,
   onDelete,
 }: {
   sessions: ChatSession[];
   activeSessionId: string | null;
-  onCreate: () => void;
   onSelect: (sessionId: string) => void;
   onDelete: (sessionId: string) => void;
 }) {
@@ -278,15 +277,9 @@ function Sidebar({
 
   return (
     <aside className="hidden h-screen w-[260px] shrink-0 flex-col border-r border-warm-border bg-surface-card md:flex">
-      <div className="border-b border-warm-border p-3">
-        <button
-          type="button"
-          onClick={onCreate}
-          className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-warm-border bg-surface-card text-sm font-medium transition hover:border-accent-active hover:bg-main-background"
-        >
-          <PlusIcon className="h-4 w-4" />
-          Phiên hội thoại mới
-        </button>
+      <div className="flex h-14 items-center gap-2 border-b border-warm-border px-4">
+        <TelecomLogo className="h-6 w-6 text-accent-active" />
+        <span className="text-sm font-semibold tracking-wide text-primary-text">Telecom Agent</span>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
         {Object.entries(grouped).map(([label, items]) =>
@@ -354,22 +347,11 @@ function ApprovalCard({
 }) {
   const toolName = approvalToolName(approval);
   const inputRows = approvalInputRows(approval);
-  const requiredConfirmations = Math.max(1, approval.required_confirmations || 1);
-  const confirmationCount = Math.max(0, approval.confirmation_count || 0);
-  const isCritical = requiredConfirmations > 1;
-  const approveLabel = isCritical
-    ? confirmationCount + 1 < requiredConfirmations
-      ? `Xác nhận lần ${confirmationCount + 1}`
-      : "Xác nhận lần 2 và chạy"
-    : "Cho chạy";
+  const approveLabel = "Cho chạy";
 
   return (
     <div
-      className={`rounded-lg border p-4 ${
-        isCritical
-          ? "border-status-crimson bg-status-crimson/5"
-          : "border-accent-active bg-[#fff8eb]"
-      }`}
+      className="rounded-lg border border-accent-active bg-[#fff8eb] p-4"
     >
       <div className="mb-3 flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -377,21 +359,13 @@ function ApprovalCard({
             Cần duyệt: {toolName}
           </h3>
           <p className="mt-1 text-sm text-secondary-text">
-            {isCritical
-              ? "Tác vụ đặc biệt nguy hiểm cần xác nhận tăng cường trước khi chạy."
-              : "Tác vụ có thay đổi trạng thái cần xác nhận trước khi chạy."}
+            Tác vụ có thay đổi trạng thái cần xác nhận trước khi chạy.
           </p>
         </div>
         <span
-          className={`shrink-0 rounded-md border px-2 py-1 text-[11px] font-semibold ${
-            isCritical
-              ? "border-status-crimson/30 bg-status-crimson/10 text-status-crimson"
-              : "border-accent-active/30 bg-accent-active/10 text-accent-active"
-          }`}
+          className="shrink-0 rounded-md border border-accent-active/30 bg-accent-active/10 px-2 py-1 text-[11px] font-semibold text-accent-active"
         >
-          {isCritical
-            ? `Xác nhận ${confirmationCount}/${requiredConfirmations}`
-            : "Chờ duyệt"}
+          Chờ duyệt
         </span>
       </div>
 
@@ -423,11 +397,7 @@ function ApprovalCard({
         <button
           type="button"
           onClick={() => onResolve("approved")}
-          className={`h-10 rounded-lg text-sm font-semibold text-white transition ${
-            isCritical
-              ? "bg-status-crimson hover:opacity-90"
-              : "bg-accent-active hover:bg-[#b86205]"
-          }`}
+          className="h-10 rounded-lg bg-accent-active text-sm font-semibold text-white transition hover:bg-[#b86205]"
         >
           {approveLabel}
         </button>
@@ -1089,21 +1059,10 @@ export default function ChatPage() {
       }
     }
     if (event.event === "run_suspended") {
-      const requiredConfirmations =
-        typeof payload.required_confirmations === "number"
-          ? payload.required_confirmations
-          : 1;
-      const confirmationCount =
-        typeof payload.confirmation_count === "number" ? payload.confirmation_count : 0;
-      updateAssistant(assistantId, (message) => ({
-        ...message,
-        content:
-          message.content ||
-          (confirmationCount > 0
-            ? `Đã ghi nhận xác nhận ${confirmationCount}/${requiredConfirmations}. Tác vụ chưa được thực thi.`
-            : "Tác vụ đang chờ người vận hành phê duyệt và chưa được thực thi."),
-        status: "done",
-      }));
+      setMessages((current) => current.filter((message) => message.id !== assistantId));
+      if (activeAssistantIdRef.current === assistantId) {
+        activeAssistantIdRef.current = null;
+      }
       setStreaming(false);
       setApproval({
         approval_request_id: String(payload.approval_request_id ?? ""),
@@ -1114,8 +1073,6 @@ export default function ChatPage() {
             ? (payload.tool_input as Record<string, unknown>)
             : null,
         risk_level: typeof payload.risk_level === "string" ? payload.risk_level : null,
-        required_confirmations: requiredConfirmations,
-        confirmation_count: confirmationCount,
         status: "pending",
       });
     }
@@ -1123,7 +1080,7 @@ export default function ChatPage() {
       const finalAnswer = typeof payload.final_answer === "string" ? payload.final_answer : "";
       updateAssistant(assistantId, (message) => ({
         ...message,
-        content: message.content || finalAnswer,
+        content: finalAnswer || message.content,
         status: "done",
         run_id: typeof payload.run_id === "string" ? payload.run_id : message.run_id,
       }));
@@ -1340,24 +1297,32 @@ export default function ChatPage() {
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
-        onCreate={() => void createSession()}
         onSelect={(sessionId) => void loadSessionMessages(sessionId)}
         onDelete={(sessionId) => void deleteSession(sessionId)}
       />
       <section className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center justify-between border-b border-warm-border bg-main-background px-5">
-          <div>
-            <h1 className="text-sm font-semibold">Telecom Agent Console</h1>
-            <p className="text-xs text-secondary-text">SSE token stream · HITL approval · run timeline</p>
+          <div className="flex items-center gap-3">
+            <TelecomLogo className="h-6 w-6 text-accent-active md:hidden" />
+            <div className="flex items-center gap-2 text-xs">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  activeRunId ? "animate-pulse bg-accent-active" : "bg-status-sage"
+                }`}
+              />
+              <span className="font-medium text-secondary-text">
+                {activeRunId ? "Agent đang chạy · có thể can thiệp" : "Backend stream ready"}
+              </span>
+            </div>
           </div>
-          <div className="flex items-center gap-2 text-xs">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                activeRunId ? "animate-pulse bg-accent-active" : "bg-status-sage"
-              }`}
-            />
-            {activeRunId ? "Agent đang chạy · có thể can thiệp" : "Backend stream ready"}
-          </div>
+          <button
+            type="button"
+            onClick={() => void createSession()}
+            className="flex h-9 items-center justify-center gap-2 rounded-lg border border-warm-border bg-surface-card px-4 text-xs font-medium transition hover:border-accent-active hover:bg-main-background"
+          >
+            <PlusIcon className="h-4 w-4" />
+            Phiên hội thoại mới
+          </button>
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-6">
           <div className="mx-auto flex max-w-4xl flex-col gap-5">

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Telecom Agent Console",
+  title: "Telecom Agent",
   description: "Operational console for telecom agent execution, approvals, and skill review.",
 };
 

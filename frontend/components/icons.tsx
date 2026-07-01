@@ -27,6 +27,27 @@ export function PlusIcon(props: IconProps) {
   );
 }
 
+export function TelecomLogo(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+      {...props}
+    >
+      <path d="M5 3a10 10 0 0 1 14 0" />
+      <path d="M8 6a6 6 0 0 1 8 0" />
+      <circle cx="12" cy="11" r="1.5" fill="currentColor" />
+      <path d="M12 11v10M9 21h6" />
+      <path d="M9 16h6" />
+    </svg>
+  );
+}
+
 export function TrashIcon(props: IconProps) {
   return (
     <Icon {...props}>
