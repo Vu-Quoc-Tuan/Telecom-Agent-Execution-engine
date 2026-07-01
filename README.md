@@ -55,18 +55,22 @@ into a free-form code execution tool.
 
 Runtime auto-execution is limited to approved skill scripts and backend-owned built-in
 capabilities. Model-generated Python, shell, SQL, SSH commands, wrappers, or script bodies are not
-pre-approved. They must be rejected or routed to human approval with the exact generated payload,
-even when a static scanner says they look safe. Infrastructure credentials, connector access, risk
-routing, and human approval stay under backend control.
+pre-approved. They are rejected unless implemented as a reviewed skill script or backend-owned
+capability, even when a static scanner says they look safe. Infrastructure credentials, connector
+access, risk routing, and human approval stay under backend control.
 
 Backend-owned capabilities are fixed runners/templates with JSON arguments, for example
-`get_site_alarm_summary`, `get_site_kpi_snapshot`, `get_site_inventory`, and
-`get_node_health_snapshot`. Free-form `query_*` and `run_ssh_command` calls are proposal paths for
-human approval, not auto-run capabilities.
+`get_site_alarm_summary`, `get_site_kpi_snapshot`, `get_site_inventory`,
+`get_node_health_snapshot`, `ping_node`, and `restart_service`. Free-form `query_*` and
+`run_ssh_command` calls are intentionally not exposed; model-generated SQL, shell, SSH, Python, or
+wrapper payloads are rejected unless they are implemented as a reviewed skill script or a
+backend-owned capability.
 
 For SSH, `node_name` should normally be a resolvable host. If operators use logical node names,
 set `SSH_NODE_HOST_MAP` as comma-separated `node=host` pairs, for example
-`site-a=10.0.0.11,site-b=node-b.internal`.
+`site-a=10.0.0.11,site-b=node-b.internal`. `restart_service` is exposed only when
+`SSH_RESTART_ALLOWED_SERVICES` contains at least one safe service/unit name such as `nginx` or
+`node-exporter.service`, and it always suspends for human approval before execution.
 
 ## Chat Stream
 

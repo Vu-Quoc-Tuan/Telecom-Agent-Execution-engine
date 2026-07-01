@@ -1,149 +1,151 @@
-# Telecom Agent Architecture
+# Telecom Agent Execution Engine: System Architecture & LLM Provider Configuration Guide
 
-## Overview
+This document provides a comprehensive guide to the system architecture, security controls, and LLM provider configurations for the Telecom Agent Execution Engine.
 
-The backend is a FastAPI and LangGraph execution engine for telecom operations. It separates
-operational knowledge from infrastructure access:
+---
 
-- Agent Skills packages contain instructions, references, assets, and pre-authored scripts.
-- Built-in capabilities own hardcoded telecom operations, connector access, and sandboxed execution
-  of approved skill scripts.
-- Built-in operations use two modes: `auto_execute` or `require_approval`.
-- PostgreSQL stores sessions, runs, timeline steps, approvals, skills, and audit records.
-- Cube Sandbox (optional) provides hardware-isolated MicroVM execution for Python scripts.
+## 1. System Architecture
 
-Authentication is intentionally outside the current development scope. The API must remain on a
-trusted network until authentication and authorization are added.
+The Telecom Agent Execution Engine is built using a **Zero-Trust layered architecture** designed to execute untrusted operator-uploaded scripts and interact safely with physical telecom nodes.
 
-## Layers
+### 1.1 Layered Design
 
-```text
-FastAPI API and SSE streaming
-            |
-LangGraph orchestration and run lifecycle
-            |
-LLM gateway (OpenAI-compatible / Anthropic)
-            |
-Agent Skills catalog and progressive disclosure
-            |
-Script registry, safety routing, and human approval
-            |
-SSH / ClickHouse / external PostgreSQL connectors
-            |
-Cube Sandbox (MicroVM code execution)
-            |
-Application PostgreSQL and LangGraph checkpointer
+```mermaid
+flowchart TD
+    %% Clients
+    A["Operator UI (Next.js Frontend)"] <-->|REST API / SSE Streams| B["FastAPI API Gateway"]
+
+    %% Core Services
+    subgraph Backend Engine (FastAPI)
+        B <--> C["Agent Services & Run Coordinator"]
+        C <--> D["LangGraph Orchestrator (StateGraph)"]
+        D <--> E["LLM Gateway (Multi-Provider Adapters)"]
+        D <--> F["Agent Skills Catalog & Registry"]
+    end
+
+    %% Security & Sandbox
+    subgraph Security Layer
+        G["Advanced AST Security Analyzer"]
+        H["Agent Safety Guard (SSH/SQL Filters)"]
+        I["Docker Sandbox Executor (Isolated Run)"]
+    end
+
+    %% External Infrastructure
+    subgraph External Infrastructure
+        J["ClickHouse DB (KPIs & Alarms)"]
+        K["PostgreSQL (Inventory DB)"]
+        L["Remote Nodes (SSH Server)"]
+    end
+
+    %% Telemetry & Storage
+    M[(App PostgreSQL & LangGraph Checkpointer)] <--> D & C
+    N["Langfuse (Telemetry & Prompt Management)"] <--> E & D
+
+    %% Connections
+    F --> G
+    D --> I
+    I -->|No Network / Read-Only Workspace| G
+    D --> H
+    H --> J & K & L
 ```
 
-## Agent Skills
+### 1.2 Component Breakdown
 
-The registry accepts a ZIP archive containing one Agent Skill directory:
+1. **API Gateway (FastAPI):** Exposes RESTful endpoints for session management, run control, skill registry upload/review, and streams real-time step progress using Server-Sent Events (SSE).
+2. **LangGraph Orchestrator:** Coordinates the agent's reasoning-acting loop using a stateful cyclic graph (`StateGraph`). It uses a PostgreSQL checkpointer to persist execution states, allowing runs to be suspended for human approval and resumed seamlessly.
+3. **LLM Gateway:** Decouples model calls from specific API implementations, exposing a unified interface (`BaseLLMProvider`) supporting OpenAI and Anthropic adapters.
+4. **Agent Skills Registry:** Manages user-uploaded skills packages structured according to the `agentskills.io` specification.
+5. **Security & Sandbox Layer:** Implements strict containment and validation rules:
+   - **Static AST Scan:** Evaluates uploaded Python scripts to block unauthorized imports and system calls.
+   - **Docker Sandbox Executor:** Launches short-lived, network-isolated, CPU/memory-constrained containers to execute approved skill scripts.
+   - **Safety Guards:** Filters runtime SQL commands (read-only enforcement) and SSH commands (command blocking and privilege escalation prevention).
+6. **Telemetry & Observability (Langfuse):** Logs execution traces, session runs, model invocation latency, input/output tokens, and hosts prompt templates versioned under the `production` tag.
+
+---
+
+## 2. LLM Provider Configuration Guide
+
+The engine supports dynamic routing between different LLM providers using the **Gateway Adapter Pattern**. All configurations are loaded from environment variables in the `.env` file.
+
+### 2.1 LLM Gateway Configuration Parameters
+
+| Environment Variable | Allowed Values | Description |
+|----------------------|----------------|-------------|
+| `PROVIDER` | `openai`, `anthropic` | The active LLM provider adapter. |
+| `OPENAI_API_KEY` | String (`sk-proj-...`) | Required if `PROVIDER=openai`. |
+| `OPENAI_MODEL_NAME` | String (`gpt-4o`, `gpt-4-turbo`) | OpenAI model identifier. |
+| `ANTHROPIC_API_KEY` | String (`sk-ant-api03-...`) | Required if `PROVIDER=anthropic`. |
+| `ANTHROPIC_MODEL_NAME` | String (`claude-3-5-sonnet-20241022`) | Anthropic Claude model identifier. |
+
+### 2.2 Adapter Implementation Details
+
+- **OpenAI Adapter (`OpenAICompatibleAdapter`):** Integrates with the official `openai` Python SDK. It formats tool definitions according to the Chat Completion API and supports strict schemas for tool calling (`strict=True`) to guarantee argument matches.
+- **Anthropic Adapter (`AnthropicAdapter`):** Integrates with the official `anthropic` SDK. It converts standard chat messages and system instructions to Claude's structure, translating tools into XML-like schemas.
+
+### 2.3 Context Window Compaction Settings
+
+To prevent token exhaustion during multi-turn diagnostic tasks, the engine enforces automatic context window compaction. The behavior is governed by the following settings in `backend/app/config.py`:
+
+- `context_window_tokens` (Default: `200000`): The maximum context limit.
+- `context_compaction_trigger_ratio` (Default: `0.65`): Compaction starts when estimated tokens exceed $65\%$ of the limit.
+- `context_compaction_target_ratio` (Default: `0.45`): Compaction trims history down to target $45\%$ of the limit.
+
+When triggered, the engine summarizes older turns into a single system message (`[AUTO-COMPACTED CONTEXT]`) while preserving recent turns and tool-calling parity.
+
+---
+
+## 3. Security Architecture & Sandboxing
+
+### 3.1 6-Stage Upload Validation Pipeline
+
+Every skill ZIP uploaded is verified against a strict pipeline:
+
+1. **Package & Structure Scan:** Verifies archive integrity, file path safety (no path traversal, no backslashes), file sizes (archive $\le 10$ MB, single file $\le 5$ MB), and confirms a valid `SKILL.md` is present.
+2. **Static AST Scan:** Parses Python code using `AdvancedASTSecurityAnalyzer` to block:
+   - System imports (`os`, `subprocess`, `sys`, `socket`, `paramiko`, etc.).
+   - Execution helpers (`eval`, `exec`, `getattr`, `__import__`).
+   - Private attributes (dunder references).
+   - Sensitive file paths (`/etc/passwd`, `.env`, `id_rsa`).
+3. **Taxonomy Validation:** Scores telecom keyword occurrences in the skill definition to ensure relevance.
+4. **LLM Domain Judge:** The skill description is audited by an LLM-assisted judge. Skills with `taxonomy_score < 0.25` AND `llm_score < 0.5` are rejected.
+5. **Docker Smoke Test:** If Docker is configured, the script is run with proposed test arguments in a network-less, resource-constrained container to verify it exits with code `0` and satisfies output contracts.
+6. **Human-in-the-Loop Review:** The skill is staged as `testing`. A human operator must manually approve the skill via the admin API to switch its status to `ready`.
+
+### 3.2 3-Stage Runtime Gates
+
+When the agent invokes an approved skill script using `run_skill_script`, three checkpoints are executed at runtime:
 
 ```text
-check-kpis/
-├── SKILL.md
-├── scripts/       # Optional, stored and disclosed as resources
-├── references/    # Optional supporting documentation
-└── assets/        # Optional text or binary assets
+[Agent Invokes run_skill_script]
+               |
+               v
+  [Gate 1: SHA256 Hash Verification]  ---> Mismatch? ---> [Abort & Raise Error]
+               | (Matches approved catalog)
+               v
+  [Gate 2: Input JSON Schema Validation]  ---> Invalid? ---> [Abort & Raise Error]
+               | (Matches parameters schema)
+               v
+  [Docker Sandbox Execution (Isolated)]
+               |
+               v
+  [Gate 3: Output Contract Validation] ---> Mismatch? ---> [Abort & Raise Error]
+               | (Matches return schema)
+               v
+  [Result Returned to Agent]
 ```
 
-`SKILL.md` uses the Agent Skills frontmatter contract. `name` and `description` are required;
-`license`, `compatibility`, `metadata`, and `allowed-tools` are optional. The package parser checks
-naming rules, path safety, duplicate files, file counts, compressed and uncompressed sizes, and
-compression ratios.
+### 3.3 Safe Database & SSH Access Controls
 
-Scripts in `scripts/` are executable resources, not free-form model context. During upload review,
-the backend may use an LLM analyzer to read `SKILL.md`, script names, and script source to propose
-how each script should be smoke-tested and later invoked. That analyzer output is only a validation
-proposal: the backend must validate it, run it inside Cube Sandbox, and show it to the human reviewer
-before it becomes a runtime capability.
+For direct infrastructure checks, the engine overrides free-form code with hardcoded guards:
+- **ClickHouse / PostgreSQL Guards:** Blocks SQL keywords modifying structures/data (`UPDATE`, `INSERT`, `DELETE`, `ALTER`, etc.). Enforces select-only statements and restricts nested output dumps (`INTO OUTFILE`).
+- **SSH Guardrails:** Classifies commands into `AUTO_EXECUTE` (read-only checks like `uname`, `free -m`, `ping`) and `REQUIRE_APPROVAL` (status-changing commands like `systemctl restart`). Commands containing system paths or blocklisted patterns (`rm -rf`, `reboot`, `chmod 777`) are blocked outright.
 
-At runtime, the model may see script path, purpose, and the approved invocation shape. Normal script
-execution must call the backend with `skill_name`, `script_path`, and JSON `arguments`. The backend
-loads the stored script content itself and executes exactly that reviewed artifact. The model must
-not copy script source into an ad-hoc code execution tool just to run it.
+---
 
-The system follows progressive disclosure:
+## 4. Observability & Telemetry
 
-1. The system prompt lists only `name` and `description` for every `ready` skill.
-2. The model calls `load_skill` to load the selected Markdown instructions.
-3. The model calls `read_skill_file` only for referenced documentation, lookup tables, or assets
-   needed to understand the procedure. Reading script source is not required for normal execution.
-4. The model calls `run_skill_script(skill_name, script_path, arguments)` to execute a bundled
-   script whose run spec was validated during upload review.
+Observability is handled via the **Langfuse SDK**, pushing traces asynchronously to avoid API call blocking:
 
-Uploaded scripts are untrusted until they pass validation. Python scripts receive static AST
-analysis, secret scanning, domain checks, and sandbox runtime validation during the upload pipeline.
-Only scripts that pass these gates and belong to a `ready` skill are eligible for `auto_execute`.
-Operational actions outside skill scripts must go through backend-owned built-in capabilities. A
-built-in capability is a hardcoded runner or query/template owned by the backend; the model only
-chooses the capability and supplies JSON arguments. Free-form SQL, SSH commands, shell snippets, or
-Python bodies generated by the model are not built-in capabilities.
-
-## Skill Validation Lifecycle
-
-```text
-ZIP upload
-   -> package and frontmatter validation
-   -> resource limits and path validation
-   -> secret scan and Python AST scan
-   -> telecom taxonomy score
-   -> optional LLM domain judge
-   -> LLM-assisted run-spec and smoke-test proposal for bundled scripts
-   -> backend validation of the proposed run specs
-   -> Cube Sandbox smoke tests for bundled scripts
-   -> testing (human review)
-   -> ready or rejected
-```
-
-Uploading a package whose name already exists returns HTTP `409`; it never deletes or replaces the
-active skill. Updating a skill requires an explicit revision workflow, which is not implemented yet.
-
-Validation is fail-closed for executable scripts. If a bundled script fails static analysis, secret
-scan, domain validation, run-spec validation, or Cube smoke testing, that script cannot become an
-auto-runnable runtime capability. The simplest v1 policy is to reject the whole package when any
-script fails. A later revision may allow a package to be approved while excluding failed scripts, but
-excluded scripts must not appear in the runtime manifest.
-Human approval is also blocked while any script manifest entry remains outside `passed`, including
-`pending_sandbox` entries from an upload where Cube Sandbox was unavailable.
-
-## Tool Safety
-
-The runtime has three capability classes:
-
-1. Approved skill scripts. These are user-uploaded scripts that passed upload validation, Cube smoke
-   tests, and human review. They run through `run_skill_script(skill_name, script_path, arguments)`.
-2. Backend-owned built-in capabilities. These are hardcoded scripts, query templates, or connector
-   operations shipped by the backend. They expose fixed names, descriptions, runners, and JSON
-   argument shapes. The model supplies arguments; it does not write the command/query/code body.
-   Examples are `get_site_alarm_summary`, `get_site_kpi_snapshot`, `get_site_inventory`, and
-   `get_node_health_snapshot`.
-3. LLM-generated executable payloads. These include Python code, shell snippets, SQL strings, SSH
-   commands, wrappers, or scripts invented during a run. They are never auto-executable. The backend
-   must reject them or create a human approval request for the exact payload.
-
-Skill-loading and skill-script tools are registered only when at least one skill is `ready`; their
-`skill_name` schema is constrained to the current catalog, and `script_path` is constrained to
-approved scripts in the stored runtime manifest. Built-in capabilities are registered from a backend
-registry, not from prompt text. Free-form connector tools such as arbitrary SQL or SSH commands must
-not be treated as auto-executable built-ins merely because a classifier labels them low-risk.
-
-Sandbox execution has separate policies for each runtime class:
-
-- `run_skill_script` runs a previously uploaded, validated, approved script using the stored run
-  spec. It can use `auto_execute` because the executable artifact and invocation shape are fixed,
-  stored by the backend, and tied to a ready skill revision. If the manifest declares a JSON output
-  contract, both upload smoke testing and runtime validate stdout against it.
-- Backend-owned built-in capabilities may use `auto_execute` only when their hardcoded runner and
-  argument schema make the operation safe by construction.
-- LLM-generated executable payloads are not auto-executable. Even if a static scan looks clean, they
-  did not pass the upload review pipeline or ship as backend-owned capabilities, so they must be
-  rejected or routed to `require_approval` with the exact generated payload shown to the operator.
-
-Before any code reaches Cube Sandbox, the backend still performs static AST/security analysis to
-reject dangerous imports, unsafe function calls, Python jailbreak techniques, secret access, and
-resource-abuse patterns. Sandbox isolation is a containment layer, not permission for the model to
-invent executable code and run it automatically.
-Uploaded scripts also cannot use background execution primitives such as threads, multiprocessing,
-async task schedulers, process forking helpers, or shutdown hooks; long foreground work is bounded
-by Cube timeout/output limits, and memory limits should be enforced by the Cube template/runtime.
+- **Trace Routing:** Every execution run starts a trace identified by `run_id` and grouped under `session_id`.
+- **DLP Redactor:** A local regex-based data loss prevention layer (`DataRedactor`) scrubs API keys, passwords, and private key strings from trace inputs/outputs, replacing them with `[[MASKED_SECRET]]` before they leave the host.
+- **Prompt Registry:** Prompt templates are fetched dynamically from the Langfuse registry using the `production` tag, enabling safe, live updates to safety prompts without code modification.

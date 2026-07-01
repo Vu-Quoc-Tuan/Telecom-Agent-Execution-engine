@@ -51,7 +51,7 @@ Plaintext
 
     Hành vi nghiêm cấm: Không expose tool free-form ở chế độ `auto_execute` cho mã Python, shell, SQL, SSH command, wrapper hoặc script body do LLM tự sinh trong lúc chat. Một payload sạch theo AST/regex vẫn chưa phải là artifact đã được duyệt.
 
-    Tiêu chuẩn bắt buộc: Chỉ hai nhóm được auto-run: script nằm trong gói skill đã qua static scan, secret scan, domain validation, LLM-assisted run-spec proposal, backend validation, Cube smoke test và human approval; hoặc backend-owned built-in capability do dev hardcode runner/template/schema. Payload phát sinh ngoài hai nhóm này phải bị từ chối hoặc chuyển sang luồng human approval với payload chính xác.
+    Tiêu chuẩn bắt buộc: Chỉ hai nhóm được auto-run: script nằm trong gói skill đã qua static scan, secret scan, domain validation, LLM-assisted run-spec proposal, backend validation, Cube smoke test và human approval; hoặc backend-owned built-in capability do dev hardcode runner/template/schema. Payload phát sinh ngoài hai nhóm này phải bị từ chối; nếu cần vận hành lặp lại thì phải thêm reviewed skill script hoặc backend-owned HITL capability với schema cố định.
 
 3. Lý do Kiến trúc (Architectural Justification)
 

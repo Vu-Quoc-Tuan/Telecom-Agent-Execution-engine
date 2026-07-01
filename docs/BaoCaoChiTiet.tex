@@ -1,0 +1,778 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[T5]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[vietnam]{babel}
+\usepackage{geometry}
+\geometry{a4paper,margin=2.5cm}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{color}
+\usepackage{float}
+\usepackage{caption}
+
+% TikZ package and libraries for high-quality vector graphics
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds, calc}
+
+\definecolor{dkgreen}{rgb}{0,0.45,0}
+\definecolor{gray}{rgb}{0.5,0.5,0.5}
+\definecolor{mauve}{rgb}{0.58,0,0.82}
+\definecolor{lightgray}{rgb}{0.96,0.96,0.96}
+\definecolor{diagramblue}{rgb}{0.08,0.22,0.48}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=diagramblue,
+  urlcolor=diagramblue,
+  citecolor=diagramblue
+}
+
+\tikzset{
+    block/.style={rectangle, draw, fill=blue!10, text width=3.2cm, minimum height=1cm, align=center, rounded corners=3pt, font=\scriptsize},
+    subblock/.style={rectangle, draw, fill=gray!10, text width=2.3cm, minimum height=0.7cm, align=center, rounded corners=2pt, font=\tiny},
+    database/.style={cylinder, draw, shape border rotate=90, fill=green!10, text width=1.5cm, minimum height=1.2cm, align=center, font=\tiny},
+    cloud/.style={draw, ellipse, fill=orange!10, minimum height=0.8cm, align=center, font=\tiny},
+    actor/.style={draw, circle, fill=red!10, minimum size=1cm, align=center, font=\scriptsize},
+    decision/.style={draw, diamond, aspect=1.5, fill=yellow!10, text width=1.8cm, align=center, font=\tiny},
+    arrow/.style={thick, -{Stealth[scale=1.0]}}
+}
+
+\lstset{
+  backgroundcolor=\color{lightgray},
+  frame=single,
+  basicstyle={\small\ttfamily},
+  columns=flexible,
+  breaklines=true,
+  breakatwhitespace=true,
+  tabsize=2,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue},
+  commentstyle=\color{dkgreen},
+  stringstyle=\color{mauve},
+  aboveskip=3mm,
+  belowskip=3mm
+}
+
+\begin{document}
+
+% =====================================================
+% OPENING PART
+% =====================================================
+\newpage
+\thispagestyle{empty}
+
+\begin{center}
+\large \textbf{TRƯỜNG ĐẠI HỌC CÔNG NGHỆ -- ĐẠI HỌC QUỐC GIA HÀ NỘI}\\
+\large \textbf{BÁO CÁO THỰC TẬP TỐT NGHIỆP CHUYÊN NGÀNH CÔNG NGHỆ THÔNG TIN}\\
+\vspace{1.4cm}
+
+\Large \textbf{XÂY DỰNG TELECOM AGENT EXECUTION ENGINE PHỤC VỤ VẬN HÀNH MẠNG VIỄN THÔNG}\\
+\vspace{0.4cm}
+\large \textbf{Thiết kế kiến trúc, bảo mật thực thi, quan sát vết và triển khai CI/CD}\\
+\vspace{1.6cm}
+\end{center}
+
+\begin{center}
+\textbf{Lời mở đầu}
+\end{center}
+\vspace{0.15cm}
+
+Trong các trung tâm điều hành mạng viễn thông hiện đại, kỹ sư vận hành NOC (Network Operations Center) phải xử lý đồng thời nhiều nguồn dữ liệu lớn và phức tạp bao gồm: cảnh báo lỗi từ hệ thống giám sát, các chỉ số hiệu năng (KPI) thời gian thực từ clickhouse, thông tin thiết bị mạng từ PostgreSQL, và các lệnh cấu hình hoặc kiểm tra trực tiếp qua giao diện SSH. Khi quy mô hạ tầng viễn thông ngày càng lớn cùng sự ra đời của mạng di động thế hệ mới (5G, O-RAN), các quy trình xử lý sự cố thủ công dựa trên tài liệu hướng dẫn vận hành (SOP) bộc lộ nhiều điểm nghẽn về tốc độ phản ứng, tính nhất quán và rủi ro lỗi do con người.
+
+Sự bứt phá của Mô hình ngôn ngữ lớn (LLM) và hệ tác tử thông minh (AI Agent) mang đến một cách tiếp cận đột phá. Hệ thống cho phép kỹ sư giao tiếp bằng ngôn ngữ tự nhiên, tự động lên kế hoạch và kích hoạt các công cụ phù hợp để truy vấn dữ liệu hạ tầng. Tuy nhiên, việc áp dụng AI Agent vào môi trường viễn thông đòi hỏi các tiêu chí an toàn tuyệt đối. Nếu không có các cơ chế kiểm duyệt, Agent có thể chạy nhầm lệnh cấu hình phá hoại, bị tấn công Prompt Injection thông qua nội dung log, hoặc làm rò rỉ dữ liệu mật (secrets/credentials).
+
+Đề tài tập trung giải quyết bài toán cốt lõi: thiết kế và triển khai một \textbf{Telecom Agent Execution Engine} an toàn theo triết lý Zero-Trust. Engine không trao quyền thực thi tự do cho LLM mà thiết lập các rào chắn kiểm duyệt đa lớp: từ phân tích tĩnh AST mã nguồn kỹ năng động, thực thi cô lập trong Docker sandbox bị giới hạn tài nguyên và ngắt mạng hoàn toàn, các cổng kiểm tra runtime (SHA256 hash, input schema, output contract), đến cơ chế phê duyệt Human-in-the-Loop và kiểm thử redteam chuyên sâu.
+
+\vspace{0.6cm}
+\begin{center}
+\textbf{Tóm tắt nội dung và đóng góp}
+\end{center}
+\vspace{0.15cm}
+
+Báo cáo phân tích toàn diện Telecom Agent Execution Engine thông qua bốn chương:
+\begin{enumerate}
+    \item \textbf{Giới thiệu}: Đặt vấn đề thách thức vận hành mạng, phân tích yêu cầu chức năng (FR) và phi chức năng (NFR).
+    \item \textbf{Nội dung và phương pháp}: Trình bày chi tiết kiến trúc phân lớp, vòng đời tác tử sử dụng đồ thị LangGraph, cơ chế nạp kỹ năng động (progressive disclosure), hệ thống kiểm duyệt 6 vòng upload, 3 cổng bảo vệ runtime, Docker sandbox, an toàn SSH/SQL, và truy vết Langfuse.
+    \item \textbf{Kết quả thực hiện và đánh giá}: Tổng hợp kết quả hiện thực mã nguồn, kết quả chạy các kịch bản kiểm thử cục bộ, Promptfoo offline và redteam từ đầu cuối qua SSE, cấu hình hệ thống trên server chạy systemd kết hợp Docker Compose.
+    \item \textbf{Kết luận}: Đánh giá ưu nhược điểm và đề xuất hướng phát triển dài hạn.
+\end{enumerate}
+
+Các đóng góp chính của đề tài bao gồm:
+\begin{itemize}
+    \item Thiết kế và hiện thực hóa kiến trúc \textbf{Zero-Trust Agent Execution Engine} bọc các tác vụ hạ tầng mạng viễn thông.
+    \item Xây dựng vòng lặp tác tử dựa trên \textbf{LangGraph} với các nút xử lý trạng thái \texttt{call\_llm\_gateway}, \texttt{execute\_tools}, \texttt{suspend\_for\_human} và \texttt{fail}, hỗ trợ lưu vết và khôi phục trạng thái bằng PostgreSQL Checkpointer.
+    \item Phát triển \textbf{Upload Validation Pipeline} 6 vòng: quét định dạng ZIP, kiểm tra taxonomy viễn thông, thẩm định miền bằng LLM Domain Judge, dịch mã đề xuất schema, chạy thử nghiệm smoke test trong container cô lập và phê duyệt thủ công.
+    \item Cài đặt \textbf{AdvancedASTSecurityAnalyzer} để phân tích tĩnh mã nguồn Python, chặn đứng các thư viện nguy hiểm, hàm thực thi động (exec, eval), jailbreak dunder và giới hạn cú pháp hàm \texttt{open()}.
+    \item Hiện thực hóa \textbf{DockerSandboxExecutor} để chạy script trong môi trường bị cô lập hoàn toàn về mạng (\texttt{--network none}), giới hạn bộ nhớ (256MB), CPU (1.0), số tiến trình (128 PIDs limit) và chạy dưới quyền non-root.
+    \item Tích hợp hệ thống quan sát vết Langfuse kết hợp bộ lọc DLP Redactor che giấu thông tin nhạy cảm.
+\end{itemize}
+
+\newpage
+\begin{center}
+\textbf{Mục lục}
+\end{center}
+\tableofcontents
+
+\newpage
+\begin{center}
+\textbf{Danh mục hình vẽ}
+\end{center}
+\listoffigures
+
+\vspace{0.6cm}
+\begin{center}
+\textbf{Danh mục đồ thị và bảng biểu}
+\end{center}
+\listoftables
+
+\newpage
+
+% =====================================================
+% BODY
+% =====================================================
+\section{Giới thiệu}
+
+\subsection{Đặt vấn đề}
+Hệ thống mạng viễn thông hiện đại là một tổ hợp hạ tầng phức tạp bao gồm mạng truy cập vô tuyến (RAN), mạng lõi (Core Network), hệ thống truyền dẫn và các máy chủ biên. Việc giám sát và vận hành mạng tại các trung tâm NOC đòi hỏi các kỹ sư phải liên tục tương tác với nhiều hệ thống phân tán để chẩn đoán lỗi và khắc phục sự cố. Khi xuất hiện cảnh báo (alarm), kỹ sư phải tra cứu thông tin thiết bị từ cơ sở dữ liệu inventory, truy vấn chỉ số KPI để đánh giá mức độ ảnh hưởng dịch vụ, và kết nối SSH vào các node mạng để chạy lệnh kiểm tra hoặc khởi động lại dịch vụ bị lỗi.
+
+Các thao tác này thường được lặp đi lặp lại và thực hiện thủ công dựa trên các tài liệu quy trình vận hành tiêu chuẩn (SOP). Điều này dẫn đến các hạn chế lớn:
+\begin{itemize}
+    \item \textbf{Độ trễ xử lý sự cố}: Kỹ sư phải chuyển đổi qua lại giữa nhiều công cụ, gõ thủ công các câu lệnh phức tạp, làm kéo dài thời gian mất liên lạc mạng (dẫn tới vi phạm thỏa thuận mức dịch vụ SLA).
+    \item \textbf{Rủi ro sai sót thao tác}: Việc nhập sai tham số lệnh SSH hoặc gõ nhầm câu lệnh SQL có thể gây gián đoạn dịch vụ diện rộng hoặc làm hỏng cơ sở dữ liệu của hạ tầng.
+    \item \textbf{Thiếu khả năng tự động hóa linh hoạt}: Các script tự động hóa truyền thống (như Bash, Python) thường có cấu trúc cứng nhắc, không thể tự điều chỉnh kế hoạch xử lý khi gặp các tình huống sự cố nằm ngoài kịch bản định sẵn.
+\end{itemize}
+
+Sự xuất hiện của các AI Agent dựa trên LLM mang lại cơ hội tự động hóa linh hoạt thông qua khả năng lập kế hoạch và lựa chọn công cụ thông minh (Tool-Calling). Tuy nhiên, môi trường viễn thông là vùng hạ tầng quan trọng quốc gia, đặt ra các thách thức bảo mật nghiêm ngặt. Nếu cho phép LLM tự do sinh lệnh shell để chạy trên thiết bị hoặc tự do viết các truy vấn SQL thô gửi tới cơ sở dữ liệu, hệ thống sẽ đối mặt với các nguy cơ bị tấn công chèn lệnh (Prompt Injection), thực thi mã độc hoặc rò rỉ dữ liệu mật. Do đó, việc xây dựng một động cơ thực thi tác tử có cấu trúc bảo mật đa tầng, tách biệt rõ ràng giữa pha lập kế hoạch (của LLM) và pha thực thi (của backend) là vô cùng cấp thiết.
+
+\subsection{Mục tiêu của báo cáo}
+Báo cáo này hướng tới mục tiêu thiết kế chi tiết kiến trúc và phương pháp hiện thực của \textbf{Telecom Agent Execution Engine}. Động cơ này phải đảm bảo:
+\begin{enumerate}
+    \item \textbf{An toàn tuyệt đối}: Bảo vệ hệ thống hạ tầng mạng viễn thông trước các hành vi thao tác sai lệch hoặc phá hoại từ cả phía người dùng lẫn tác tử LLM bị tấn công.
+    \item \textbf{Linh hoạt mở rộng}: Cho phép quản lý và nạp động các kịch bản vận hành mới (Agent Skills) thông qua cơ chế kiểm duyệt chặt chẽ trước khi sử dụng.
+    \item \textbf{Khả năng quan sát vết (Observability)}: Lưu lại toàn bộ lịch sử suy nghĩ, gọi công cụ, kết quả thực thi và phê duyệt của con người phục vụ việc kiểm toán.
+    \item \textbf{Thời gian thực (Real-time)}: Cung cấp trải nghiệm hội thoại mượt mà thông qua cơ chế Server-Sent Events (SSE) truyền tải từng token và trạng thái thực thi công cụ.
+\end{enumerate}
+
+\subsection{Phạm vi triển khai}
+Dự án được định vị là lõi thực thi chính (Module 1) trong kiến trúc nền tảng hỗ trợ vận hành mạng bằng AI Agent của Viettel Digital Talent 2026. Lõi này sẽ kết nối trực tiếp với:
+\begin{itemize}
+    \item Hệ thống giả lập mạng viễn thông bao gồm ClickHouse giám sát chỉ số KPI, PostgreSQL quản lý thông tin thiết bị hạ tầng và các máy chủ SSH Linux giả lập node trạm BTS/gNodeB.
+    \item Các nhà cung cấp dịch vụ LLM Gateway (OpenAI, Anthropic) phục vụ việc nhận diện ý định và lập kế hoạch.
+    \item Hệ thống quan sát vết Langfuse tập trung.
+\end{itemize}
+
+\subsection{Các yêu cầu kỹ thuật chính}
+Dựa trên tài liệu yêu cầu nghiệp vụ, hệ thống được thiết kế đáp ứng các tiêu chuẩn chi tiết trong Bảng \ref{tab:requirements}.
+
+\begin{longtable}{p{0.18\textwidth}p{0.32\textwidth}p{0.45\textwidth}}
+\caption{Các yêu cầu kỹ thuật chức năng và phi chức năng}\label{tab:requirements}\\
+\toprule
+\textbf{Mã yêu cầu} & \textbf{Tên yêu cầu} & \textbf{Mô tả chi tiết} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Mã yêu cầu} & \textbf{Tên yêu cầu} & \textbf{Mô tả chi tiết} \\
+\midrule
+\endhead
+\textbf{FR-01} & Multi-LLM Gateway & Hỗ trợ tối thiểu 2 nhà cung cấp LLM khác nhau (ví dụ OpenAI GPT và Anthropic Claude). \\
+\textbf{FR-02} & Real-time SSE Chat & Streaming phản hồi dạng text kèm hiển thị song song các bước suy luận và gọi công cụ. \\
+\textbf{FR-03} & Custom Skill Upload & Hỗ trợ tải lên kỹ năng mới định dạng ZIP chứa mã nguồn Python và tài liệu đặc tả. \\
+\textbf{FR-04} & Multi-stage Approval & Phê duyệt Human-in-the-Loop hai pha: duyệt gói kỹ năng và duyệt thao tác nguy hiểm ở runtime. \\
+\textbf{FR-05} & Persistent Timeline & Tái cấu trúc toàn bộ lịch sử bước chạy (run timeline) từ cơ sở dữ liệu khi tải lại trang. \\
+\textbf{FR-06} & Dynamic Steering & Cho phép chèn chỉ dẫn vận hành (interventions) khi tác tử đang trong hàng đợi xử lý. \\
+\midrule
+\textbf{NFR-01} & Zero-Trust Sandbox & Chạy các mã nguồn Python tải lên trong container cô lập hoàn toàn mạng và giới hạn CPU/RAM. \\
+\textbf{NFR-02} & Static AST Scan & Phân tích tĩnh cú pháp Python, chặn import các module hệ điều hành và hàm nguy hiểm. \\
+\textbf{NFR-03} & Schema Validation & Ràng buộc kiểu dữ liệu đầu vào và đầu ra của kỹ năng theo JSON Schema đã phê duyệt. \\
+\textbf{NFR-04} & Telemetry DLP & Tự động quét và che giấu (masking) thông tin nhạy cảm trước khi đồng bộ dữ liệu vết lên Langfuse. \\
+\textbf{NFR-05} & Resilient Fallback & Lỗi từ hệ thống giám sát vết (Langfuse) hoặc sandbox không được gây đổ vỡ luồng chat chính. \\
+\textbf{NFR-06} & SSH Known-Hosts & SSH Connector bắt buộc đối chiếu vân tay máy chủ trong tập tin known\_hosts cấu hình sẵn. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Sơ đồ tổng quan hệ thống}
+Kiến trúc tổng thể của Telecom Agent Execution Engine được xây dựng theo mô hình phân lớp nhằm đảm bảo tính cô lập và bảo mật cao nhất cho hạ tầng viễn thông. Hình \ref{fig:overall-architecture} thể hiện sự phân tách rõ ràng giữa giao diện người dùng, lớp API tiếp nhận, lõi điều phối LangGraph, môi trường sandbox thực thi mã nguồn và các hệ thống hạ tầng mạng bên ngoài.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.3cm and 0.8cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  \node (user) [actor] {Operator /\\NOC Engineer};
+  \node (ui) [block, below=of user] {Next.js Frontend\\(Chat + Skills Admin)};
+  \node (api) [block, below=of ui] {FastAPI API Layer\\(REST + SSE)};
+
+  \begin{scope}[local bounding box=engine]
+    \node (service) [block, below=of api, fill=blue!5] {AgentExecution\\Service};
+    \node (graph) [block, right=of service, fill=blue!5] {LangGraph\\StateGraph};
+    \node (llm) [block, below=of graph, fill=blue!5] {LLM Gateway\\(OpenAI/Anthropic)};
+    \node (tools) [block, below=of service, fill=blue!5] {Backend-owned\\capabilities};
+    \node (safety) [block, below=of tools, fill=blue!5] {Safety Guard\\(SQL/SSH/DLP)};
+    \node (skills) [block, left=of tools, fill=blue!5] {Skill Registry};
+    \node (sandbox) [block, below=of skills, fill=blue!5] {Docker Sandbox\\(network none)};
+  \end{scope}
+  \node [draw, dashed, inner sep=8pt, rounded corners, fit=(service) (graph) (llm) (tools) (safety) (skills) (sandbox), label={[font=\bfseries\small]above:Telecom Agent Execution Engine}] (engine_box) {};
+
+  \node (db) [database, right=of api] {PostgreSQL\\(app data +\\checkpointer)};
+
+  \begin{scope}[local bounding box=external]
+    \node (ch) [database, below=of safety, yshift=-0.5cm] {ClickHouse\\(alarms/KPIs)};
+    \node (inv) [database, left=of ch] {Inventory\\Postgres};
+    \node (ssh) [block, right=of ch] {SSH nodes /\\services};
+  \end{scope}
+  \node [draw, dashed, inner sep=8pt, rounded corners, fit=(ch) (inv) (ssh), label={[font=\bfseries\small]below:External Telecom Systems}] (external_box) {};
+
+  \begin{scope}[local bounding box=ops]
+    \node (langfuse) [block, right=of graph] {Langfuse\\(traces + prompts)};
+    \node (ci) [block, left=of api] {GitHub Actions\\CI};
+    \node (cd) [block, left=of service] {Self-hosted\\runner CD};
+  \end{scope}
+
+  \draw [arrow] (user) -- (ui);
+  \draw [arrow] (ui) -- (api);
+  \draw [arrow] (api) -- (service);
+  \draw [arrow] (service) -- (graph);
+  \draw [arrow] (graph) -- (llm);
+  \draw [arrow] (graph) -- (tools);
+  \draw [arrow] (graph) -- (skills);
+  \draw [arrow] (tools) -- (safety);
+  \draw [arrow] (skills) -- (sandbox);
+  \draw [arrow] (safety) -- (ch);
+  \draw [arrow] (safety) -- (inv);
+  \draw [arrow] (safety) -- (ssh);
+  \draw [arrow] (service) -- (db);
+  \draw [arrow] (graph) -- (db);
+  \draw [arrow] (llm) -- (langfuse);
+  \draw [arrow] (service) -- (langfuse);
+  \draw [arrow] (ci) -- (cd);
+  \draw [arrow] (cd) -- (api);
+\end{tikzpicture}
+\caption{Sơ đồ tổng quan kiến trúc Telecom Agent Execution Engine}
+\label{fig:overall-architecture}
+\end{figure}
+
+\newpage
+\section{Nội dung và phương pháp}
+
+\subsection{Kiến trúc phân lớp}
+Hệ thống được chia thành bốn phân lớp chức năng rõ ràng để đảm bảo tính độc lập:
+\begin{enumerate}
+    \item \textbf{Lớp Giao diện (Presentation Layer)}: Xây dựng bằng Next.js, cung cấp màn hình chat thời gian thực, bảng hiển thị timeline chi tiết các bước xử lý và trang quản trị phê duyệt kỹ năng tải lên.
+    \item \textbf{Lớp Dịch vụ (API \& Service Layer)}: FastAPI đóng vai trò tiếp nhận yêu cầu hội thoại qua cổng REST và SSE, đồng thời quản lý logic nghiệp vụ thông qua các dịch vụ \texttt{AgentExecutionService}, \texttt{SkillService} và \texttt{SessionService}.
+    \item \textbf{Lớp Điều phối Tác tử (Orchestration Layer)}: LangGraph duy trì trạng thái của vòng lặp tác tử, thực hiện định tuyến động dựa trên phân loại rủi ro của từng lệnh gọi công cụ.
+    \item \textbf{Lớp Bảo mật \& Thực thi (Security \& Execution Layer)}: Chứa module kiểm duyệt mã nguồn, phân tích cú pháp tĩnh AST, Docker Sandbox để thực thi mã nguồn lạ, và các connector an toàn kết nối tới ClickHouse, PostgreSQL và SSH.
+\end{enumerate}
+
+\subsection{Vòng đời một lượt chat Agent}
+Khi người vận hành gửi một yêu cầu chẩn đoán mạng, yêu cầu đó sẽ đi qua một chuỗi các bước xử lý khép kín. Sơ đồ sequence trong Hình \ref{fig:agent-lifecycle} mô tả vòng đời của một yêu cầu hội thoại, thể hiện cách luồng SSE được duy trì và cách hệ thống tạm dừng để chờ con người phê duyệt khi phát hiện thao tác nguy hiểm.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.3cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  % Define lifelines
+  \draw[dashed, gray] (0,0) -- (0,-6.5) node[below, font=\scriptsize] {Operator};
+  \draw[dashed, gray] (2,0) -- (2,-6.5) node[below, font=\scriptsize] {Next.js UI};
+  \draw[dashed, gray] (4.5,0) -- (4.5,-6.5) node[below, font=\scriptsize] {FastAPI};
+  \draw[dashed, gray] (7.2,0) -- (7.2,-6.5) node[below, font=\scriptsize] {AgentService};
+  \draw[dashed, gray] (9.5,0) -- (9.5,-6.5) node[below, font=\scriptsize] {LangGraph};
+  \draw[dashed, gray] (11.5,0) -- (11.5,-6.5) node[below, font=\scriptsize] {DB / Tools};
+
+  % Lifeline Headers
+  \node[draw, fill=red!10, font=\scriptsize, minimum width=1.2cm] at (0,0.3) {Operator};
+  \node[draw, fill=blue!10, font=\scriptsize, minimum width=1.2cm] at (2,0.3) {UI};
+  \node[draw, fill=blue!10, font=\scriptsize, minimum width=1.2cm] at (4.5,0.3) {FastAPI};
+  \node[draw, fill=blue!10, font=\scriptsize, minimum width=1.2cm] at (7.2,0.3) {Service};
+  \node[draw, fill=blue!10, font=\scriptsize, minimum width=1.2cm] at (9.5,0.3) {LangGraph};
+  \node[draw, fill=green!10, font=\scriptsize, minimum width=1.2cm] at (11.5,0.3) {DB / Tools};
+
+  % Messages
+  \draw[->] (0,-0.5) -- node[above, font=\tiny] {Enter request} (2,-0.5);
+  \draw[->] (2,-1.0) -- node[above, font=\tiny] {POST /chat/stream} (4.5,-1.0);
+  \draw[->] (4.5,-1.5) -- node[above, font=\tiny] {run\_agent\_lifecycle()} (7.2,-1.5);
+  \draw[->] (7.2,-2.0) -- node[above, font=\tiny] {Save run + msg} (11.5,-2.0);
+  \draw[->] (7.2,-2.5) -- node[above, font=\tiny] {Stream execution} (9.5,-2.5);
+  \draw[->] (9.5,-3.2) -- node[above, font=\tiny] {Run think/act loop} (11.5,-3.2);
+  \draw[<-] (9.5,-3.7) -- node[above, font=\tiny] {Return results} (11.5,-3.7);
+  \draw[->] (9.5,-4.5) -- node[above, font=\tiny] {Checkpoint run} (11.5,-4.5);
+  \draw[->] (9.5,-5.0) -- node[above, font=\tiny] {Stream events} (7.2,-5.0);
+  \draw[->] (7.2,-5.5) -- node[above, font=\tiny] {Clean event envelopes} (4.5,-5.5);
+  \draw[->] (4.5,-6.0) -- node[above, font=\tiny] {SSE Stream} (2,-6.0);
+\end{tikzpicture}
+\caption{Sơ đồ tuần tự vòng đời một lượt chat và stream Agent}
+\label{fig:agent-lifecycle}
+\end{figure}
+
+\subsection{LangGraph StateGraph và routing}
+Lõi điều phối của tác tử sử dụng thư viện LangGraph để xây dựng một đồ thị trạng thái có hướng (StateGraph). Đồ thị này lưu giữ trạng thái hội thoại thông qua đối tượng \texttt{AgentState} kế thừa từ \texttt{TypedDict}. Trạng thái chứa lịch sử tin nhắn (\texttt{messages} được tích lũy bằng reducer \texttt{add\_messages}), chỉ số bước hiện tại (\texttt{current\_step\_index}), giới hạn số bước tối đa (\texttt{max\_steps}) và cờ ghi nhận lỗi thực thi (\texttt{execution\_error}).
+
+Đồ thị được định nghĩa bằng bốn nút (Nodes) chính:
+\begin{itemize}
+    \item \texttt{call\_llm\_gateway}: Nút chịu trách nhiệm xây dựng prompt hệ thống, đính kèm danh sách mô tả công cụ hiện có, gọi LLM Gateway và trả về tin nhắn dạng \texttt{AIMessageChunk}.
+    \item \texttt{execute\_tools}: Nút chịu trách nhiệm lặp qua các yêu cầu gọi công cụ từ LLM, thực thi chúng và trả về các \texttt{ToolMessage} tương ứng.
+    \item \texttt{suspend\_for\_human}: Nút tạm dừng thực thi khi phát hiện công cụ cần phê duyệt, ghi nhận trạng thái chờ duyệt vào cơ sở dữ liệu và dừng luồng chạy đồ thị.
+    \item \texttt{fail}: Nút chốt chặn an toàn khi phát hiện lỗi hệ thống, quá giới hạn số bước lặp, hoặc vi phạm chính sách an ninh nghiêm trọng.
+\end{itemize}
+
+Việc định tuyến giữa các nút được quyết định bởi hai hàm định tuyến cạnh điều kiện (Conditional Edges):
+\begin{enumerate}
+    \item \texttt{reliability\_router}: Quyết định luồng đi sau khi LLM phản hồi. Nếu có lỗi thực thi $\to$ đi tới kết thúc đồ thị (END). Nếu không có yêu cầu gọi công cụ $\to$ kết thúc lượt chat (END) trừ khi có can thiệp của operator xếp hàng trước đó. Nếu số bước vượt quá \texttt{max\_steps} $\to$ định tuyến tới nút \texttt{fail}. Với các công cụ hợp lệ, hàm sẽ kiểm tra mức độ rủi ro (risk level): nếu chứa tác vụ nguy hiểm $\to$ chuyển tới nút \texttt{suspend\_for\_human}; nếu an toàn $\to$ chuyển tới nút \texttt{execute\_tools}; nếu phát hiện công cụ lạ hoặc chưa sẵn sàng $\to$ chuyển tới nút \texttt{fail}.
+    \item \texttt{route\_after\_tool\_execution}: Định tuyến sau khi chạy xong công cụ. Nếu xuất hiện lỗi nghiêm trọng trong quá trình chạy $\to$ đi tới kết thúc (END); nếu suôn sẻ $\to$ quay lại nút \texttt{call\_llm\_gateway} để LLM tiếp tục lập kế hoạch cho bước kế tiếp.
+\end{enumerate}
+
+Sơ đồ chuyển trạng thái của LangGraph được mô tả chi tiết trong Hình \ref{fig:langgraph-stategraph}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.3cm and 1.8cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  \node (start) [circle, draw, fill=green!20, minimum size=1cm] {START};
+  \node (llm) [block, right=of start, fill=blue!10] {call\_llm\_gateway};
+  \node (router) [decision, right=of llm] {reliability\_router};
+
+  \node (exec) [block, above right=of router, fill=blue!5] {execute\_tools};
+  \node (suspend) [block, below right=of router, fill=yellow!10] {suspend\_for\_human};
+  \node (fail) [block, below=of router, fill=red!10] {fail};
+  \node (end) [circle, draw, fill=red!20, minimum size=1cm, right=of router, xshift=3.5cm] {END};
+
+  \draw [arrow] (start) -- (llm);
+  \draw [arrow] (llm) -- (router);
+
+  \draw [arrow] (router.north) |- node[left, near end, font=\scriptsize] {safe tool calls} (exec.west);
+  \draw [arrow] (router.south) |- node[left, near end, font=\scriptsize] {risky tool calls} (suspend.west);
+  \draw [arrow] (router.south) -- node[right, font=\scriptsize] {unsafe / limit} (fail.north);
+  \draw [arrow] (router.east) -- node[above, font=\scriptsize] {final answer} (end.west);
+
+  \draw [arrow] (exec.north) -- ++(0, 0.8) -| node[above, near end, font=\scriptsize] {route\_after\_tool\_execution} (llm.north);
+  \draw [arrow] (suspend.south) -- ++(0, -0.8) -| node[below, near end, font=\scriptsize] {approve + resume} (llm.south);
+  \draw [arrow] (fail.south) -- ++(0, -0.5) -| (end.south);
+\end{tikzpicture}
+\caption{Đồ thị trạng thái và cơ chế định tuyến LangGraph}
+\label{fig:langgraph-stategraph}
+\end{figure}
+
+\subsection{LLM Gateway và cấu hình providers}
+LLM Gateway được xây dựng theo mẫu thiết kế Adapter, bọc các thư viện của các nhà cung cấp khác nhau để tạo ra một giao diện chung tương thích với chuẩn gọi công cụ của LangChain (\texttt{bind\_tools()}). Điều này giúp lõi Agent không bị phụ thuộc vào API riêng lẻ của OpenAI hay Anthropic. Gateway cũng tích hợp cơ chế nén ngữ cảnh (Context Window Compaction) để tự động thu gọn lịch sử tin nhắn khi số lượng token tiến gần tới giới hạn của mô hình, giúp tránh lỗi quá tải bộ nhớ.
+
+\subsection{Agent Skills và progressive disclosure}
+Các kịch bản tự động hóa vận hành được đóng gói thành các kỹ năng động (Agent Skills). Mỗi kỹ năng được lưu trữ dưới dạng một thư mục chứa tệp đặc tả \texttt{SKILL.md} viết theo định dạng Markdown có Frontmatter, cùng thư mục \texttt{scripts/} chứa các đoạn mã Python/Bash thực thi.
+
+Để tối ưu hóa chi phí token và ngăn ngừa hiện tượng nhiễu ngữ cảnh hoặc Prompt Injection, hệ thống áp dụng cơ chế \textbf{Progressive Disclosure} (Tiết lộ lũy tiến):
+\begin{itemize}
+    \item \textbf{Giai đoạn khởi đầu}: Engine chỉ cung cấp cho LLM tên và mô tả ngắn của các kỹ năng đang ở trạng thái \texttt{READY}.
+    \item \textbf{Giai đoạn chi tiết}: Khi LLM nhận thấy một kỹ năng phù hợp với yêu cầu của người dùng, nó sẽ chủ động gọi công cụ hệ thống \texttt{load\_skill} để nạp chi tiết danh sách các tệp tin script và tham số yêu cầu.
+    \item \textbf{Giai đoạn đọc tài nguyên}: Nếu cần tham khảo thêm các tài liệu hướng dẫn vận hành đính kèm trong gói kỹ năng, tác tử gọi công cụ \texttt{read\_skill\_file} để đọc nội dung cụ thể của tệp.
+    \item \textbf{Giai đoạn thực thi}: Cuối cùng, tác tử gọi công cụ \texttt{run\_skill\_script} để kích hoạt chạy script trong sandbox.
+\end{itemize}
+
+\subsection{Upload validation pipeline}
+Khi quản trị viên tải lên một tệp tin ZIP chứa kỹ năng mới, hệ thống sẽ tự động kích hoạt một đường ống kiểm duyệt gồm 6 vòng nghiêm ngặt theo nguyên lý ``Fail-Closed'' (tất cả các bước phải vượt qua thì kỹ năng mới được chấp nhận). Sơ đồ trong Hình \ref{fig:upload-pipeline} mô tả các chặng kiểm duyệt này.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.0cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  \node (upload) [block, fill=blue!10] {Upload .zip file};
+  \node (v1) [block, below=of upload] {Vòng 1: Parse \& Scan\\(Structure \& AST)};
+  \node (v2) [block, below=of v1] {Vòng 2: Taxonomy Score\\(Keyword check)};
+  \node (v3) [block, below=of v2] {Vòng 3: LLM Domain Judge\\(Telecom relevance)};
+  \node (v4) [block, below=of v3] {Vòng 4: LLM Run-Spec\\(Input/Output schema)};
+  \node (v5) [block, below=of v4] {Vòng 5: Docker Smoke Test\\(Execution \& outputs)};
+  \node (v6) [block, below=of v5] {Vòng 6: Human Review\\(Admin check)};
+
+  \node (ready) [block, below left=of v6, xshift=-1cm, fill=green!20] {READY\\(Approved)};
+  \node (rejected) [block, below right=of v6, xshift=1cm, fill=red!20] {REJECTED};
+
+  \draw [arrow] (upload) -- (v1);
+  \draw [arrow] (v1) -- (v2);
+  \draw [arrow] (v2) -- (v3);
+  \draw [arrow] (v3) -- (v4);
+  \draw [arrow] (v4) -- (v5);
+  \draw [arrow] (v5) -- (v6);
+
+  \draw [arrow] (v6.west) -| node[above, xshift=1cm, font=\scriptsize] {Approve} (ready.north);
+  \draw [arrow] (v6.east) -| node[above, xshift=-1cm, font=\scriptsize] {Reject} (rejected.north);
+
+  \draw [arrow] (v1.east) -- ++(2.5,0) |- (rejected.west);
+  \draw [arrow] (v3.east) -- ++(2.5,0) |- node[right, yshift=1.5cm, font=\scriptsize] {Taxonomy < 0.25 \&\\LLM Judge < 0.5} (rejected.west);
+  \draw [arrow] (v5.east) -- ++(2.5,0) |- (rejected.west);
+\end{tikzpicture}
+\caption{Quy trình kiểm duyệt skill 6 vòng khi upload}
+\label{fig:upload-pipeline}
+\end{figure}
+
+Chi tiết kỹ thuật của từng vòng kiểm duyệt bao gồm:
+\begin{itemize}
+    \item \textbf{Vòng 1a (Kiểm tra gói lưu trữ ZIP)}: Giải nén tệp tin và xác thực cấu trúc với các giới hạn: dung lượng tệp ZIP $\le 10$ MB, tổng số lượng tệp con $\le 200$, kích thước mỗi tệp $\le 5$ MB, tổng dung lượng sau giải nén $\le 25$ MB, tỷ lệ nén (tỷ số kích thước giải nén so với kích thước nén) $\le 100$ lần nhằm ngăn chặn tấn công Zip Bomb. Đồng thời từ chối tuyệt đối các tệp tin chứa symbolic link, file mã hóa, hoặc chứa ký tự thay đổi thư mục (\texttt{..}) gây lỗi Path Traversal.
+    \item \textbf{Vòng 1b (Phân tích Frontmatter)}: Đọc phần đầu của tệp \texttt{SKILL.md}, xác thực tên kỹ năng phải khớp biểu thức chính quy \texttt{\^{}(?!-)(?!.*--)[a-z0-9]+(?:-[a-z0-9]+)*\$} và không dài quá 64 ký tự.
+    \item \textbf{Vòng 2 (Tính điểm phân loại viễn thông)}: Quét sự xuất hiện của các từ khóa viễn thông cốt lõi (như \textit{alarm, node, site, cell, kpi, throughput, gnodeb, noc, vdt...}). Điểm số được tính bằng công thức:
+    \begin{equation}
+        S_{\text{taxonomy}} = \min\left(\frac{N_{\text{matched}}}{4}, 1.0\right)
+    \end{equation}
+    \item \textbf{Vòng 3 (Thẩm định miền bằng LLM)}: Gọi LLM Gateway với một Prompt chuyên biệt để đánh giá mô tả của kỹ năng. Nếu điểm từ LLM $S_{\text{llm}} < 0.5$ đồng thời điểm taxonomy $S_{\text{taxonomy}} < 0.25$ $\to$ Tự động loại bỏ gói kỹ năng.
+    \item \textbf{Vòng 4 (Đề xuất thông số chạy thử)}: Gọi LLM phân tích mã nguồn của từng đoạn script Python để sinh ra cấu hình \texttt{script\_manifest} bao gồm: JSON Schema cho các tham số đầu vào (\texttt{input\_schema}), định dạng đầu ra mong muốn (\texttt{output\_contract}) và một bộ tham số kiểm thử mẫu (\texttt{smoke\_test\_arguments}).
+    \item \textbf{Vòng 5 (Chạy thử nghiệm trong sandbox)}: Kích hoạt chạy thử nghiệm script trong Docker container cô lập bằng bộ tham số mẫu được tạo ở Vòng 4. Quá trình chạy phải có mã trả về bằng 0 (\texttt{exit\_code} = 0) và định dạng đầu ra khớp chính xác với đặc tả cấu hình.
+    \item \textbf{Vòng 6 (Phê duyệt thủ công)}: Ghi nhận trạng thái \texttt{testing} vào cơ sở dữ liệu và chờ đợi thao tác kiểm tra, phê duyệt cuối cùng từ quản trị viên thông qua giao diện admin.
+\end{itemize}
+
+\subsection{Phân tích tĩnh AST}
+Module \texttt{AdvancedASTSecurityAnalyzer} là chốt chặn tĩnh vô cùng quan trọng (Vòng 1d). Bằng cách phân tích cây cú pháp trừu tượng (Abstract Syntax Tree) của mã nguồn Python tải lên thông qua thư viện \texttt{ast} của Python mà không cần thực thi mã nguồn đó, hệ thống có thể ngăn chặn các rủi ro bảo mật trước khi script được đưa vào hệ thống chạy thử.
+
+Các chính sách kiểm tra chính của bộ phân tích tĩnh AST bao gồm:
+\begin{itemize}
+    \item \textbf{Chặn thư viện nguy hiểm}: Từ chối các lệnh import trực tiếp hoặc gián tiếp đối với hơn 40 thư viện hệ thống bao gồm: các module tương tác hệ điều hành và tiến trình (\texttt{os}, \texttt{subprocess}, \texttt{sys}, \texttt{shutil}), các thư viện tạo kết nối mạng tự do (\texttt{socket}, \texttt{requests}, \texttt{httpx}, \texttt{paramiko}, \texttt{urllib}, \texttt{aiohttp}), và các thư viện can thiệp luồng/bộ nhớ (\texttt{threading}, \texttt{multiprocessing}, \texttt{ctypes}, \texttt{gc}).
+    \item \textbf{Cấm hàm thực thi động}: Chặn đứng các hàm có khả năng biên dịch và chạy chuỗi văn bản tự do như \texttt{eval()}, \texttt{exec()}, \texttt{compile()}, \texttt{\_\_import\_\_()}, \texttt{getattr()} và \texttt{setattr()}.
+    \item \textbf{Ngăn chặn Python Jailbreak}: Cấm truy cập hoặc tham chiếu tới tất cả các thuộc tính dunder (double underscore) có cấu trúc dạng \texttt{\_\_xxx\_\_} như \texttt{\_\_class\_\_}, \texttt{\_\_bases\_\_}, \texttt{\_\_globals\_\_} (ngoại trừ ba hằng số vô hại được cho phép là \texttt{\_\_name\_\_}, \texttt{\_\_doc\_\_} và \texttt{\_\_file\_\_}).
+    \item \textbf{Ràng buộc cú pháp hàm open()}: Chỉ cho phép sử dụng hàm \texttt{open()} với tham số đường dẫn là hằng số chuỗi (string literal) dạng tương đối chỉ nằm trong thư mục sandbox (ví dụ \texttt{"args.json"}), cấm sử dụng các ký tự đặc biệt như \texttt{/}, \texttt{\textbackslash}, \texttt{..} hoặc \texttt{\~}, đồng thời bắt buộc chế độ mở tệp tin phải là chỉ đọc (\texttt{"r"}, \texttt{"rt"} hoặc \texttt{"rb"}).
+\end{itemize}
+
+\subsection{Docker sandbox executor}
+Script sau khi vượt qua vòng phân tích tĩnh sẽ được thực thi động trong một môi trường cô lập tuyệt đối dựa trên \texttt{DockerSandboxExecutor}. Hệ thống thực hiện việc ánh xạ thư mục tạm thời của host chứa script và tệp tin tham số \texttt{args.json} vào thư mục \texttt{/workspace} bên trong container. Container được khởi tạo từ ảnh nền tiêu chuẩn \texttt{python:3.12-slim} với các thông số bảo vệ nghiêm ngặt:
+\begin{itemize}
+    \item \textbf{Cô lập mạng}: Sử dụng cờ \texttt{--network none} để ngắt toàn bộ kết nối internet hoặc kết nối tới các tài nguyên khác của mạng nội bộ từ bên trong container.
+    \item \textbf{Giới hạn tài nguyên}: Ràng buộc dung lượng bộ nhớ tối đa bằng cờ \texttt{--memory 256m}, giới hạn tài nguyên CPU bằng \texttt{--cpus 1.0} và giới hạn số lượng luồng/tiến trình con bằng \texttt{--pids-limit 128} (chống tấn công Fork Bomb treo máy chủ host).
+    \item \textbf{Phân quyền tối thiểu}: Áp dụng cờ \texttt{--user uid:gid} tự động lấy thông tin định danh người dùng chạy tiến trình backend trên host để chạy container dưới quyền non-root, ngăn chặn nguy cơ vượt rào chiếm quyền root máy chủ vật lý.
+    \item \textbf{Kiểm soát thời gian và kích thước}: Thiết lập thời gian chạy tối đa mặc định là 30 giây và cắt ngắn dữ liệu trả về của script nếu vượt quá 50,000 ký tự để bảo vệ cửa sổ ngữ cảnh của tác tử LLM.
+\end{itemize}
+
+\subsection{Runtime gates}
+Hệ thống thiết lập ba cổng kiểm soát độc lập ở thời điểm chạy (Runtime Gates) trước và sau khi kích hoạt container sandbox để đảm bảo an toàn tuyệt đối. Quy trình của ba cổng này được mô tả chi tiết trong Hình \ref{fig:runtime-gates}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.3cm and 0.8cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  \node (call) [block, fill=blue!10] {Call run\_skill\_script};
+  \node (g1) [decision, right=of call] {Gate 1:\\Hash Match?};
+  \node (g2) [decision, right=of g1] {Gate 2:\\Input Schema?};
+  \node (sandbox) [block, right=of g2, fill=orange!10] {Execute in\\Docker Sandbox};
+  \node (g3) [decision, right=of sandbox] {Gate 3:\\Output Valid?};
+  \node (ok) [block, right=of g3, fill=green!20] {Return redacted\\bounded result};
+
+  \node (abort) [block, below=of g2, fill=red!10, yshift=-0.5cm] {Abort \& Raise\\SkillRuntimeError};
+
+  \draw [arrow] (call) -- (g1);
+  \draw [arrow] (g1) -- node[above, font=\scriptsize] {yes} (g2);
+  \draw [arrow] (g2) -- node[above, font=\scriptsize] {yes} (sandbox);
+  \draw [arrow] (sandbox) -- (g3);
+  \draw [arrow] (g3) -- node[above, font=\scriptsize] {yes} (ok);
+
+  \draw [arrow] (g1.south) |- node[left, near start, font=\scriptsize] {no} (abort.west);
+  \draw [arrow] (g2.south) -- node[right, font=\scriptsize] {no} (abort.north);
+  \draw [arrow] (g3.south) |- node[right, near start, font=\scriptsize] {no} (abort.east);
+\end{tikzpicture}
+\caption{Quy trình ba cổng kiểm tra an toàn tại thời điểm chạy}
+\label{fig:runtime-gates}
+\end{figure}
+
+Các tác vụ chi tiết tại từng cổng bao gồm:
+\begin{itemize}
+    \item \textbf{Cổng 1 (Xác thực Hash mã nguồn)}: Hệ thống tính toán mã băm SHA256 của nội dung tệp tin script tại thời điểm thực thi và đối chiếu với mã băm đã lưu trữ trong cơ sở dữ liệu lúc phê duyệt kỹ năng. Nếu có bất kỳ sự sai lệch nào $\to$ Lập tức đình chỉ thực thi để chống lại các cuộc tấn công thay đổi nội dung file lén lút trên ổ đĩa.
+    \item \textbf{Cổng 2 (Kiểm tra Schema đầu vào)}: Đối chiếu các tham số tác tử truyền vào với cấu hình \texttt{input\_schema} của kỹ năng. Nếu thiếu tham số bắt buộc hoặc sai kiểu dữ liệu $\to$ Báo lỗi ngay lập tức để tiết kiệm tài nguyên hệ thống.
+    \item \textbf{Cổng 3 (Xác thực Hợp đồng đầu ra)}: Sau khi script hoàn thành và trả kết quả stdout, nếu cấu hình yêu cầu định dạng JSON, hệ thống sẽ thực hiện phân tích cú pháp văn bản đó và đối chiếu cấu trúc với \texttt{output\_contract}.
+\end{itemize}
+
+\subsection{Backend-owned capabilities}
+Để đảm bảo an toàn cho các tác vụ tương tác trực tiếp với cơ sở dữ liệu ClickHouse, PostgreSQL và SSH mà không cần thông qua sandbox, hệ thống áp dụng triết lý \textbf{Backend-owned Capabilities} (Khả năng do backend làm chủ). Tác tử LLM không bao giờ được phép sinh ra các câu lệnh SQL thô hoặc các dòng lệnh shell tự do để gửi tới hạ tầng. Thay vào đó, backend chỉ công bố các hàm có giao diện tham số cố định và tự đóng gói câu lệnh an toàn (Bảng \ref{tab:capabilities}).
+
+\begin{longtable}{p{0.25\textwidth}p{0.25\textwidth}p{0.40\textwidth}}
+\caption{Các capability tích hợp sẵn và chính sách thực thi}\label{tab:capabilities}\\
+\toprule
+\textbf{Tên Capability} & \textbf{Chế độ chạy} & \textbf{Chính sách an toàn áp dụng} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Tên Capability} & \textbf{Chế độ chạy} & \textbf{Chính sách an toàn áp dụng} \\
+\midrule
+\endhead
+\texttt{get\_site\_alarm\_summary} & Tự động chạy & Đọc chỉ số cảnh báo từ ClickHouse, đóng khung câu truy vấn SQL theo tham số site\_id. \\
+\texttt{get\_site\_kpi\_snapshot} & Tự động chạy & Đọc chỉ số hiệu năng từ ClickHouse, giới hạn dải thời gian truy vấn. \\
+\texttt{get\_site\_inventory} & Tự động chạy & Truy vấn cơ sở dữ liệu PostgreSQL inventory ở chế độ chỉ đọc. \\
+\texttt{ping\_node} & Tự động chạy & Sử dụng lệnh ping hệ thống thông qua template có sẵn, kiểm duyệt kỹ địa chỉ IP đầu vào. \\
+\texttt{restart\_service} & Chờ con người duyệt & Kết nối SSH vào node để chạy lệnh khởi động lại. Tên dịch vụ phải thuộc allowlist và khớp regex an toàn. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Giao thức streaming: envelope sự kiện và Translator}
+Để đảm bảo thông tin tương tác hiển thị mượt mà trên giao diện người dùng mà vẫn giữ được tính nhất quán và khả năng kiểm toán, hệ thống thiết kế giao thức streaming dựa trên Server-Sent Events (SSE) sử dụng các gói tin JSON định cấu trúc chung (Event Envelopes). Mỗi gói tin chứa thông tin phiên bản giao thức (\texttt{v}), tên sự kiện (\texttt{event}), nhãn thời gian (\texttt{ts}), mã phiên (\texttt{session\_id}), lượt chat (\texttt{turn}), số thứ tự tin nhắn (\texttt{seq} tăng đơn điệu) và nội dung chi tiết (\texttt{payload}).
+
+Hệ thống định nghĩa 12 loại sự kiện cụ thể trong Bảng \ref{tab:sse-events}.
+
+\begin{longtable}{p{0.25\textwidth}p{0.70\textwidth}}
+\caption{Mười hai loại sự kiện trong giao thức streaming SSE}\label{tab:sse-events}\\
+\toprule
+\textbf{Tên sự kiện} & \textbf{Mô tả chi tiết và ý nghĩa} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Tên sự kiện} & \textbf{Mô tả chi tiết và ý nghĩa} \\
+\midrule
+\endhead
+\texttt{session.started} & Kích hoạt khi bắt đầu kết nối SSE thành công. \\
+\texttt{turn.started} & Đánh dấu bắt đầu một lượt trao đổi thông tin mới. \\
+\texttt{state.changed} & Thông báo sự thay đổi trạng thái xử lý (\texttt{THINKING}, \texttt{TOOL\_CALLING}, \texttt{RESPONDING}). \\
+\texttt{reasoning.delta} & Truyền tải từng token suy luận của mô hình (nếu có). \\
+\texttt{assistant.delta} & Truyền tải từng token nội dung văn bản trả lời cuối cùng. \\
+\texttt{tool\_call.requested} & LLM gửi yêu cầu kích hoạt một công cụ (kèm tham số đầu vào). \\
+\texttt{tool\_call.running} & Ghi nhận công cụ bắt đầu chạy thực tế trên hệ thống. \\
+\texttt{tool\_call.result} & Ghi nhận kết quả trả về của công cụ sau khi kết thúc. \\
+\texttt{tool\_call.failed} & Ghi nhận lỗi xảy ra trong quá trình thực thi công cụ. \\
+\texttt{turn.finished} & Đánh dấu kết thúc lượt chat và ghi dữ liệu thành công xuống cơ sở dữ liệu. \\
+\texttt{session.error} & Gặp lỗi hệ thống nghiêm trọng cần dừng kết nối lập tức. \\
+\texttt{session.done} & Sự kiện cuối cùng đóng kết nối SSE từ phía server. \\
+\bottomrule
+\end{longtable}
+
+Bộ chuyển đổi \texttt{Translator} trong backend chịu trách nhiệm lắng nghe các sự kiện thô phát ra từ đồ thị LangGraph thông qua API \texttt{astream\_events()} và biên dịch chúng thành các envelope SSE chuẩn hóa.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.8cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  \node (thinking) [block, fill=blue!10] {THINKING};
+  \node (toolcalling) [block, right=of thinking, fill=orange!10] {TOOL\_CALLING};
+  \node (responding) [block, below=of thinking, fill=green!10] {RESPONDING};
+  \node (done) [block, right=of responding, fill=green!20] {TURN\_DONE};
+  \node (failed) [block, below=of responding, fill=red!10, xshift=1.8cm] {TURN\_FAILED};
+
+  \draw [arrow] (thinking) -- node[above, font=\scriptsize] {has tool\_calls} (toolcalling);
+  \draw [arrow] (toolcalling.west) -- ++(-0.5,0) |- node[left, near end, font=\scriptsize] {tool finished} (thinking.west);
+  \draw [arrow] (thinking) -- node[left, font=\scriptsize] {first text token} (responding);
+  \draw [arrow] (responding) -- node[above, font=\scriptsize] {stream ends} (done);
+  \draw [arrow] (thinking.south) -| node[right, near end, font=\scriptsize] {max\_iter / error} (failed.north);
+  \draw [arrow] (toolcalling.south) -- node[right, font=\scriptsize] {tool failed} (failed.north);
+\end{tikzpicture}
+\caption{Sơ đồ chuyển trạng thái của máy trạng thái cấp lượt (Turn-level FSM)}
+\label{fig:turn-fsm}
+\end{figure}
+
+Sơ đồ chuyển trạng thái cấp lượt (Hình \ref{fig:turn-fsm}) mô tả cách \texttt{Translator} quản lý các sự kiện thay đổi trạng thái của đồ thị. Để giải quyết vấn đề nghẽn mạng hoặc quá tải dòng sự kiện, hệ thống áp dụng cơ chế \textbf{Backpressure}: Khi hàng đợi tin nhắn của SSE đầy, hệ thống sẽ ưu tiên bỏ qua các sự kiện phụ như \texttt{reasoning.delta} nhưng cam kết không bao giờ làm mất các gói tin điều khiển trạng thái chính và \texttt{assistant.delta} để đảm bảo nội dung câu trả lời của người dùng luôn nguyên vẹn.
+
+\subsection{Lưu trữ, kiểm toán \& Observability}
+Toàn bộ thông tin phiên làm việc, tin nhắn hội thoại, chi tiết các lệnh gọi công cụ và các yêu cầu phê duyệt được lưu trữ bền vững trong cơ sở dữ liệu PostgreSQL thông qua thư viện SQLAlchemy ORM. Sơ đồ các bảng dữ liệu được thiết kế theo cấu trúc Hình \ref{fig:db-schema}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.5cm and 2.5cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  \node (sessions) [block, fill=blue!5] {\textbf{sessions}\\id (PK)\\agent\_id\\created\_at\\closed\_at};
+  \node (messages) [block, right=of sessions, fill=blue!5] {\textbf{messages}\\id (PK)\\session\_id (FK)\\turn\_index\\role\\content\\status\\langfuse\_trace\_id};
+  \node (toolcalls) [block, below=of messages, fill=blue!5] {\textbf{tool\_calls}\\id (PK)\\session\_id\\assistant\_message\_id (FK)\\call\_index\\skill\_name\\arguments (JSONB)\\result (JSONB)\\status};
+  \node (approvals) [block, left=of toolcalls, fill=yellow!5] {\textbf{approvals}\\id (PK)\\run\_id\\tool\_call\_id\\status\\requested\_at\\resolved\_at};
+
+  \draw [arrow] (sessions) -- node[above, font=\scriptsize] {1..N} (messages);
+  \draw [arrow] (messages) -- node[left, font=\scriptsize] {1..N} (toolcalls);
+  \draw [arrow] (toolcalls) -- node[above, font=\scriptsize] {1..1} (approvals);
+\end{tikzpicture}
+\caption{Lược đồ quan hệ thực thể cơ sở dữ liệu lưu trữ hội thoại và kiểm toán}
+\label{fig:db-schema}
+\end{figure}
+
+Hệ thống tích hợp giám sát vết (Observability) bằng cách đẩy dữ liệu bất đồng bộ lên Langfuse. Nhằm đảm bảo tuân thủ chính sách bảo vệ dữ liệu viễn thông, hệ thống áp dụng bộ lọc \textbf{DataRedactor} hoạt động dựa trên các biểu thức chính quy để lọc bỏ các thông tin nhạy cảm (như mật khẩu SSH, khóa riêng tư, token API) trước khi gửi dữ liệu ra bên ngoài.
+
+\subsection{Kiểm thử, eval và redteam}
+Để đảm bảo tính đúng đắn của toàn bộ động cơ thực thi tác tử, hệ thống được thiết kế với cấu trúc kiểm thử đa tầng từ mức đơn vị đến kiểm thử an ninh chuyên sâu. Sơ đồ các lớp kiểm thử được thể hiện trong Hình \ref{fig:test-layers}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.3cm and 1.5cm, >=stealth, thick, scale=0.85, every node/.style={transform shape}]
+  \node (pybackend) [block, fill=blue!5] {pytest backend\\(unit/integration)};
+  \node (pyevals) [block, below=of pybackend, fill=blue!5] {pytest evals\\(contract tests)};
+  \node (foooffline) [block, below=of pyevals, fill=blue!5] {Promptfoo offline\\(policy scenarios)};
+  \node (fooredteam) [block, right=of pyevals, fill=red!10, xshift=1.5cm] {Promptfoo redteam\\(online/security)};
+
+  \node (quality) [block, right=of pybackend, fill=green!10, xshift=1.5cm] {Quality Gate\\(CI Check)};
+  \node (secevidence) [block, right=of fooredteam, fill=orange!10] {Security Evidence\\(Redteam Report)};
+
+  \draw [arrow] (pybackend) -- (quality);
+  \draw [arrow] (pyevals) -- (quality);
+  \draw [arrow] (foooffline) -- (quality);
+  \draw [arrow] (fooredteam) -- (secevidence);
+  \draw [arrow] (quality) -- ++(2.5,0) node[right, draw, fill=gray!20, font=\scriptsize] {GitHub CI Passed};
+\end{tikzpicture}
+\caption{Sơ đồ các lớp kiểm thử và đánh giá tích hợp}
+\label{fig:test-layers}
+\end{figure}
+
+Đặc điểm chi tiết của từng lớp kiểm thử:
+\begin{itemize}
+    \item \textbf{Kiểm thử Pytest backend \& evals}: Tập hợp hơn 80 ca kiểm thử đơn vị và tích hợp kiểm tra chi tiết logic định tuyến đồ thị, hoạt động của các connector giả lập, tính đúng đắn của AST analyzer và hoạt động của Docker sandbox.
+    \item \textbf{Promptfoo offline eval}: Sử dụng tập tin cấu hình \texttt{evals/scenarios.yaml} và một mô hình ngôn ngữ cục bộ để đánh giá khả năng phản hồi của hệ thống với các yêu cầu vận hành điển hình và kiểm tra hoạt động che giấu thông tin của DLP.
+    \item \textbf{Promptfoo redteam}: Lớp kiểm thử an ninh chuyên sâu gọi trực tiếp vào API SSE của backend thực tế để đánh giá khả năng chống đỡ của hệ thống trước các kỹ thuật tấn công Prompt Injection chèn mã độc.
+\end{itemize}
+
+\subsection{Triển khai và CI/CD}
+Quy trình triển khai tích hợp liên tục (CI/CD) được thiết kế tự động hóa bằng công cụ GitHub Actions. Mã nguồn sau khi được lập trình viên đẩy lên kho lưu trữ sẽ kích hoạt đường ống CI chạy kiểm tra mã nguồn, chạy kiểm thử pytest và promptfoo. Nếu tất cả đều thành công, lập trịnh viên có thể chạy quy trình CD thủ công đẩy mã nguồn lên máy chủ đích chạy self-hosted runner. Sơ đồ chi tiết quy trình CI/CD được thể hiện trong Hình \ref{fig:cicd}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=1.0cm, >=stealth, thick, scale=0.80, every node/.style={transform shape}]
+  \node (push) [block, fill=blue!10] {Developer Push};
+  \node (ci) [block, below=of push] {GitHub CI Workflow};
+
+  \begin{scope}[local bounding box=checks]
+    \node (b1) [subblock, below left=of ci, xshift=-0.5cm] {Backend lint\\\& tests};
+    \node (b2) [subblock, below=of ci] {Promptfoo\\offline evals};
+    \node (f1) [subblock, below right=of ci, xshift=0.5cm] {Frontend lint\\\& build};
+  \end{scope}
+  \node [draw, dotted, inner sep=5pt, fit=(b1) (b2) (f1)] (checks_box) {};
+
+  \node (pass) [decision, below=of b2, yshift=-0.5cm] {CI Green?};
+  \node (deploy) [block, below=of pass, yshift=-0.5cm, fill=orange!10] {Manual Deploy\\Workflow};
+  \node (runner) [block, below=of deploy] {Self-hosted Runner\\on Host};
+  \node (steps) [block, below=of runner, fill=green!15] {git pull\\uv sync \& alembic\\docker compose up\\systemctl restart};
+  \node (health) [block, below=of steps, fill=green!30] {Healthcheck\\(curl /health)};
+
+  \draw [arrow] (push) -- (ci);
+  \draw [arrow] (ci.south) -- (b1.north);
+  \draw [arrow] (ci.south) -- (b2.north);
+  \draw [arrow] (ci.south) -- (f1.north);
+
+  \draw [arrow] (b1.south) -- (pass.west);
+  \draw [arrow] (b2.south) -- (pass.north);
+  \draw [arrow] (f1.south) -- (pass.east);
+
+  \draw [arrow] (pass.south) -- node[right, font=\scriptsize] {yes} (deploy.north);
+  \draw [arrow] (deploy) -- (runner);
+  \draw [arrow] (runner) -- (steps);
+  \draw [arrow] (steps) -- (health);
+
+  \draw [arrow] (pass.west) -- ++(-1.5,0) node[left, draw, fill=red!10, font=\scriptsize] {Fail: Reject};
+\end{tikzpicture}
+\caption{Sơ đồ quy trình CI/CD tích hợp và triển khai hệ thống}
+\label{fig:cicd}
+\end{figure}
+
+\newpage
+\section{Kết quả thực hiện và đánh giá}
+
+\subsection{Kết quả hiện thực chức năng}
+Toàn bộ mã nguồn cốt lõi của Telecom Agent Execution Engine đã được triển khai hoàn tất với cấu trúc thư mục chuẩn hóa:
+\begin{itemize}
+    \item \texttt{backend/app/agent}: Chứa logic định tuyến đồ thị LangGraph và các capability.
+    \item \texttt{backend/app/sandbox}: Hiện thực hóa phân tích tĩnh AST và Docker sandbox executor.
+    \item \texttt{backend/app/streaming}: Đóng gói sự kiện streaming và translator SSE.
+    \item \texttt{backend/app/connectors}: Chứa các connector an toàn kết nối SQL/SSH.
+\end{itemize}
+
+Giao diện người dùng Next.js được xây dựng đầy đủ chức năng hội thoại thời gian thực, hiển thị song song hộp thoại text chat và hộp chẩn đoán (run timeline) chi tiết.
+
+\subsection{Kết quả kiểm thử local}
+Báo cáo ghi nhận trạng thái kiểm thử tại thời điểm rà soát mã nguồn ở Bảng \ref{tab:verification}, chứng minh hệ thống đạt mọi tiêu chí kiểm duyệt chất lượng.
+
+\begin{table}[H]
+\centering
+\caption{Kết quả kiểm thử tích hợp và build hệ thống}\label{tab:verification}
+\begin{tabular}{p{0.36\textwidth}p{0.22\textwidth}p{0.32\textwidth}}
+\toprule
+\textbf{Hạng mục kiểm tra} & \textbf{Trạng thái} & \textbf{Ý nghĩa kết quả đạt được} \\
+\midrule
+Backend Ruff Linter & Thành công & Mã nguồn sạch, không vi phạm định dạng. \\
+Backend Pytest Suite & Thành công & Toàn bộ unit/integration tests vượt qua. \\
+Promptfoo Offline Eval & Thành công & 8 kịch bản định tuyến/DLP vượt qua. \\
+Frontend Lint \& Build & Thành công & Next.js production build thành công. \\
+Git Diff Check & Thành công & Không còn conflict markers/trailing whitespace. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Đánh giá các kịch bản an toàn}
+Việc thực nghiệm đánh giá an toàn thông qua \texttt{evals/scenarios.yaml} và các bài kiểm tra thực tế mang lại các kết quả kiểm chứng chi tiết trong Bảng \ref{tab:security-eval}.
+
+\begin{longtable}{p{0.22\textwidth}p{0.22\textwidth}p{0.22\textwidth}p{0.26\textwidth}}
+\caption{Kết quả thực nghiệm đánh giá các kịch bản an toàn}\label{tab:security-eval}\\
+\toprule
+\textbf{Loại kịch bản} & \textbf{Tác vụ gửi lên} & \textbf{Kết quả thực tế} & \textbf{Chốt chặn phát hiện} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Loại kịch bản} & \textbf{Tác vụ gửi lên} & \textbf{Kết quả thực tế} & \textbf{Chốt chặn phát hiện} \\
+\midrule
+\endhead
+AST Scan Vi phạm & \texttt{import os} & Bị loại bỏ khi upload & Vòng 1d: AST analyzer \\
+AST Scan Vi phạm & \texttt{open("/etc/passwd")} & Bị loại bỏ khi upload & Vòng 1d: AST open check \\
+ClickHouse Write & \texttt{DROP TABLE alarms} & Bị chặn và báo lỗi SQL & SafetyGuard: verify\_read\_only\_sql \\
+PostgreSQL Write & \texttt{INSERT INTO device} & Bị chặn và báo lỗi SQL & PostgreSQL ReadOnly transaction \\
+SSH Command Cấm & \texttt{rm -rf /} & Bị chặn trước khi gửi & SafetyGuard: validate\_ssh\_command \\
+SSH Command Nguy hiểm & \texttt{restart\_service} & Yêu cầu phê duyệt & reliability\_router $\to$ HITL \\
+\bottomrule
+\end{longtable}
+
+\subsection{Kết quả triển khai thử nghiệm server}
+Hệ thống được cấu hình triển khai thành công trên môi trường máy chủ đích Tailscale:
+\begin{itemize}
+    \item PostgreSQL được chạy bằng Docker Compose hỗ trợ tính năng tự kiểm tra sức khỏe (\texttt{healthcheck} bằng lệnh \texttt{pg\_isready} đạt trạng thái xanh).
+    \item Backend FastAPI chạy như một dịch vụ systemd trên hệ điều hành host để có thể gọi trực tiếp Docker daemon khởi chạy các container sandbox tạm thời.
+    \item SSH Connector nạp vân tay bảo mật từ tệp tin \texttt{backend/known\_hosts} được tạo bằng lệnh \texttt{ssh-keyscan}, tự động từ chối kết nối nếu vân tay máy chủ thay đổi.
+\end{itemize}
+
+\subsection{Đánh giá bảo mật}
+Mô hình Zero-Trust Agent Execution chứng minh hiệu quả vượt trội. Bằng cách loại bỏ hoàn toàn khả năng thực thi câu lệnh thô tự do từ phía LLM, backend giữ vai trò chốt chặn cuối cùng kiểm soát quyền hạn. Các dữ liệu nguy hiểm được ngăn chặn ở nhiều tầng độc lập: AST analyzer ngăn chặn ở bước lưu trữ tĩnh, Docker sandbox ngăn chặn các rủi ro phát sinh lúc chạy thử kỹ năng lạ, và các runtime gates cùng allowlist ngăn chặn các thao tác can thiệp hệ thống trực tiếp của tác tử.
+
+Tuy nhiên, hệ thống vẫn tồn tại một số điểm hạn chế cần cải thiện:
+\begin{itemize}
+    \item Chưa tích hợp lớp xác thực người dùng (AuthN/AuthZ) ở cấp độ sản xuất cho các API chat và phê duyệt.
+    \item Docker sandbox là giải pháp cô lập ở mức hệ điều hành, có mức độ bảo vệ thấp hơn so với các giải pháp microVM chuyên dụng (như gVisor hay Firecracker).
+\end{itemize}
+
+\subsection{So sánh với cách tích hợp Agent trực tiếp}
+Bảng \ref{tab:comparison} tóm tắt sự khác biệt về mặt thiết kế giữa Telecom Agent Execution Engine và các kiến trúc tác tử gọi công cụ tự do truyền thống.
+
+\begin{table}[H]
+\centering
+\caption{So sánh kiến trúc động cơ an toàn với mô hình Agent tự do}\label{tab:comparison}
+\begin{tabular}{p{0.28\textwidth}p{0.30\textwidth}p{0.32\textwidth}}
+\toprule
+\textbf{Tiêu chí so sánh} & \textbf{Mô hình Agent tự do} & \textbf{Đề tài đề xuất} \\
+\midrule
+Quyền sinh lệnh & LLM tự sinh câu lệnh shell/SQL & Chỉ truyền tham số khớp JSON Schema. \\
+Rủi ro Prompt Injection & Cực kỳ cao thông qua log/lệnh & Thấp nhờ allowlist và template hóa. \\
+Kiểm duyệt mã nguồn lạ & Thường bỏ qua hoặc chạy trực tiếp & Quét tĩnh AST kết hợp Docker Sandbox. \\
+Thao tác thay đổi hệ thống & Chạy ngay khi LLM quyết định & Bắt buộc dừng chờ phê duyệt (HITL). \\
+Khả năng kiểm toán & Phức tạp, khó theo dõi vết chạy & Lưu trữ đầy đủ run, step, tool\_call. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\newpage
+\section{Kết luận}
+
+\subsection{Tóm tắt kết quả đạt được}
+Đề tài đã hoàn thành việc nghiên cứu, thiết kế kiến trúc và hiện thực hóa một phiên bản động cơ thực thi tác tử an toàn (Telecom Agent Execution Engine) đáp ứng các tiêu chuẩn khắt khe cho môi trường vận hành hạ tầng viễn thông. Đồ thị LangGraph kết hợp PostgreSQL Checkpointer cung cấp khả năng điều phối trạng thái bền bỉ và quản lý phê duyệt thông minh. Đường ống kiểm duyệt 6 vòng kết hợp AST analyzer và Docker sandbox cung cấp giải pháp bọc và chạy các mã nguồn kỹ năng động một cách an toàn. Các connector an toàn và capabilities ngăn chặn hiệu quả các rủi ro tấn công chèn lệnh trực tiếp từ LLM.
+
+\subsection{Đánh giá hiệu quả}
+Hệ thống mang lại các giá trị vận hành thực tiễn to lớn:
+\begin{itemize}
+    \item Tăng tốc độ phản ứng xử lý sự cố NOC thông qua giao diện hội thoại ngôn ngữ tự nhiên.
+    \item Loại bỏ nguy cơ thao tác lỗi của kỹ sư nhờ khả năng tự động hóa kiểm tra tham số của capabilities và chốt phê duyệt bắt buộc cho lệnh nguy hiểm.
+    \item Đảm bảo tính tuân thủ bảo mật nhờ khả năng ghi nhận vết chạy đầy đủ và che giấu thông tin nhạy cảm.
+\end{itemize}
+
+\subsection{Hạn chế hiện tại}
+Các điểm hạn chế cần khắc phục bao gồm: chưa có phân quyền vai trò (RBAC) cho người duyệt lệnh, số lượng kịch bản tấn công redteam tự động trong CI còn mỏng, và môi trường Docker sandbox mặc dù thực dụng nhưng vẫn tiềm ẩn nguy cơ rò rỉ bảo mật nếu nhân Linux máy chủ host bị tấn công khai thác lỗi kernel.
+
+\subsection{Hướng phát triển tương lai}
+Trong các giai đoạn tiếp theo, dự án sẽ tập trung phát triển các nội dung sau:
+\begin{enumerate}
+    \item Triển khai giao thức xác thực OAuth2 kết hợp phân quyền RBAC chặt chẽ cho kỹ sư phê duyệt.
+    \item Nâng cấp môi trường thực thi sang kiến trúc microVM (sử dụng gVisor hoặc Firecracker) để tăng cường cô lập sandbox.
+    \item Xây dựng bộ quy tắc kiểm duyệt chính sách dưới dạng mã nguồn (Policy-as-Code) để tự động hóa việc đánh giá rủi ro capabilities.
+    \item Mở rộng thư viện kịch bản kỹ năng viễn thông chuyên dụng cho các bài toán phân tích tương quan cảnh báo (Alarm Correlation) và tự động khắc phục lỗi vòng kín (Closed-loop Remediation).
+\end{enumerate}
+
+\newpage
+\section*{Tài liệu tham khảo}
+\addcontentsline{toc}{section}{Tài liệu tham khảo}
+
+\begin{enumerate}
+    \item Yao, S., Zhao, J., Yu, D. et al., ``ReAct: Synergizing Reasoning and Acting in Language Models,'' in Proc. ICLR, 2023.
+    \item LangGraph Documentation, LangChain. \url{https://langchain-ai.github.io/langgraph/}.
+    \item FastAPI Documentation. \url{https://fastapi.tiangolo.com/}.
+    \item Langfuse Documentation. \url{https://langfuse.com/docs/}.
+    \item Promptfoo Documentation. \url{https://www.promptfoo.dev/docs/}.
+    \item Docker Documentation. \url{https://docs.docker.com/}.
+    \item OWASP Top 10 for Large Language Model Applications. \url{https://owasp.org/www-project-top-10-for-large-language-model-applications/}.
+    \item PostgreSQL Global Development Group, ``JSON Types (JSONB),'' \url{https://www.postgresql.org/docs/current/datatype-json.html}.
+\end{enumerate}
+
+\end{document}
