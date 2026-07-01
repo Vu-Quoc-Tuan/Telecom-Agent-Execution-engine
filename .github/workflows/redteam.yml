@@ -1,0 +1,142 @@
+name: Manual Red Team
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_path:
+        description: "Promptfoo redteam config path."
+        required: false
+        default: "evals/redteam.yaml"
+        type: string
+      max_concurrency:
+        description: "Promptfoo redteam concurrency."
+        required: false
+        default: "2"
+        type: string
+      openai_api_url:
+        description: "OpenAI-compatible API base URL used by the backend and Promptfoo."
+        required: false
+        default: "https://api.openai.com/v1"
+        type: string
+      openai_model_name:
+        description: "OpenAI-compatible model used by the backend and Promptfoo."
+        required: false
+        default: "gpt-4o-mini"
+        type: string
+
+concurrency:
+  group: redteam-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  redteam:
+    name: Manual red team
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_API_URL: ${{ inputs.openai_api_url }}
+      OPENAI_MODEL_NAME: ${{ inputs.openai_model_name }}
+      PROVIDER: openai
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: telecom_agent
+      CHECKPOINTER_BACKEND: memory
+      RUN_TIMEOUT_SWEEPER_ENABLED: "false"
+      REDTEAM_BACKEND_BASE_URL: http://127.0.0.1:8000
+      PROMPTFOO_CONFIG_DIR: /tmp/telecom-promptfoo
+      PROMPTFOO_DISABLE_WAL_MODE: "true"
+      PROMPTFOO_DISABLE_TELEMETRY: "true"
+      PROMPTFOO_CACHE_ENABLED: "false"
+      PROMPTFOO_VERSION: "0.121.17"
+      npm_config_ignore_scripts: "true"
+      REDTEAM_CONFIG_PATH: ${{ inputs.config_path }}
+      REDTEAM_MAX_CONCURRENCY: ${{ inputs.max_concurrency }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install backend dependencies
+        run: uv sync
+        working-directory: backend
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Start PostgreSQL
+        run: |
+          set -euo pipefail
+          docker compose up -d postgres
+          for attempt in {1..30}; do
+            if docker compose exec -T postgres pg_isready -U postgres -d telecom_agent; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs postgres
+          exit 1
+
+      - name: Migrate database
+        run: uv run alembic upgrade head
+        working-directory: backend
+
+      - name: Start backend
+        run: |
+          set -euo pipefail
+          nohup uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 \
+            >/tmp/redteam-backend.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/redteam-backend.log
+          exit 1
+        working-directory: backend
+
+      - name: Check redteam config exists
+        run: |
+          set -euo pipefail
+          if [ ! -f "${REDTEAM_CONFIG_PATH}" ]; then
+            echo "Redteam config '${REDTEAM_CONFIG_PATH}' does not exist." >&2
+            echo "Create it with 'promptfoo redteam init' or pass another config_path." >&2
+            exit 1
+          fi
+
+      - name: Run Promptfoo redteam
+        run: |
+          set -euo pipefail
+          args=(redteam run -c "${REDTEAM_CONFIG_PATH}" -j "${REDTEAM_MAX_CONCURRENCY}" -o redteam-generated.yaml --no-progress-bar)
+          npx --yes promptfoo@${PROMPTFOO_VERSION} "${args[@]}"
+
+      - name: Upload redteam artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: redteam-generated
+          path: |
+            redteam-generated.yaml
+            /tmp/redteam-backend.log
+          if-no-files-found: ignore
+
+      - name: Stop services
+        if: always()
+        run: docker compose down

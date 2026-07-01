@@ -1,0 +1,61 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Git branch to deploy from."
+        required: false
+        default: "main"
+        type: string
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy on self-hosted server
+    runs-on: [self-hosted, Linux, X64]
+
+    env:
+      DEPLOY_BRANCH: ${{ inputs.branch }}
+
+    steps:
+      - name: Deploy application
+        run: |
+          set -euo pipefail
+
+          branch="${DEPLOY_BRANCH}"
+          app_dir="/opt/telecom-agent"
+
+          cd "$app_dir"
+
+          git fetch origin "$branch"
+          git reset --hard "origin/$branch"
+
+          cd backend
+          UV_CACHE_DIR=/tmp/uv-cache uv sync
+
+          set -a
+          source ../.env
+          set +a
+
+          UV_CACHE_DIR=/tmp/uv-cache uv run alembic upgrade head
+          cd ..
+
+          docker compose up --build -d postgres frontend
+
+          sudo systemctl restart telecom-backend
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
+              echo "Backend healthy"
+              docker compose ps
+              exit 0
+            fi
+            sleep 2
+          done
+
+          sudo journalctl -u telecom-backend -n 80 --no-pager
+          exit 1

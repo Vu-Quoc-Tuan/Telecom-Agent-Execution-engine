@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests and offline eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: telecom_agent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d telecom_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/telecom_agent
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: telecom_agent
+      CHECKPOINTER_BACKEND: memory
+      RUN_TIMEOUT_SWEEPER_ENABLED: "false"
+      PROMPTFOO_CONFIG_DIR: /tmp/telecom-promptfoo
+      PROMPTFOO_DISABLE_WAL_MODE: "true"
+      PROMPTFOO_DISABLE_TELEMETRY: "true"
+      PROMPTFOO_CACHE_ENABLED: "false"
+      PROMPTFOO_VERSION: "0.121.17"
+      npm_config_ignore_scripts: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install backend dependencies
+        run: uv sync
+        working-directory: backend
+
+      - name: Lint backend
+        run: .venv/bin/ruff check app tests scripts
+        working-directory: backend
+
+      - name: Migrate test database
+        run: .venv/bin/alembic upgrade head
+        working-directory: backend
+
+      - name: Run backend tests
+        run: .venv/bin/pytest -q
+        working-directory: backend
+
+      - name: Run eval unit tests
+        run: PYTHONPATH=. backend/.venv/bin/pytest -q evals
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run offline Promptfoo eval
+        run: npx --yes promptfoo@${PROMPTFOO_VERSION} eval -c promptfoo.yaml --no-progress-bar
+        working-directory: evals
+
+  frontend:
+    name: Frontend lint, typecheck, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Lint frontend
+        run: npm run lint
+        working-directory: frontend
+
+      - name: Typecheck frontend
+        run: npx tsc --noEmit
+        working-directory: frontend
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: frontend
