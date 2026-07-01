@@ -28,6 +28,7 @@ from app.database.repositories.tool_calls import ToolCallRepository
 from app.llm.gateway import LLMGateway
 from app.llm.schemas import LLMMessage, LLMRequestOptions, MessageRole
 from app.observability.langfuse import telemetry_tracker
+from app.observability.logging import app_logger
 from app.observability.tracing import TelecomTaskTracer
 from app.services.timeline import serialize_timeline_steps
 
@@ -108,12 +109,19 @@ class AgentExecutionService:
 
         trace_id = run_record.id.hex
         # 🛡️ DLP: che mặt nạ secret/PII trước khi nội dung rời hệ thống sang LLM bên thứ 3.
-        # Bản gốc người dùng gõ vẫn được lưu nguyên trong chat_messages ở trên để hiển thị.
         sanitized_content = AgentSafetyGuard.sanitize_input_prompt(user_content)
+
+        # Đếm số lượt user message để tính turn_index, giúp đặt tên span là agent_turn #1, #2...
+        user_message_count = len(
+            [m for m in session_history if getattr(m, "role", None) == MessageRole.USER.value]
+        )
+        turn_index = max(1, user_message_count)
+
         telemetry_tracker.trace_run_start(
             session_id=str(session_id),
             run_id=trace_id,
             input_content=sanitized_content,
+            turn_index=turn_index,
         )
 
         run_config = cls._run_config(run_record)
@@ -229,47 +237,6 @@ class AgentExecutionService:
                         role="assistant",
                         content=assistant_text,
                     )
-                    # Tự động cập nhật tiêu đề cuộc chat nếu tiêu đề hiện tại là mặc định ("New Session" hoặc trống)
-                    session_title = getattr(session, "title", None)
-                    if (
-                        session_title is None
-                        or session_title.strip() == ""
-                        or session_title.strip() == "New Session"
-                    ):
-                        try:
-                            # Hỏi LLM sinh tiêu đề ngắn gọn
-                            title_prompt = (
-                                "Tóm tắt câu hỏi hoặc yêu cầu sau thành một tiêu đề ngắn gọn, súc tích (khoảng 3-6 từ), "
-                                "chuyên nghiệp để đặt tên cho cuộc chat viễn thông này. Chỉ trả về đúng tiêu đề, "
-                                f'không thêm bất kỳ từ giải thích nào khác:\n\n"{sanitized_content}"'
-                            )
-                            # Đồng bộ hóa logic chọn provider giống như trong nodes.py.
-                            target_provider = provider.strip().lower() if provider else None
-                            if target_provider in llm_gateway.providers:
-                                options = LLMRequestOptions(model=model, temperature=0.1)
-                            else:
-                                target_provider = None
-                                options = LLMRequestOptions(temperature=0.1)
-
-                            title_resp = await llm_gateway.invoke(
-                                provider=target_provider,
-                                messages=[LLMMessage(role=MessageRole.USER, content=title_prompt)],
-                                options=options,
-                            )
-                            if title_resp and title_resp.content:
-                                new_title = title_resp.content.strip().strip('"').strip("'").strip()
-                                if new_title:
-                                    if len(new_title) > 50:
-                                        new_title = new_title[:47] + "..."
-                                    if hasattr(session, "title"):
-                                        session.title = new_title
-                                        db.commit()
-                        except Exception as e:
-                            import logging
-
-                            logging.getLogger("telecom-agent").error(
-                                f"Title auto-update failed: {e}", exc_info=True
-                            )
                     telemetry_tracker.trace_run_end(
                         run_id=trace_id,
                         output_content=assistant_text,
@@ -278,6 +245,14 @@ class AgentExecutionService:
                     yield (
                         "run_completed",
                         {"run_id": str(run_record.id), "final_answer": assistant_text},
+                    )
+                    await cls._maybe_update_session_title(
+                        db=db,
+                        llm_gateway=llm_gateway,
+                        session=session,
+                        sanitized_content=sanitized_content,
+                        provider=provider,
+                        model=model,
                     )
                     return
 
@@ -416,9 +391,9 @@ class AgentExecutionService:
                     status="failed",
                     summary=output,
                 )
-                error_message = cls._mark_run_failed(
+                error_message = cls._mark_run_failed_and_close_trace(
                     db,
-                    run_record.id,
+                    run_record,
                     error_message=output,
                     source="approved_tool_execution",
                 )
@@ -476,9 +451,9 @@ class AgentExecutionService:
         batch_requests = ApprovalRepository.get_requests_by_run(db, run_record.id)
         if any(request.status in {"expired", "cancelled"} for request in batch_requests):
             error_message = "Approval batch expired or was cancelled before completion."
-            error_message = cls._mark_run_failed(
+            error_message = cls._mark_run_failed_and_close_trace(
                 db,
-                run_record.id,
+                run_record,
                 error_message=error_message,
                 source="approval_batch",
             )
@@ -496,9 +471,9 @@ class AgentExecutionService:
             if call.provider_tool_call_id in provider_ids
         }
         if len(persisted_calls) != len(provider_ids):
-            error_message = cls._mark_run_failed(
+            error_message = cls._mark_run_failed_and_close_trace(
                 db,
-                run_record.id,
+                run_record,
                 error_message="Approval batch is incomplete and cannot be resumed.",
                 source="approval_batch",
             )
@@ -753,6 +728,74 @@ class AgentExecutionService:
         if status == RunStatus.TIMED_OUT.value:
             return "Run timed out before the agent finished."
         return None
+
+    @staticmethod
+    async def _maybe_update_session_title(
+        *,
+        db: Session,
+        llm_gateway: LLMGateway,
+        session: Any,
+        sanitized_content: str,
+        provider: str | None,
+        model: str | None,
+    ) -> None:
+        session_title = getattr(session, "title", None)
+        if session_title and session_title.strip() not in {"", "New Session"}:
+            return
+
+        try:
+            title_prompt = (
+                "Tóm tắt câu hỏi hoặc yêu cầu sau thành một tiêu đề ngắn gọn, súc tích "
+                "(khoảng 3-6 từ), chuyên nghiệp để đặt tên cho cuộc chat viễn thông này. "
+                "Chỉ trả về đúng tiêu đề, không thêm bất kỳ từ giải thích nào khác:"
+                f'\n\n"{sanitized_content}"'
+            )
+            target_provider = provider.strip().lower() if provider else None
+            if target_provider in llm_gateway.providers:
+                options = LLMRequestOptions(model=model, temperature=0.1)
+            else:
+                target_provider = None
+                options = LLMRequestOptions(temperature=0.1)
+
+            title_response = await llm_gateway.invoke(
+                provider=target_provider,
+                messages=[LLMMessage(role=MessageRole.USER, content=title_prompt)],
+                options=options,
+            )
+            if not title_response or not title_response.content:
+                return
+
+            new_title = title_response.content.strip().strip('"').strip("'").strip()
+            if not new_title:
+                return
+            if len(new_title) > 50:
+                new_title = new_title[:47] + "..."
+            session.title = new_title
+            db.commit()
+        except Exception:
+            app_logger.exception("Title auto-update failed.")
+
+    @classmethod
+    def _mark_run_failed_and_close_trace(
+        cls,
+        db: Session,
+        run_record: Any,
+        *,
+        error_message: str,
+        source: str,
+    ) -> str:
+        terminal_message = cls._mark_run_failed(
+            db,
+            run_record.id,
+            error_message=error_message,
+            source=source,
+        )
+        telemetry_tracker.trace_run_end(
+            run_id=run_record.id.hex,
+            output_content=terminal_message,
+            status="failed",
+        )
+        return terminal_message
 
     @classmethod
     def _mark_run_failed(

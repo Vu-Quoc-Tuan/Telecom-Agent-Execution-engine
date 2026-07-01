@@ -36,11 +36,11 @@ class AgentState(BaseModel):
     # Trục tin nhắn tích lũy qua reducer
     messages: Annotated[list[LLMMessage], append_messages] = Field(default_factory=list)
 
-    # Định danh định vị phiên làm việc xuống hệ quản trị cơ sở dữ liệu
+    # Định danh định vị phiên làm việc
     session_id: str
     run_id: str
 
-    # Biến đếm bước để chống lỗi lặp vô hạn (Infinite Loop Protection)
+    # chống lỗi lặp vô hạn
     current_step_index: int = 0
     max_steps: int = 12
 

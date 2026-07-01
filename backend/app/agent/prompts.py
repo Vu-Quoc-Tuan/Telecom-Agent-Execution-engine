@@ -67,7 +67,7 @@ def _build_skill_section(ready_skills, selected_skill_name: str | None = None) -
         return "## Skill vận hành khả dụng\n- Chưa có custom skill nào được duyệt."
 
     catalog = "\n".join(f"- {skill.name}: {skill.description}" for skill in ready_skills)
-    
+
     instructions = (
         "\n\nQUAN TRỌNG: Bạn KHÔNG ĐƯỢC gọi trực tiếp tên skill (ví dụ: `noc-alarm-enrichment`) như một tool call. "
         "Tên skill KHÔNG PHẢI là tên tool khả dụng để gọi trực tiếp.\n"
@@ -78,7 +78,6 @@ def _build_skill_section(ready_skills, selected_skill_name: str | None = None) -
 
     sel = f"\nChỉ định nạp skill: `{selected_skill_name}`." if selected_skill_name else ""
     return f"## Skill vận hành khả dụng\n{catalog}{instructions}{sel}"
-
 
 
 def build_system_prompt(ready_skills, settings=None, selected_skill_name: str | None = None) -> str:

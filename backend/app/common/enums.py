@@ -1,4 +1,3 @@
-# backend/app/common/enums.py
 from enum import StrEnum
 
 

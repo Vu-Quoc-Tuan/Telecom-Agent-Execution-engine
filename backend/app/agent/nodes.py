@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -10,14 +9,13 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 from langgraph.types import interrupt
 
+from app.agent.builtin_runners import execute_builtin_tool
 from app.agent.builtin_tools import (
     BUILTIN_TOOL_NAMES,
     LOAD_SKILL,
     build_builtin_tool_definitions,
     classify_builtin_risk,
     connector_name_for,
-    execute_builtin_tool,
-    required_approval_confirmations,
 )
 from app.agent.context_window import compact_messages_if_needed
 from app.agent.prompts import build_system_prompt
@@ -40,6 +38,7 @@ from app.llm.schemas import (
     ToolChoice,
     ToolChoiceMode,
 )
+from app.observability.langfuse import telemetry_tracker
 
 
 def _normalize_provider_name(provider: Any) -> str | None:
@@ -159,6 +158,99 @@ class AgentNodes:
         )
 
     @staticmethod
+    async def _execute_and_log_single_tool(
+        *,
+        db,
+        run_uuid: uuid.UUID,
+        session_uuid: uuid.UUID,
+        step_id: uuid.UUID,
+        tool_call,
+        risk_level: str,
+        settings,
+        idempotency_key: str | None = None,
+        step_index: int = 0,
+    ) -> LLMMessage:
+        db_tool_call = ToolCallRepository.create_tool_call(
+            db=db,
+            run_id=run_uuid,
+            run_step_id=step_id,
+            skill_name=tool_call.name,
+            connector_name=connector_name_for(tool_call.name),
+            arguments=tool_call.arguments,
+            risk_level=risk_level,
+            requires_approval=False,
+            provider_tool_call_id=tool_call.id,
+            idempotency_key=idempotency_key,
+        )
+        ToolCallRepository.start_execution(db, db_tool_call.id)
+        started_at = datetime.now(UTC)
+        try:
+            if settings is not None:
+                output, was_truncated = await execute_builtin_tool(
+                    tool_name=tool_call.name,
+                    arguments=tool_call.arguments,
+                    db=db,
+                    settings=settings,
+                )
+            else:
+                output, was_truncated = await execute_builtin_tool(
+                    tool_name=tool_call.name,
+                    arguments=tool_call.arguments,
+                    db=db,
+                )
+            status = "completed"
+            error_message = None
+        except TelecomAgentException as exc:
+            output = exc.message
+            was_truncated = False
+            status = "failed"
+            error_message = exc.message
+
+        latency_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
+        ToolCallRepository.save_result(
+            db=db,
+            tool_call_id=db_tool_call.id,
+            status=status,
+            result={"output": output},
+            latency_ms=latency_ms,
+            error_msg=error_message,
+            output_truncated=was_truncated,
+        )
+        RunStepRepository.complete_step(db=db, step_id=step_id, status=status, summary=output)
+
+        # Ghi tool span con vào Langfuse dưới root span của lượt chạy hiện tại.
+        # QUAN TRỌNG: dùng run_uuid.hex (giống trace_run_start) để _ensure_root
+        # tìm đúng root span đã tạo, tránh tạo orphan observation.
+        try:
+            turn_index = telemetry_tracker.get_turn_index(run_uuid.hex)
+            telemetry_tracker.trace_span(
+                run_id=run_uuid.hex,
+                span_name=f"tool: {tool_call.name} #{turn_index}.{step_index}",
+                input_data=tool_call.arguments,
+                output_data=output,
+                start_time=started_at,
+                end_time=datetime.now(UTC),
+                status=status,
+            )
+        except Exception:
+            pass
+
+        MessageRepository.save_message(
+            db=db,
+            session_id=session_uuid,
+            run_id=run_uuid,
+            role="tool",
+            content=output,
+            metadata={"tool_name": tool_call.name, "tool_call_id": tool_call.id},
+        )
+        return LLMMessage(
+            role=MessageRole.TOOL,
+            content=output,
+            tool_call_id=tool_call.id,
+            tool_is_error=status == "failed",
+        )
+
+    @staticmethod
     def _custom_stream_writer():
         try:
             return get_stream_writer()
@@ -176,7 +268,9 @@ class AgentNodes:
         options: LLMRequestOptions | None,
         fallback_providers: list[str] | None = None,
         provider_options: dict[str, LLMRequestOptions] | None = None,
+        provider_kwargs: dict[str, Any] | None = None,
     ):
+        call_kwargs = provider_kwargs or {}
         stream_method = getattr(llm_gateway, "stream", None)
         if not callable(stream_method):
             return await llm_gateway.invoke(
@@ -188,6 +282,7 @@ class AgentNodes:
                 fallback_providers=fallback_providers,
                 fallback_on_non_retryable=True,
                 provider_options=provider_options,
+                **call_kwargs,
             )
 
         writer = AgentNodes._custom_stream_writer()
@@ -201,6 +296,7 @@ class AgentNodes:
             fallback_providers=fallback_providers,
             fallback_on_non_retryable=True,
             provider_options=provider_options,
+            **call_kwargs,
         ):
             if (
                 stream_chunk.event_type == StreamEventType.TEXT_DELTA
@@ -225,6 +321,10 @@ class AgentNodes:
             tools=llm_tools,
             provider=provider,
             options=options,
+            fallback_providers=fallback_providers,
+            fallback_on_non_retryable=True,
+            provider_options=provider_options,
+            **call_kwargs,
         )
 
     @staticmethod
@@ -300,10 +400,6 @@ class AgentNodes:
                     run_id=run_uuid,
                     tool_call_id=db_tool_call.id,
                     expires_in_seconds=1800,
-                    required_confirmations=required_approval_confirmations(
-                        tool_call.name,
-                        tool_call.arguments,
-                    ),
                 )
                 continue
 
@@ -315,65 +411,16 @@ class AgentNodes:
                 name=f"Skill Runtime: {tool_call.name}",
             )
             RunStepRepository.start_step(db, step.id)
-            db_tool_call = ToolCallRepository.create_tool_call(
+            executed_tool_messages[tool_call.id] = await AgentNodes._execute_and_log_single_tool(
                 db=db,
-                run_id=run_uuid,
-                run_step_id=step.id,
-                skill_name=tool_call.name,
-                connector_name=connector_name_for(tool_call.name),
-                arguments=tool_call.arguments,
+                run_uuid=run_uuid,
+                session_uuid=session_uuid,
+                step_id=step.id,
+                tool_call=tool_call,
                 risk_level=risk_level,
-                requires_approval=False,
-                provider_tool_call_id=tool_call.id,
+                settings=settings,
                 idempotency_key=idempotency_key,
-            )
-            ToolCallRepository.start_execution(db, db_tool_call.id)
-            started_at = datetime.now(UTC)
-            try:
-                if settings is not None:
-                    output, was_truncated = await execute_builtin_tool(
-                        tool_name=tool_call.name,
-                        arguments=tool_call.arguments,
-                        db=db,
-                        settings=settings,
-                    )
-                else:
-                    output, was_truncated = await execute_builtin_tool(
-                        tool_name=tool_call.name,
-                        arguments=tool_call.arguments,
-                        db=db,
-                    )
-                status = "completed"
-                error_message = None
-            except TelecomAgentException as exc:
-                output = exc.message
-                was_truncated = False
-                status = "failed"
-                error_message = exc.message
-            latency_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
-            ToolCallRepository.save_result(
-                db=db,
-                tool_call_id=db_tool_call.id,
-                status=status,
-                result={"output": output},
-                latency_ms=latency_ms,
-                error_msg=error_message,
-                output_truncated=was_truncated,
-            )
-            RunStepRepository.complete_step(db=db, step_id=step.id, status=status, summary=output)
-            executed_tool_messages[tool_call.id] = LLMMessage(
-                role=MessageRole.TOOL,
-                content=output,
-                tool_call_id=tool_call.id,
-                tool_is_error=status == "failed",
-            )
-            MessageRepository.save_message(
-                db=db,
-                session_id=session_uuid,
-                run_id=run_uuid,
-                role="tool",
-                content=output,
-                metadata={"tool_name": tool_call.name, "tool_call_id": tool_call.id},
+                step_index=state.current_step_index + index,
             )
 
         resume_payload = interrupt(
@@ -428,7 +475,6 @@ class AgentNodes:
         RunStepRepository.start_step(db, step.id)
 
         # Catalog skill 'ready' chỉ chèn METADATA (name+description) vào system prompt
-        # (progressive disclosure L1); bộ tool gửi cho LLM là các tool built-in cố định.
         run_config = config["configurable"].get("run_config") or {}
         selected_skill = run_config.get("selected_skill")
         if not isinstance(selected_skill, str) or not selected_skill.strip():
@@ -473,9 +519,6 @@ class AgentNodes:
         ]
         messages_for_llm = [*state.messages, *intervention_messages]
 
-        # Lái provider + model theo lựa chọn của request. Nếu provider không được đăng ký
-        # thì rơi về default_provider và BỎ luôn model override (tránh gửi model của
-        # provider này sang provider khác gây lỗi). Nếu provider hợp lệ thì honor model.
         requested_provider = config["configurable"].get("provider")
         requested_model = config["configurable"].get("model")
         normalized_provider = _normalize_provider_name(requested_provider)
@@ -549,7 +592,19 @@ class AgentNodes:
             target_ratio=target_ratio,
         )
 
-        llm_started_at = datetime.now(UTC)
+        langfuse_callback = telemetry_tracker.get_langchain_callback_handler(str(run_uuid))
+        provider_kwargs: dict[str, Any] = {}
+        if langfuse_callback is not None:
+            turn_index = telemetry_tracker.get_turn_index(str(run_uuid))
+            provider_kwargs = {
+                "callbacks": [langfuse_callback],
+                "run_name": f"AI Core Reasoner #{turn_index}.{state.current_step_index}",
+                "metadata": {
+                    "run_id": str(run_uuid),
+                    "step_id": str(step.id),
+                },
+                "tags": ["telecom-agent", "llm"],
+            }
         try:
             response = await AgentNodes._invoke_llm_gateway_with_text_stream(
                 llm_gateway=llm_gateway,
@@ -560,8 +615,8 @@ class AgentNodes:
                 options=options,
                 fallback_providers=fallback_providers,
                 provider_options=provider_options,
+                provider_kwargs=provider_kwargs,
             )
-            llm_ended_at = datetime.now(UTC)
             summary = (
                 response.content
                 if response.content
@@ -599,28 +654,6 @@ class AgentNodes:
             )
             db.commit()
 
-            try:
-                from app.observability.langfuse import PROMPT_NAME, telemetry_tracker
-
-                telemetry_tracker.trace_generation(
-                    run_id=str(run_uuid),
-                    generation_name=f"AI Core Reasoner #{state.current_step_index}",
-                    model_name=response.model,
-                    input_data=messages_for_llm,
-                    output_data=response.content
-                    or json.dumps([tc.model_dump() for tc in response.tool_calls])
-                    if response.tool_calls
-                    else (response.content or ""),
-                    input_tokens=response.usage.input_tokens if response.usage else 0,
-                    output_tokens=response.usage.output_tokens if response.usage else 0,
-                    prompt_name=PROMPT_NAME,
-                    start_time=llm_started_at,
-                    end_time=llm_ended_at,
-                )
-            except Exception as telemetry_exc:
-                logging.getLogger("telecom-agent").warning(
-                    f"Failed to log step generation to Langfuse: {telemetry_exc}"
-                )
             # Nối assistant message (kèm tool_calls) vào lịch sử hội thoại.
             # Bắt buộc: provider yêu cầu mỗi tool message phải đứng SAU một assistant
             # message chứa tool_calls tương ứng; nếu thiếu, lượt gọi LLM kế tiếp sẽ lỗi 400.
@@ -705,7 +738,6 @@ class AgentNodes:
                 )
                 continue
 
-            connector_name = connector_name_for(tool_call.name)
             try:
                 risk_level = classify_builtin_risk(tool_call.name, tool_call.arguments)
             except TelecomAgentException as exc:
@@ -739,87 +771,17 @@ class AgentNodes:
                 )
                 continue
 
-            db_tool_call = ToolCallRepository.create_tool_call(
+            msg = await AgentNodes._execute_and_log_single_tool(
                 db=db,
-                run_id=run_uuid,
-                run_step_id=step.id,
-                skill_name=tool_call.name,
-                connector_name=connector_name,
-                arguments=tool_call.arguments,
+                run_uuid=run_uuid,
+                session_uuid=session_uuid,
+                step_id=step.id,
+                tool_call=tool_call,
                 risk_level=risk_level,
-                requires_approval=False,
-                provider_tool_call_id=tool_call.id,
+                settings=settings,
+                step_index=state.current_step_index + index,
             )
-            ToolCallRepository.start_execution(db, db_tool_call.id)
-
-            started_at = datetime.now(UTC)
-            try:
-                if settings is not None:
-                    output, was_truncated = await execute_builtin_tool(
-                        tool_name=tool_call.name,
-                        arguments=tool_call.arguments,
-                        db=db,
-                        settings=settings,
-                    )
-                else:
-                    output, was_truncated = await execute_builtin_tool(
-                        tool_name=tool_call.name,
-                        arguments=tool_call.arguments,
-                        db=db,
-                    )
-                status = "completed"
-                error_message = None
-            except TelecomAgentException as exc:
-                output = exc.message
-                was_truncated = False
-                status = "failed"
-                error_message = exc.message
-
-            latency_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
-            ToolCallRepository.save_result(
-                db=db,
-                tool_call_id=db_tool_call.id,
-                status=status,
-                result={"output": output},
-                latency_ms=latency_ms,
-                error_msg=error_message,
-                output_truncated=was_truncated,
-            )
-            RunStepRepository.complete_step(db=db, step_id=step.id, status=status, summary=output)
-
-            try:
-                from app.observability.langfuse import telemetry_tracker
-
-                telemetry_tracker.trace_span(
-                    run_id=str(run_uuid),
-                    span_name=f"tool: {tool_call.name}",
-                    input_data=tool_call.arguments,
-                    output_data=output,
-                    start_time=started_at,
-                    end_time=datetime.now(UTC),
-                    status=status,
-                )
-            except Exception as telemetry_exc:
-                logging.getLogger("telecom-agent").warning(
-                    f"Failed to log tool span to Langfuse: {telemetry_exc}"
-                )
-
-            new_tool_messages.append(
-                LLMMessage(
-                    role=MessageRole.TOOL,
-                    content=output,
-                    tool_call_id=tool_call.id,
-                    tool_is_error=status == "failed",
-                )
-            )
-            MessageRepository.save_message(
-                db=db,
-                session_id=session_uuid,
-                run_id=run_uuid,
-                role="tool",
-                content=output,
-                metadata={"tool_name": tool_call.name, "tool_call_id": tool_call.id},
-            )
+            new_tool_messages.append(msg)
 
         return {
             "messages": new_tool_messages,

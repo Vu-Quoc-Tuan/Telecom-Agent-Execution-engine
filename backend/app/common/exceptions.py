@@ -1,4 +1,3 @@
-# backend/app/common/exceptions.py
 from typing import Any
 
 

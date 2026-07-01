@@ -1,4 +1,3 @@
-# backend/app/streaming/event_mapper.py
 from __future__ import annotations
 
 from typing import Any

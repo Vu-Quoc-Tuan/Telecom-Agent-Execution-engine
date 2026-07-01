@@ -59,7 +59,6 @@ class ToolCall(Base):
         nullable=False,
     )
 
-
     # ssh | clickhouse | external_postgres | internal | mcp_server_name
     connector_name = Column(
         String(100),

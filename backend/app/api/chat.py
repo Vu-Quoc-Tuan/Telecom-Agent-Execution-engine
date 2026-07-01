@@ -1,4 +1,3 @@
-# backend/app/api/chat.py (Bản update liên thông mạch map)
 from __future__ import annotations
 
 import uuid
@@ -104,7 +103,7 @@ async def stream_agent_conversation(
     # generator dưới đây mới truy vấn DB sau đó -> dùng SessionLocal() bên trong generator.
     async def sse_pipeline_transport():
         with SessionLocal() as db:
-            # 1. Bốc generator nhả Tuple thô từ Service
+            # 1. Generator Tuple thô từ AgentExecutionService
             raw_generator = AgentExecutionService.run_agent_lifecycle(
                 db=db,
                 llm_gateway=llm_gateway,
@@ -114,13 +113,13 @@ async def stream_agent_conversation(
                 model=model,
                 selected_skill=body.skill_name if body.skill_mode == "specific" else None,
             )
-            # 2. Đút qua bộ mapper và format sse rạch ròi nhiệm vụ
+            # 2. Mapper, format SSE
             async for event_type, payload_dict in raw_generator:
-                # Lớp 1: Map và validate cấu trúc bằng Pydantic
+                # Map và validate cấu trúc bằng Pydantic
                 envelope = TelecomStreamEventMapper.map_raw_payload_to_envelope(
                     event_type, payload_dict
                 )
-                # Lớp 2: Biến thành chuỗi text sse truyền mạng
+                # Biến thành chuỗi text sse
                 yield format_sse_event(envelope.event_type.value, envelope.payload.model_dump())
 
     return StreamingResponse(sse_pipeline_transport(), media_type="text/event-stream")

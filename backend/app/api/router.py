@@ -1,4 +1,3 @@
-# backend/app/api/router.py
 from fastapi import APIRouter
 
 from app.api import approvals, chat, resources, runs, sessions, skills

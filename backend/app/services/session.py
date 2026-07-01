@@ -1,4 +1,3 @@
-# backend/app/services/session.py
 from __future__ import annotations
 
 import uuid
@@ -21,7 +20,7 @@ class SessionService:
         AuditLogRepository.log_event(
             db=db,
             actor_type="user",
-            actor_id="operator",  # Tạm thời fix, sau này bốc từ jwt token
+            actor_id="operator",
             action="session.created",
             session_id=session.id,
             resource_type="session",

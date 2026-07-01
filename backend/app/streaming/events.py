@@ -1,4 +1,3 @@
-# backend/app/streaming/events.py
 from __future__ import annotations
 
 from enum import StrEnum
@@ -60,8 +59,6 @@ class RunSuspendedPayload(BaseStreamPayload):
     tool_name: str | None = None
     tool_input: dict[str, Any] | None = None
     risk_level: str | None = None
-    required_confirmations: int = 1
-    confirmation_count: int = 0
 
 
 class RunResumedPayload(BaseStreamPayload):

@@ -24,6 +24,17 @@ class FakeMessage:
         self.run_id = run_id
 
 
+class FakeResult:
+    @property
+    def rowcount(self) -> int:
+        return 0
+
+    def scalars(self, *args, **kwargs):
+        mock_res = MagicMock()
+        mock_res.all.return_value = []
+        return mock_res
+
+
 class FakeDb:
     def commit(self):
         pass
@@ -32,7 +43,7 @@ class FakeDb:
         pass
 
     def execute(self, *args, **kwargs):
-        pass
+        return FakeResult()
 
     def scalar(self, *args, **kwargs):
         return 1

@@ -26,6 +26,9 @@ class FakeDb:
     def rollback(self) -> None:
         pass
 
+    def execute(self, statement, *args, **kwargs):
+        return types.SimpleNamespace(rowcount=0, scalars=lambda: [])
+
     def scalars(self, statement):
         return types.SimpleNamespace(all=lambda: [])
 
@@ -112,8 +115,8 @@ class TwoPhaseResumeAgentApp:
                         tool_calls=[
                             NormalizedToolCall(
                                 id=self.provider_tool_call_id,
-                                name="run_ssh_command",
-                                arguments={"node_name": "site-a", "command": "restart service"},
+                                name="ping_node",
+                                arguments={"node_name": "site-a", "count": 3},
                             )
                         ],
                     )
@@ -240,7 +243,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(AgentExecutionService, "_serialize_steps", return_value=[]),
             patch(
                 "app.services.agent_execution.telemetry_tracker.get_active_prompt_version",
-                return_value="0.1.0",
+                return_value=TELECOM_AGENT_PROMPT_VERSION,
             ),
         ):
             events = [
@@ -440,17 +443,21 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(AgentExecutionService, "_serialize_steps", return_value=[]),
             patch("app.services.agent_execution.telemetry_tracker.trace_run_end"),
         ):
-            events = [
-                event
-                async for event in AgentExecutionService.run_agent_lifecycle(
-                    db=FakeDb(),
-                    llm_gateway=gateway,
-                    session_id=session_id,
-                    user_content="server tôi lag password=SSH_Master_Password_2026",
-                )
-            ]
+            stream = AgentExecutionService.run_agent_lifecycle(
+                db=FakeDb(),
+                llm_gateway=gateway,
+                session_id=session_id,
+                user_content="server tôi lag password=SSH_Master_Password_2026",
+            )
+            while True:
+                event = await anext(stream)
+                if event[0] == "run_completed":
+                    break
 
-        self.assertEqual("run_completed", events[-1][0])
+            self.assertIsNone(gateway.title_prompt)
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+
         self.assertIsNotNone(gateway.title_prompt)
         self.assertNotIn("SSH_Master_Password_2026", gateway.title_prompt)
         self.assertIn("[[MASKED_SECRET]]", gateway.title_prompt)
@@ -518,68 +525,6 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("run_failed", events[-1][0])
         self.assertIn("cancelled", events[-1][1]["error"])
 
-    async def test_first_critical_confirmation_keeps_run_suspended(self) -> None:
-        from app.services.agent_execution import AgentExecutionService
-
-        run = types.SimpleNamespace(
-            id=uuid.uuid4(),
-            session_id=uuid.uuid4(),
-            provider="openai",
-            model="gpt-4o",
-            status=RunStatus.WAITING_APPROVAL.value,
-        )
-        tool_call = types.SimpleNamespace(
-            id=uuid.uuid4(),
-            run_step_id=uuid.uuid4(),
-            skill_name="run_ssh_command",
-            arguments_json={"node_name": "site-a", "command": "rm -rf /var/tmp/cache"},
-            risk_level="require_approval",
-        )
-        pending = types.SimpleNamespace(
-            id=uuid.uuid4(),
-            run_id=run.id,
-            tool_call_id=tool_call.id,
-            status="pending",
-            reason="Critical SSH command",
-            required_confirmations=2,
-            confirmation_count=0,
-        )
-        first_confirmation = types.SimpleNamespace(**{**pending.__dict__, "confirmation_count": 1})
-
-        with (
-            patch(
-                "app.services.agent_execution.ApprovalRepository.get_request",
-                return_value=pending,
-            ),
-            patch(
-                "app.services.agent_execution.ApprovalRepository.resolve_request",
-                return_value=first_confirmation,
-            ),
-            patch("app.services.agent_execution.RunRepository.get_run", return_value=run),
-            patch(
-                "app.services.agent_execution.ToolCallRepository.get_tool_call",
-                return_value=tool_call,
-            ),
-            patch(
-                "app.services.agent_execution.execute_builtin_tool",
-                new=AsyncMock(),
-            ) as execute_tool,
-        ):
-            events = [
-                event
-                async for event in AgentExecutionService.resolve_approval_and_resume_lifecycle(
-                    db=FakeDb(),
-                    llm_gateway=types.SimpleNamespace(),
-                    approval_id=pending.id,
-                    action="approved",
-                )
-            ]
-
-        self.assertEqual("run_suspended", events[-1][0])
-        self.assertEqual(1, events[-1][1]["confirmation_count"])
-        self.assertEqual(2, events[-1][1]["required_confirmations"])
-        execute_tool.assert_not_awaited()
-
     async def test_unexpected_approved_tool_error_closes_run(self) -> None:
         from app.services.agent_execution import AgentExecutionService
 
@@ -593,8 +538,8 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         tool_call = types.SimpleNamespace(
             id=uuid.uuid4(),
             run_step_id=uuid.uuid4(),
-            skill_name="run_ssh_command",
-            arguments_json={"node_name": "site-a", "command": "restart service"},
+            skill_name="ping_node",
+            arguments_json={"node_name": "site-a", "count": 3},
         )
         approval = types.SimpleNamespace(
             id=uuid.uuid4(),
@@ -628,6 +573,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
                 "_mark_run_failed",
                 return_value="connector crashed",
             ) as mark_failed,
+            patch("app.services.agent_execution.telemetry_tracker.trace_run_end") as trace_run_end,
         ):
             events = [
                 event
@@ -643,6 +589,11 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", save_result.call_args.kwargs["status"])
         self.assertEqual("failed", complete_step.call_args.kwargs["status"])
         mark_failed.assert_called_once()
+        trace_run_end.assert_called_once_with(
+            run_id=run.id.hex,
+            output_content="connector crashed",
+            status="failed",
+        )
 
     async def test_rejected_approval_saves_tool_message_and_resume_telemetry(self) -> None:
         from app.services.agent_execution import AgentExecutionService
@@ -659,8 +610,8 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         tool_call = types.SimpleNamespace(
             id=uuid.uuid4(),
             run_step_id=uuid.uuid4(),
-            skill_name="run_ssh_command",
-            arguments_json={"node_name": "site-a", "command": "restart service"},
+            skill_name="ping_node",
+            arguments_json={"node_name": "site-a", "count": 3},
             provider_tool_call_id=provider_tool_call_id,
             result_json={"output": "Rejected by human operator. Reason: risky"},
             status="rejected",
@@ -701,6 +652,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.agent_execution.ToolCallRepository.save_result"),
             patch("app.services.agent_execution.RunStepRepository.complete_step"),
+            patch("app.services.agent_execution.MessageRepository.save_message"),
             patch(
                 "app.services.agent_execution.ApprovalRepository.get_pending_requests",
                 return_value=[],
@@ -803,45 +755,6 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(ToolChoiceMode.NONE, gateway.options.tool_choice.mode)
-
-    async def test_critical_ssh_request_requires_two_confirmations(self) -> None:
-        from app.agent.nodes import AgentNodes
-
-        run_id = uuid.uuid4()
-        response = LLMResponse(
-            provider="openai",
-            model="gpt-4o",
-            finish_reason=FinishReason.TOOL,
-            tool_calls=[
-                NormalizedToolCall(
-                    id="call-critical",
-                    name="run_ssh_command",
-                    arguments={"node_name": "site-a", "command": "rm -rf /var/tmp/cache"},
-                )
-            ],
-        )
-        state = AgentState(
-            session_id=str(uuid.uuid4()),
-            run_id=str(run_id),
-            current_step_index=1,
-            latest_response=response,
-        )
-        step = types.SimpleNamespace(id=uuid.uuid4())
-        tool_call = types.SimpleNamespace(id=uuid.uuid4())
-
-        with (
-            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
-            patch("app.agent.nodes.ToolCallRepository.get_by_idempotency_key", return_value=None),
-            patch("app.agent.nodes.ToolCallRepository.create_tool_call", return_value=tool_call),
-            patch("app.agent.nodes.ApprovalRepository.create_request") as create_request,
-            patch("app.agent.nodes.interrupt", return_value={"messages": []}),
-        ):
-            await AgentNodes.suspend_for_human(
-                state,
-                {"configurable": {"db": FakeDb()}},
-            )
-
-        self.assertEqual(2, create_request.call_args.kwargs["required_confirmations"])
 
     async def test_call_llm_gateway_uses_run_config_options(self) -> None:
         from app.agent.nodes import AgentNodes
@@ -1411,17 +1324,46 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
                 tool_calls=[
                     NormalizedToolCall(
                         id="call-chained",
-                        name="run_ssh_command",
-                        arguments={
-                            "node_name": "default",
-                            "command": "hostname && uptime",
-                        },
+                        name="unknown_raw_tool",
+                        arguments={"command": "hostname && uptime"},
                     )
                 ],
             ),
         )
 
         route = reliability_router(state, {"configurable": {"db": FakeDb()}})
+
+        self.assertEqual("fail", route)
+
+    def test_reliability_router_routes_invalid_approval_tool_to_feedback_path(self) -> None:
+        from app.agent.routing import reliability_router
+
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(uuid.uuid4()),
+            current_step_index=1,
+            latest_response=LLMResponse(
+                provider="openai",
+                model="gpt-4o",
+                finish_reason=FinishReason.TOOL,
+                tool_calls=[
+                    NormalizedToolCall(
+                        id="call-invalid-restart",
+                        name="restart_service",
+                        arguments={"node_name": "site-a", "service_name": "apache"},
+                    )
+                ],
+            ),
+        )
+        settings = types.SimpleNamespace(
+            SSH_ALLOWED_NODES="site-a",
+            SSH_NODE_HOST_MAP="",
+            SSH_HOST="",
+            SSH_RESTART_ALLOWED_SERVICES="nginx",
+            SANDBOX_ENABLED=False,
+        )
+
+        route = reliability_router(state, {"configurable": {"db": FakeDb(), "settings": settings}})
 
         self.assertEqual("execute_tools", route)
 
@@ -1441,13 +1383,13 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
                 tool_calls=[
                     NormalizedToolCall(
                         id="call-invalid",
-                        name="run_ssh_command",
-                        arguments={"node_name": "default", "command": "hostname && uptime"},
+                        name="unknown_raw_tool",
+                        arguments={"command": "hostname && uptime"},
                     ),
                     NormalizedToolCall(
                         id="call-approval",
-                        name="run_ssh_command",
-                        arguments={"node_name": "default", "command": "systemctl restart sshd"},
+                        name="removed_approval_tool",
+                        arguments={"command": "systemctl restart sshd"},
                     ),
                 ],
             ),
@@ -1455,7 +1397,57 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         route = reliability_router(state, {"configurable": {"db": FakeDb()}})
 
-        self.assertEqual("execute_tools", route)
+        self.assertEqual("fail", route)
+
+    async def test_restart_service_request_creates_single_approval(self) -> None:
+        from app.agent.nodes import AgentNodes
+
+        run_id = uuid.uuid4()
+        response = LLMResponse(
+            provider="openai",
+            model="gpt-4o",
+            finish_reason=FinishReason.TOOL,
+            tool_calls=[
+                NormalizedToolCall(
+                    id="call-restart",
+                    name="restart_service",
+                    arguments={"node_name": "site-a", "service_name": "nginx"},
+                )
+            ],
+        )
+        state = AgentState(
+            session_id=str(uuid.uuid4()),
+            run_id=str(run_id),
+            current_step_index=1,
+            latest_response=response,
+        )
+        step = types.SimpleNamespace(id=uuid.uuid4())
+        tool_call = types.SimpleNamespace(id=uuid.uuid4())
+        settings = types.SimpleNamespace(
+            SSH_ALLOWED_NODES="site-a",
+            SSH_NODE_HOST_MAP="site-a=10.0.0.11",
+            SSH_HOST="",
+            SSH_RESTART_ALLOWED_SERVICES="nginx",
+        )
+
+        with (
+            patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
+            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
+            patch("app.agent.nodes.ToolCallRepository.get_by_idempotency_key", return_value=None),
+            patch("app.agent.nodes.ToolCallRepository.create_tool_call", return_value=tool_call),
+            patch("app.agent.nodes.ApprovalRepository.create_request") as create_request,
+            patch("app.agent.nodes.execute_builtin_tool", new=AsyncMock()) as run_tool,
+            patch("app.agent.nodes.interrupt", return_value={"messages": []}),
+        ):
+            result = await AgentNodes.suspend_for_human(
+                state,
+                {"configurable": {"db": FakeDb(), "settings": settings}},
+            )
+
+        self.assertEqual(2, result["current_step_index"])
+        create_request.assert_called_once()
+        self.assertNotIn("required_confirmations", create_request.call_args.kwargs)
+        run_tool.assert_not_awaited()
 
     async def test_call_llm_gateway_includes_dynamic_resource_context_from_settings(self) -> None:
         from app.agent.nodes import AgentNodes
@@ -1597,7 +1589,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             custom_events,
         )
 
-    async def test_execute_tools_refuses_dangerous_action_if_router_is_bypassed(self) -> None:
+    async def test_execute_tools_rejects_removed_raw_tool_if_router_is_bypassed(self) -> None:
         from app.agent.nodes import AgentNodes
 
         run_id = uuid.uuid4()
@@ -1633,12 +1625,17 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await AgentNodes.execute_tools(
                 state,
-                {"configurable": {"db": FakeDb()}},
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "settings": types.SimpleNamespace(CLICKHOUSE_HOST="clickhouse.test"),
+                    }
+                },
             )
 
         self.assertNotIn("execution_error", result)
-        self.assertIn("TOOL_REQUIRES_APPROVAL", result["messages"][0].content)
-        self.assertIn("requires human approval", result["messages"][0].content)
+        self.assertIn("TOOL_VALIDATION_ERROR", result["messages"][0].content)
+        self.assertIn("not available", result["messages"][0].content)
         complete_step.assert_called_once()
         self.assertEqual("failed", complete_step.call_args.kwargs["status"])
         run_tool.assert_not_awaited()
@@ -1655,7 +1652,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             tool_calls=[
                 NormalizedToolCall(
                     id="call-invalid",
-                    name="query_clickhouse",
+                    name="get_active_alarms",
                     arguments={},
                 )
             ],
@@ -1679,7 +1676,12 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await AgentNodes.execute_tools(
                 state,
-                {"configurable": {"db": FakeDb()}},
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "settings": types.SimpleNamespace(CLICKHOUSE_HOST="clickhouse.test"),
+                    }
+                },
             )
 
         self.assertNotIn("execution_error", result)
@@ -1703,8 +1705,8 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             tool_calls=[
                 NormalizedToolCall(
                     id="call-invalid-danger",
-                    name="run_ssh_command",
-                    arguments={"command": "systemctl restart x"},
+                    name="get_active_alarms",
+                    arguments={"window_minutes": 30},
                 )
             ],
         )
@@ -1728,7 +1730,12 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await AgentNodes.suspend_for_human(
                 state,
-                {"configurable": {"db": FakeDb()}},
+                {
+                    "configurable": {
+                        "db": FakeDb(),
+                        "settings": types.SimpleNamespace(CLICKHOUSE_HOST="clickhouse.test"),
+                    }
+                },
             )
 
         self.assertIn("Invalid tool arguments", result["execution_error"])
@@ -1736,130 +1743,6 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         create_approval.assert_not_called()
         run_tool.assert_not_awaited()
 
-    async def test_suspension_advances_step_index(self) -> None:
-        from app.agent.nodes import AgentNodes
-
-        run_id = uuid.uuid4()
-        response = LLMResponse(
-            provider="openai",
-            model="gpt-4o",
-            finish_reason=FinishReason.TOOL,
-            tool_calls=[
-                NormalizedToolCall(
-                    id="call-1",
-                    name="run_ssh_command",
-                    arguments={"node_name": "site-a", "command": "systemctl restart x"},
-                )
-            ],
-        )
-        state = AgentState(
-            session_id=str(uuid.uuid4()),
-            run_id=str(run_id),
-            current_step_index=1,
-            latest_response=response,
-        )
-        skill = types.SimpleNamespace(
-            name="run_ssh_command",
-            status="ready",
-            connector_name="ssh",
-            risk_level="dangerous_action",
-        )
-        step = types.SimpleNamespace(id=uuid.uuid4())
-        tool_call = types.SimpleNamespace(id=uuid.uuid4())
-
-        with (
-            patch("app.agent.nodes.SkillRepository.get_skill_by_name", return_value=skill),
-            patch("app.agent.nodes.RunStepRepository.create_step", return_value=step),
-            patch("app.agent.nodes.ToolCallRepository.get_by_idempotency_key", return_value=None),
-            patch("app.agent.nodes.ToolCallRepository.create_tool_call", return_value=tool_call),
-            patch("app.agent.nodes.ApprovalRepository.create_request") as create_request,
-            patch("app.agent.nodes.interrupt", return_value={"messages": []}),
-        ):
-            result = await AgentNodes.suspend_for_human(
-                state,
-                {"configurable": {"db": FakeDb()}},
-            )
-
-        self.assertEqual(2, result["current_step_index"])
-        create_request.assert_called_once()
-
-    async def test_mixed_tool_batch_requests_approval_for_llm_generated_payloads(self) -> None:
-        from app.agent.nodes import AgentNodes
-
-        run_id = uuid.uuid4()
-        session_id = uuid.uuid4()
-        response = LLMResponse(
-            provider="openai",
-            model="gpt-4o",
-            finish_reason=FinishReason.TOOL,
-            tool_calls=[
-                NormalizedToolCall(
-                    id="call-read",
-                    name="query_clickhouse",
-                    arguments={"sql": "SELECT 1"},
-                ),
-                NormalizedToolCall(
-                    id="call-danger",
-                    name="run_ssh_command",
-                    arguments={"node_name": "site-a", "command": "systemctl restart x"},
-                ),
-            ],
-        )
-        state = AgentState(
-            session_id=str(session_id),
-            run_id=str(run_id),
-            current_step_index=1,
-            latest_response=response,
-        )
-        steps = [types.SimpleNamespace(id=uuid.uuid4()), types.SimpleNamespace(id=uuid.uuid4())]
-        tool_calls = [
-            types.SimpleNamespace(id=uuid.uuid4()),
-            types.SimpleNamespace(id=uuid.uuid4()),
-        ]
-
-        with (
-            patch("app.agent.nodes.RunStepRepository.create_step", side_effect=steps),
-            patch("app.agent.nodes.RunStepRepository.start_step"),
-            patch("app.agent.nodes.RunStepRepository.complete_step"),
-            patch("app.agent.nodes.ToolCallRepository.get_by_idempotency_key", return_value=None),
-            patch("app.agent.nodes.ToolCallRepository.create_tool_call", side_effect=tool_calls),
-            patch("app.agent.nodes.ToolCallRepository.start_execution"),
-            patch("app.agent.nodes.ToolCallRepository.save_result"),
-            patch("app.agent.nodes.MessageRepository.save_message"),
-            patch(
-                "app.agent.nodes.execute_builtin_tool", new=AsyncMock(return_value=("rows", False))
-            ) as run_tool,
-            patch("app.agent.nodes.ApprovalRepository.create_request") as create_request,
-            patch(
-                "app.agent.nodes.interrupt",
-                return_value={
-                    "messages": [
-                        LLMMessage(
-                            role=MessageRole.TOOL,
-                            content="approved",
-                            tool_call_id="call-read",
-                        ).model_dump(mode="json"),
-                        LLMMessage(
-                            role=MessageRole.TOOL,
-                            content="approved",
-                            tool_call_id="call-danger",
-                        ).model_dump(mode="json"),
-                    ]
-                },
-            ),
-        ):
-            result = await AgentNodes.suspend_for_human(
-                state,
-                {"configurable": {"db": FakeDb()}},
-            )
-
-        self.assertEqual(3, result["current_step_index"])
-        self.assertEqual(2, create_request.call_count)
-        run_tool.assert_not_awaited()
-        self.assertEqual(["call-read", "call-danger"], [m.tool_call_id for m in result["messages"]])
-
-
-class InterventionRepositoryRegressionTests(unittest.TestCase):
     def test_mark_undelivered_preserves_message_and_records_failure(self) -> None:
         from app.database.repositories.messages import MessageRepository
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+
 from app.agent.safety import AgentSafetyGuard
+from app.llm.langchain_messages import to_langchain_messages
+from app.llm.langchain_model import to_langchain_tools
 from app.llm.schemas import LLMMessage, LLMToolDefinition, MessageRole
 
 
@@ -17,47 +20,37 @@ class ContextWindowPlan:
     was_compacted: bool
 
 
-def estimate_text_tokens(value: str | None) -> int:
-    if not value:
-        return 0
-    return max(1, math.ceil(len(value) / 4))
-
-
-def estimate_tool_tokens(tools: Sequence[LLMToolDefinition] | None) -> int:
-    if not tools:
-        return 0
-    total = 0
-    for tool in tools:
-        total += estimate_text_tokens(tool.name)
-        total += estimate_text_tokens(tool.description)
-        total += estimate_text_tokens(str(tool.input_schema))
-        total += 12
-    return total
-
-
-def estimate_message_tokens(message: LLMMessage) -> int:
-    total = 8 + estimate_text_tokens(message.content)
-    total += estimate_text_tokens(message.name)
-    total += estimate_text_tokens(message.tool_call_id)
-    for tool_call in message.tool_calls:
-        total += estimate_text_tokens(tool_call.id)
-        total += estimate_text_tokens(tool_call.name)
-        total += estimate_text_tokens(str(tool_call.arguments))
-        total += 16
-    return total
-
-
 def estimate_context_tokens(
     messages: Sequence[LLMMessage],
     *,
     system_prompt: str | None = None,
     tools: Sequence[LLMToolDefinition] | None = None,
 ) -> int:
-    return (
-        estimate_text_tokens(system_prompt)
-        + estimate_tool_tokens(tools)
-        + sum(estimate_message_tokens(message) for message in messages)
+    return count_tokens_approximately(
+        to_langchain_messages(messages, system_prompt),
+        tools=to_langchain_tools(tools, supports_strict=False),
     )
+
+
+def _trim_recent_messages(
+    messages: Sequence[LLMMessage],
+    *,
+    max_tokens: int,
+) -> list[LLMMessage]:
+    trimmed = trim_messages(
+        to_langchain_messages(messages),
+        max_tokens=max_tokens,
+        token_counter="approximate",
+        strategy="last",
+        allow_partial=False,
+        start_on="human",
+    )
+    if trimmed:
+        return list(messages[-len(trimmed) :])
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role is MessageRole.USER:
+            return list(messages[index:])
+    return []
 
 
 def compact_messages_if_needed(
@@ -71,7 +64,11 @@ def compact_messages_if_needed(
     summary_max_characters: int = 6000,
 ) -> ContextWindowPlan:
     threshold_tokens = max(1, int(context_window_tokens * trigger_ratio))
-    original_tokens = estimate_context_tokens(messages, system_prompt=system_prompt, tools=tools)
+    original_tokens = estimate_context_tokens(
+        messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
     if original_tokens <= threshold_tokens or len(messages) < 3:
         return ContextWindowPlan(
             messages=list(messages),
@@ -82,25 +79,25 @@ def compact_messages_if_needed(
         )
 
     target_tokens = max(1, int(context_window_tokens * target_ratio))
-    fixed_tokens = estimate_text_tokens(system_prompt) + estimate_tool_tokens(tools)
-    retained: list[LLMMessage] = []
-    retained_tokens = fixed_tokens
-
-    for message in reversed(messages):
-        message_tokens = estimate_message_tokens(message)
-        if retained and retained_tokens + message_tokens > target_tokens:
-            break
-        retained.insert(0, message)
-        retained_tokens += message_tokens
-
+    fixed_tokens = estimate_context_tokens(
+        [],
+        system_prompt=system_prompt,
+        tools=tools,
+    )
+    retained = _trim_recent_messages(
+        messages,
+        max_tokens=max(1, target_tokens - fixed_tokens),
+    )
     if not retained:
-        retained = [messages[-1]]
+        return ContextWindowPlan(
+            messages=list(messages),
+            original_tokens=original_tokens,
+            compacted_tokens=original_tokens,
+            threshold_tokens=threshold_tokens,
+            was_compacted=False,
+        )
 
     cutoff = len(messages) - len(retained)
-    while cutoff > 0 and retained and retained[0].role is MessageRole.TOOL:
-        cutoff -= 1
-        retained.insert(0, messages[cutoff])
-
     old_messages = list(messages[:cutoff])
     if not old_messages:
         return ContextWindowPlan(
@@ -111,9 +108,14 @@ def compact_messages_if_needed(
             was_compacted=False,
         )
 
-    summary = _summarize_messages(old_messages, max_characters=summary_max_characters)
     compacted_messages = [
-        LLMMessage(role=MessageRole.SYSTEM, content=summary),
+        LLMMessage(
+            role=MessageRole.SYSTEM,
+            content=_summarize_messages(
+                old_messages,
+                max_characters=summary_max_characters,
+            ),
+        ),
         *retained,
     ]
     compacted_tokens = estimate_context_tokens(
