@@ -1,4 +1,3 @@
-# backend/app/observability/redaction.py
 from __future__ import annotations
 
 import re

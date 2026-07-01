@@ -12,35 +12,49 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
 
         self.assertEqual("telecom-agent-backend", langfuse_module.os.environ["OTEL_SERVICE_NAME"])
 
-    def test_tracker_reads_credentials_from_settings_and_uses_v4_generation_api(self) -> None:
+    def test_tracker_reads_credentials_and_traces_turn_span(self) -> None:
         from app.observability import langfuse as langfuse_module
 
-        calls: dict[str, object] = {}
+        calls: dict[str, object] = {
+            "observations": [],
+            "updates": [],
+            "otel_attributes": {},
+            "ended": 0,
+            "flushed": 0,
+        }
+
+        class FakeOtelSpan:
+            def is_recording(self):
+                return True
+
+            def set_attribute(self, key, value):
+                calls["otel_attributes"][key] = value
+
+        class FakeObservation:
+            def __init__(self, name, as_type, trace_id="fake-trace-id", span_id="fake-span-id"):
+                self.name = name
+                self.as_type = as_type
+                self.trace_id = trace_id
+                self.id = span_id
+                self._otel_span = FakeOtelSpan()
+
+            def update(self, **kwargs):
+                calls["updates"].append(kwargs)
+
+            def end(self, **kwargs):
+                calls["ended"] += 1
 
         class FakeLangfuse:
             def __init__(self, **kwargs):
                 calls["init"] = kwargs
 
-            def update_current_generation(self, **kwargs):
-                calls["generation"] = kwargs
+            def start_observation(self, *, name, as_type="span", **kwargs):
+                calls["observations"].append({"name": name, "as_type": as_type, **kwargs})
+                trace_id = (kwargs.get("trace_context") or {}).get("trace_id") or "fake-trace-id"
+                return FakeObservation(name, as_type, trace_id=trace_id, span_id="fake-span-id")
 
             def flush(self):
-                calls["flushed"] = True
-
-            def get_trace_url(self, *, trace_id=None):
-                return f"https://langfuse.test/project/project-id/traces/{trace_id}"
-
-        def fake_observe(**decorator_kwargs):
-            calls["observe"] = decorator_kwargs
-
-            def decorate(func):
-                def wrapped(*args, **kwargs):
-                    calls["observe_call"] = kwargs
-                    return func(*args, **kwargs)
-
-                return wrapped
-
-            return decorate
+                calls["flushed"] += 1
 
         fake_settings = types.SimpleNamespace(
             LANGFUSE_PUBLIC_KEY="pk-test",
@@ -48,24 +62,20 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
             LANGFUSE_HOST="https://langfuse.test",
         )
 
-        with (
-            patch.object(langfuse_module, "Langfuse", FakeLangfuse),
-            patch.object(langfuse_module, "observe", fake_observe),
-        ):
+        with patch.object(langfuse_module, "Langfuse", FakeLangfuse):
             tracker = langfuse_module.LangfuseTelemetryTracker(configuration=fake_settings)
             tracker.initialize()
             run_id = str(uuid.uuid4())
-            expected_trace_id = uuid.UUID(run_id).hex
-            tracker.trace_llm_generation(
+            tracker.trace_run_start(
                 session_id="session-1",
                 run_id=run_id,
-                model_name="gpt-4o",
-                prompt_messages=[{"role": "user", "content": "password=secret"}],
-                completion_content="token: abc",
-                prompt_tokens=10,
-                completion_tokens=5,
+                input_content="password=secret",
             )
-            trace_url = tracker.get_trace_url(run_id)
+            tracker.trace_run_end(
+                run_id=run_id,
+                output_content="final answer",
+                status="completed",
+            )
 
         self.assertEqual(
             {
@@ -75,28 +85,23 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
             },
             calls["init"],
         )
+        self.assertEqual(1, len(calls["observations"]))
+        turn = calls["observations"][0]
+        self.assertEqual("agent_turn #1", turn["name"])
+        self.assertEqual("span", turn["as_type"])
+        self.assertEqual(run_id.replace("-", "").lower(), turn["trace_context"]["trace_id"])
+        self.assertNotIn("secret", str(turn["input"]))
         self.assertEqual(
-            {
-                "name": "llm_gateway_call",
-                "as_type": "generation",
-                "capture_input": False,
-                "capture_output": False,
-            },
-            calls["observe"],
+            {"output": "final answer", "metadata": {"status": "completed"}},
+            calls["updates"][0],
         )
-        generation = calls["generation"]
-        self.assertEqual("telecom_agent_run", generation["name"])
-        self.assertEqual("gpt-4o", generation["model"])
-        self.assertEqual({"input": 10, "output": 5}, generation["usage_details"])
-        self.assertEqual(expected_trace_id, calls["observe_call"]["langfuse_trace_id"])
-        self.assertNotIn("secret", str(generation["input"]))
-        self.assertNotIn("abc", generation["output"])
-        self.assertTrue(calls["flushed"])
-        self.assertEqual(
-            f"https://langfuse.test/project/project-id/traces/{expected_trace_id}", trace_url
-        )
+        self.assertEqual(1, calls["ended"])
+        self.assertEqual(1, calls["flushed"])
+        self.assertEqual("session-1", calls["otel_attributes"].get("session.id"))
+        self.assertEqual("agent_turn #1", calls["otel_attributes"].get("langfuse.trace.name"))
+        self.assertEqual("final answer", calls["otel_attributes"].get("langfuse.trace.output"))
 
-    def test_prompt_management_links_version_and_compiles(self) -> None:
+    def test_prompt_management_uses_configured_label(self) -> None:
         from app.observability import langfuse as langfuse_module
 
         calls: dict[str, object] = {}
@@ -104,9 +109,6 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
         class FakePrompt:
             is_fallback = False
             version = 7
-
-            def compile(self, **vars):
-                return "compiled:" + vars.get("resource_context", "")
 
         class FakeLangfuse:
             def __init__(self, **kwargs):
@@ -116,21 +118,6 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
                 calls["get_prompt"] = {"name": name, **kwargs}
                 return FakePrompt()
 
-            def update_current_generation(self, **kwargs):
-                calls["generation"] = kwargs
-
-            def flush(self):
-                pass
-
-        def fake_observe(**_decorator_kwargs):
-            def decorate(func):
-                def wrapped(*args, **kwargs):
-                    return func(*args, **kwargs)
-
-                return wrapped
-
-            return decorate
-
         fake_settings = types.SimpleNamespace(
             LANGFUSE_PUBLIC_KEY="pk-test",
             LANGFUSE_SECRET_KEY="sk-test",
@@ -139,30 +126,14 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
             LANGFUSE_PROMPT_CACHE_TTL_SECONDS=123,
         )
 
-        with (
-            patch.object(langfuse_module, "Langfuse", FakeLangfuse),
-            patch.object(langfuse_module, "observe", fake_observe),
-        ):
+        with patch.object(langfuse_module, "Langfuse", FakeLangfuse):
             tracker = langfuse_module.LangfuseTelemetryTracker(configuration=fake_settings)
             tracker.initialize()
-
             self.assertEqual("7", tracker.get_active_prompt_version("0.0.0"))
-
-            tracker.trace_llm_generation(
-                session_id="s",
-                run_id=str(uuid.uuid4()),
-                model_name="gpt-4o",
-                prompt_messages=[{"role": "user", "content": "hi"}],
-                completion_content="ok",
-                prompt_tokens=1,
-                completion_tokens=1,
-                prompt_name=langfuse_module.PROMPT_NAME,
-            )
 
         self.assertEqual(langfuse_module.PROMPT_NAME, calls["get_prompt"]["name"])
         self.assertEqual("production", calls["get_prompt"]["label"])
         self.assertEqual(123, calls["get_prompt"]["cache_ttl_seconds"])
-        self.assertIsInstance(calls["generation"]["prompt"], FakePrompt)
 
     def test_prompt_helpers_noop_without_client(self) -> None:
         from app.observability import langfuse as langfuse_module
@@ -178,42 +149,88 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
         self.assertIsNone(tracker.get_system_prompt("fallback"))
         self.assertEqual("0.1.0", tracker.get_active_prompt_version("0.1.0"))
 
+    def test_langchain_callback_handler_targets_active_turn_span(self) -> None:
+        from app.observability import langfuse as langfuse_module
+
+        calls: dict[str, object] = {}
+
+        class FakeCallbackHandler:
+            def __init__(self, **kwargs):
+                calls["handler_kwargs"] = kwargs
+
+        fake_settings = types.SimpleNamespace(
+            LANGFUSE_PUBLIC_KEY="pk-test",
+            LANGFUSE_SECRET_KEY="sk-test",
+            LANGFUSE_HOST="https://langfuse.test",
+        )
+        tracker = langfuse_module.LangfuseTelemetryTracker(configuration=fake_settings)
+        tracker._client = object()
+        run_id = str(uuid.uuid4())
+        tracker._active_runs[uuid.UUID(run_id).hex] = types.SimpleNamespace(
+            trace_id="session-trace-id",
+            id="turn-span-id",
+        )
+
+        with patch("langfuse.langchain.CallbackHandler", FakeCallbackHandler):
+            handler = tracker.get_langchain_callback_handler(run_id)
+
+        self.assertIsInstance(handler, FakeCallbackHandler)
+        self.assertEqual(
+            {
+                "public_key": "pk-test",
+                "trace_context": {
+                    "trace_id": "session-trace-id",
+                    "parent_span_id": "turn-span-id",
+                },
+            },
+            calls["handler_kwargs"],
+        )
+
+    def test_langchain_callback_handler_noops_without_active_turn_span(self) -> None:
+        from app.observability import langfuse as langfuse_module
+
+        fake_settings = types.SimpleNamespace(
+            LANGFUSE_PUBLIC_KEY="pk-test",
+            LANGFUSE_SECRET_KEY="sk-test",
+            LANGFUSE_HOST="https://langfuse.test",
+        )
+        tracker = langfuse_module.LangfuseTelemetryTracker(configuration=fake_settings)
+        tracker._client = object()
+
+        self.assertIsNone(tracker.get_langchain_callback_handler(str(uuid.uuid4())))
+
     def test_nested_tree_tracing(self) -> None:
         from app.observability import langfuse as langfuse_module
 
         calls = {
             "trace": [],
             "span": [],
-            "generation": [],
             "trace_io": {},
             "flushed": 0,
         }
 
         class FakeObservation:
-            """Span/observation giả: con được tạo qua chính nó (root.start_observation)."""
-
             def __init__(self, name, as_type, kwargs):
                 self.name = name
                 self.as_type = as_type
                 self.metadata = dict(kwargs.get("metadata") or {})
+                self.trace_id = (kwargs.get("trace_context") or {}).get(
+                    "trace_id"
+                ) or "sessionnested"
+                self.id = "fake-span-id"
 
             def start_observation(self, *, name, as_type="span", **kwargs):
-                rec = {
-                    "name": name,
-                    "as_type": as_type,
-                    "input": kwargs.get("input"),
-                    "output": kwargs.get("output"),
-                    "model": kwargs.get("model"),
-                    "usage": kwargs.get("usage_details"),
-                }
-                if as_type == "generation":
-                    calls["generation"].append(rec)
-                else:
-                    calls["span"].append(rec)
+                calls["span"].append(
+                    {
+                        "name": name,
+                        "as_type": as_type,
+                        "input": kwargs.get("input"),
+                        "output": kwargs.get("output"),
+                    }
+                )
                 return FakeObservation(name, as_type, kwargs)
 
             def update(self, **kwargs):
-                # Output cấp trace giờ suy ra từ output của span gốc (qua update).
                 if kwargs.get("output") is not None:
                     calls["trace_io"]["output"] = kwargs["output"]
                 if kwargs.get("metadata"):
@@ -227,12 +244,13 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
                 pass
 
             def start_observation(self, *, name, as_type="span", **kwargs):
-                # Chỉ span GỐC được tạo qua client; con đi qua root.start_observation.
                 calls["trace"].append(
                     {
                         "name": name,
                         "input": kwargs.get("input"),
                         "session_id": (kwargs.get("metadata") or {}).get("session_id"),
+                        "run_id": (kwargs.get("metadata") or {}).get("run_id"),
+                        "trace_id": (kwargs.get("trace_context") or {}).get("trace_id"),
                     }
                 )
                 return FakeObservation(name, as_type, kwargs)
@@ -256,15 +274,6 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
                 run_id=run_id,
                 input_content="password=secret_password and more",
             )
-            tracker.trace_generation(
-                run_id=run_id,
-                generation_name="AI Step 0",
-                model_name="gpt-4o",
-                input_data="user content with password=secret_password",
-                output_data="calling tool: test",
-                input_tokens=5,
-                output_tokens=3,
-            )
             tracker.trace_span(
                 run_id=run_id,
                 span_name="tool: test",
@@ -278,21 +287,16 @@ class LangfuseTelemetryContractTests(unittest.TestCase):
                 status="completed",
             )
 
-        # Đúng 1 span gốc cho cả run (không nhân đôi).
         self.assertEqual(1, len(calls["trace"]))
-        self.assertEqual("telecom_agent_run", calls["trace"][0]["name"])
+        self.assertEqual("agent_turn #1", calls["trace"][0]["name"])
         self.assertEqual("session-nested", calls["trace"][0]["session_id"])
-        # Redaction DLP trên trace input (span gốc) + generation input + tool output.
+        self.assertEqual(run_id.replace("-", ""), calls["trace"][0]["run_id"])
+        self.assertEqual(run_id.replace("-", ""), calls["trace"][0]["trace_id"])
         self.assertNotIn("secret_password", str(calls["trace"][0]["input"]))
-        self.assertEqual(1, len(calls["generation"]))
-        self.assertEqual("AI Step 0", calls["generation"][0]["name"])
-        self.assertNotIn("secret_password", str(calls["generation"][0]["input"]))
-        self.assertEqual({"input": 5, "output": 3}, calls["generation"][0]["usage"])
         self.assertEqual(1, len(calls["span"]))
         self.assertEqual("tool: test", calls["span"][0]["name"])
         self.assertEqual("tool", calls["span"][0]["as_type"])
         self.assertNotIn("secret_password", str(calls["span"][0]["output"]))
-        # Output cấp trace + flush ĐÚNG 1 lần (hết lag flush từng bước).
         self.assertEqual("final answer", calls["trace_io"].get("output"))
         self.assertEqual(1, calls["flushed"])
 

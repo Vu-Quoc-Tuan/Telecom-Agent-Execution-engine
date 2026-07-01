@@ -41,9 +41,9 @@ class TelecomTaskTracer(AbstractContextManager):
         latency_ms = int((time.perf_counter() - self.start_time) * 1000)
 
         if exc_type:
-            # Ghi nhận log cấu trúc JSON nếu tác vụ can thiệp trạm bị oẹo giữa chừng
+            # Ghi nhận log cấu trúc JSON nếu tác vụ bị lỗi
             app_logger.error(
-                f"[TRACE FAILED] Tác vụ '{self.task_name}' bị crash sau {latency_ms}ms. Lỗi: {str(exc_val)}",
+                f"[TRACE FAILED] Tác vụ '{self.task_name}' bị lỗi sau {latency_ms}ms. Lỗi: {str(exc_val)}",
                 extra={
                     "session_id": self.session_id,
                     "run_id": self.run_id,
@@ -51,7 +51,6 @@ class TelecomTaskTracer(AbstractContextManager):
                     "error_type": exc_type.__name__,
                 },
             )
-            # Không nuốt ngoại lệ, để nổi lên trên cho tầng service bọc giáp xử lý
             return False
 
         app_logger.info(

@@ -1,4 +1,3 @@
-# backend/app/observability/logging.py
 from __future__ import annotations
 
 import json
@@ -20,11 +19,9 @@ class JSONStructuredFormatter(logging.Formatter):
             "function": record.funcName,
             "line": record.lineno,
         }
-        # Nếu log có đính kèm metadata (trường extra)
         if hasattr(record, "extra") and isinstance(record.extra, dict):
             log_entry["metadata"] = record.extra
 
-        # 🛡️ BỌC GIÁP: Ép qua bộ lọc khử độc dữ liệu nhạy cảm trước khi xuất xưởng
         log_entry = DataRedactor.redact_dict(log_entry)
         return json.dumps(log_entry, ensure_ascii=False)
 

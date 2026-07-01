@@ -10,7 +10,18 @@ Cách chạy (cần LANGFUSE_PUBLIC_KEY/SECRET_KEY/HOST trong môi trường):
 
 from app.agent.prompts import TELECOM_AGENT_PROMPT_VERSION, TELECOM_AGENT_SYSTEM_PROMPT
 from app.config import settings
-from app.observability.langfuse import PROMPT_NAME
+from app.observability.langfuse import PROMPT_NAME, SKILL_DOMAIN_JUDGE_PROMPT_NAME
+
+SKILL_DOMAIN_JUDGE_MANAGED_PROMPT = """Bạn là chuyên gia kiểm toán quy trình và kiến trúc mạng viễn thông cấp cao.
+Hãy đánh giá Skill sau có thực sự phục vụ vận hành hoặc xử lý sự cố mạng viễn thông không.
+
+- Tên hàm: {{name}}
+- Mô tả: {{description}}
+- Mã nguồn Python:
+{{code_text}}
+
+Chấm điểm từ 0.0 (không liên quan) đến 1.0 (hoàn toàn phục vụ viễn thông).
+"""
 
 
 def seed_prompt() -> None:
@@ -31,16 +42,28 @@ def seed_prompt() -> None:
     )
 
     label = settings.LANGFUSE_PROMPT_LABEL
-    print(f"Seeding prompt '{PROMPT_NAME}' (label={label}) lên {settings.LANGFUSE_HOST} ...")
-    client.create_prompt(
-        name=PROMPT_NAME,
-        type="text",
-        prompt=TELECOM_AGENT_SYSTEM_PROMPT.strip(),
-        labels=[label],
-        config={"fallback_version": TELECOM_AGENT_PROMPT_VERSION},
+    prompts = (
+        (
+            PROMPT_NAME,
+            TELECOM_AGENT_SYSTEM_PROMPT.strip(),
+            {"fallback_version": TELECOM_AGENT_PROMPT_VERSION},
+        ),
+        (SKILL_DOMAIN_JUDGE_PROMPT_NAME, SKILL_DOMAIN_JUDGE_MANAGED_PROMPT.strip(), None),
     )
+    for prompt_name, prompt_text, config in prompts:
+        print(f"Seeding prompt '{prompt_name}' (label={label}) lên {settings.LANGFUSE_HOST} ...")
+        create_args = {
+            "name": prompt_name,
+            "type": "text",
+            "prompt": prompt_text,
+            "labels": [label],
+        }
+        if config is not None:
+            create_args["config"] = config
+        client.create_prompt(**create_args)
+
     client.flush()
-    print("Done. Kiểm tra prompt trên Langfuse dashboard.")
+    print("Done. Langfuse tự gán label 'latest' cho version mới nhất.")
 
 
 if __name__ == "__main__":
