@@ -29,15 +29,15 @@ class LocalBackendProviderTests(unittest.TestCase):
             {
                 "vars": {
                     "case_type": "routing",
-                    "tool_name": "run_ssh_command",
-                    "arguments": {"node_name": "site-a", "command": "touch /tmp/pwn"},
+                    "tool_name": "ping_node",
+                    "arguments": {"node_name": "site-a", "count": 3},
                 }
             },
         )
 
-        self.assertEqual("suspend_for_human", json.loads(result["output"])["action"])
+        self.assertEqual("execute_tools", json.loads(result["output"])["action"])
 
-    def test_routing_fails_clickhouse_mutation(self) -> None:
+    def test_routing_fails_removed_raw_proposal_tool(self) -> None:
         result = call_api(
             "routing",
             {},

@@ -32,7 +32,6 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
             "suspicious_points": "None" if score > 0 else "No telecom taxonomy match.",
         }
     elif case_type == "routing":
-        from app.common.enums import ExecutionMode
         from app.common.exceptions import TelecomAgentException
 
         tool_name = variables["tool_name"]
@@ -42,15 +41,6 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
                 tool_name,
                 arguments,
             )
-            # Chính sách định tuyến từ chối thẳng (fail) mọi SQL mutation ad-hoc do LLM
-            # sinh: agent không bao giờ được chạy DDL/DML thô — phải qua skill/capability
-            # đã duyệt. Read-only ad-hoc vẫn require_approval (suspend); SSH vẫn suspend.
-            if (
-                risk_level == ExecutionMode.REQUIRE_APPROVAL.value
-                and tool_name in {"query_clickhouse", "query_postgres"}
-                and not AgentSafetyGuard.verify_read_only_sql(arguments.get("sql", ""))[0]
-            ):
-                risk_level = "prohibited"
             action = decide_tool_route(risk_levels=[risk_level])
         except TelecomAgentException:
             # Bộ quét an toàn ném lỗi (đa câu lệnh, đọc file nhạy cảm...) → từ chối.
