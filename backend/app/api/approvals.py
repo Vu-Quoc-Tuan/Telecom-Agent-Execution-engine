@@ -23,9 +23,8 @@ class ResolveApprovalBody(BaseModel):
 
 @router.get("/pending")
 def list_pending_approvals(db: Session = Depends(get_db)):
-    """Admin Dashboard bốc danh sách các lệnh nguy hiểm đang xếp hàng chờ phê duyệt."""
-    pending = ApprovalService.list_all_pending_requests(db)
-    return [ApprovalService.get_approval_detail_for_ui(db, req.id) for req in pending]
+    """Hiển thị danh sách các lệnh nguy hiểm đang chờ phê duyệt."""
+    return ApprovalService.list_pending_approval_details_for_ui(db)
 
 
 @router.get("/{approval_id}")

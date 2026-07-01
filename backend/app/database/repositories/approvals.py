@@ -7,6 +7,8 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.database.models.approval_requests import ApprovalRequest
+from app.database.models.run_steps import RunStep
+from app.database.models.tool_calls import ToolCall
 
 
 class ApprovalRepository:
@@ -16,17 +18,12 @@ class ApprovalRepository:
         run_id: uuid.UUID,
         tool_call_id: uuid.UUID,
         expires_in_seconds: int = 1800,
-        required_confirmations: int = 1,
     ) -> ApprovalRequest:
-        if required_confirmations not in {1, 2}:
-            raise ValueError("required_confirmations must be 1 or 2")
         approval = ApprovalRequest(
             id=uuid.uuid4(),
             run_id=run_id,
             tool_call_id=tool_call_id,
             status="pending",
-            required_confirmations=required_confirmations,
-            confirmation_count=0,
             expires_at=datetime.now(UTC) + timedelta(seconds=expires_in_seconds),
         )
         db.add(approval)
@@ -44,16 +41,6 @@ class ApprovalRepository:
     @staticmethod
     def get_pending_requests(db: Session) -> list[ApprovalRequest]:
         now = datetime.now(UTC)
-        db.execute(
-            update(ApprovalRequest)
-            .where(
-                ApprovalRequest.status == "pending",
-                ApprovalRequest.expires_at.is_not(None),
-                ApprovalRequest.expires_at <= now,
-            )
-            .values(status="expired", updated_at=now)
-        )
-        db.commit()
         statement = (
             select(ApprovalRequest)
             .where(
@@ -63,6 +50,47 @@ class ApprovalRepository:
             .order_by(ApprovalRequest.requested_at.asc())
         )
         return list(db.scalars(statement).all())
+
+    @staticmethod
+    def get_pending_request_details(
+        db: Session,
+    ) -> list[tuple[ApprovalRequest, ToolCall, RunStep | None]]:
+        now = datetime.now(UTC)
+        statement = (
+            select(ApprovalRequest, ToolCall, RunStep)
+            .join(ToolCall, ToolCall.id == ApprovalRequest.tool_call_id)
+            .outerjoin(RunStep, RunStep.id == ToolCall.run_step_id)
+            .where(
+                ApprovalRequest.status == "pending",
+                or_(ApprovalRequest.expires_at.is_(None), ApprovalRequest.expires_at > now),
+            )
+            .order_by(ApprovalRequest.requested_at.asc())
+        )
+        return [(request, tool_call, step) for request, tool_call, step in db.execute(statement).all()]
+
+    @staticmethod
+    def expire_pending_requests(
+        db: Session,
+        now: datetime | None = None,
+        commit: bool = True,
+        run_id: uuid.UUID | None = None,
+    ) -> int:
+        reference_time = now or datetime.now(UTC)
+        filters = [
+            ApprovalRequest.status == "pending",
+            ApprovalRequest.expires_at.is_not(None),
+            ApprovalRequest.expires_at <= reference_time,
+        ]
+        if run_id is not None:
+            filters.append(ApprovalRequest.run_id == run_id)
+        result = db.execute(
+            update(ApprovalRequest)
+            .where(*filters)
+            .values(status="expired", updated_at=reference_time)
+        )
+        if commit:
+            db.commit()
+        return result.rowcount or 0
 
     @staticmethod
     def get_requests_by_run(
@@ -91,15 +119,6 @@ class ApprovalRepository:
             db.commit()
             return None
 
-        next_count = approval.confirmation_count
-        persisted_status = status
-        resolved_at = now
-        if status == "approved":
-            next_count += 1
-            if next_count < approval.required_confirmations:
-                persisted_status = "pending"
-                resolved_at = None
-
         statement = (
             update(ApprovalRequest)
             .where(
@@ -108,9 +127,8 @@ class ApprovalRepository:
                 or_(ApprovalRequest.expires_at.is_(None), ApprovalRequest.expires_at > now),
             )
             .values(
-                status=persisted_status,
-                confirmation_count=next_count,
-                resolved_at=resolved_at,
+                status=status,
+                resolved_at=now,
                 updated_at=now,
             )
             .returning(ApprovalRequest)

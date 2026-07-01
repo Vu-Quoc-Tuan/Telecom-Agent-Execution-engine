@@ -6,7 +6,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
-    Integer,
     String,
     func,
     text,
@@ -69,20 +68,6 @@ class ApprovalRequest(Base):
         nullable=True,
     )
 
-    required_confirmations = Column(
-        Integer,
-        nullable=False,
-        default=1,
-        server_default=text("1"),
-    )
-
-    confirmation_count = Column(
-        Integer,
-        nullable=False,
-        default=0,
-        server_default=text("0"),
-    )
-
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -113,14 +98,6 @@ class ApprovalRequest(Base):
             )
             """,
             name="ck_approval_requests_status",
-        ),
-        CheckConstraint(
-            "required_confirmations IN (1, 2)",
-            name="ck_approval_requests_required_confirmations",
-        ),
-        CheckConstraint(
-            "confirmation_count >= 0 AND confirmation_count <= required_confirmations",
-            name="ck_approval_requests_confirmation_count",
         ),
         Index(
             "idx_approval_requests_run_id",

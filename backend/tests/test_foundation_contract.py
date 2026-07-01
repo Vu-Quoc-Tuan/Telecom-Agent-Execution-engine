@@ -36,15 +36,19 @@ class SettingsContractTests(unittest.TestCase):
 
         gateway = build_llm_gateway(settings)
 
-        self.assertEqual("openai", gateway.get_adapter().provider)
+        from app.llm.langchain_adapter import LangChainChatAdapter
+
+        adapter = gateway.get_adapter()
+        self.assertEqual("openai", adapter.provider)
+        self.assertIsInstance(adapter, LangChainChatAdapter)
 
 
 class ModelContractTests(unittest.TestCase):
-    def test_approval_request_tracks_multi_confirmation_progress(self) -> None:
+    def test_approval_request_is_single_confirmation(self) -> None:
         columns = {column.key for column in inspect(ApprovalRequest).columns}
 
-        self.assertIn("required_confirmations", columns)
-        self.assertIn("confirmation_count", columns)
+        self.assertNotIn("required_confirmations", columns)
+        self.assertNotIn("confirmation_count", columns)
 
     def test_skill_persists_connector_and_risk_metadata(self) -> None:
         columns = {column.key for column in inspect(Skill).columns}
@@ -178,7 +182,7 @@ class RepositoryImportTests(unittest.TestCase):
             id=uuid4(),
             status="running",
             summary=None,
-            metadata_json={"tool_name": "query_clickhouse", "started_by": "agent"},
+            metadata_json={"tool_name": "get_active_alarms", "started_by": "agent"},
             completed_at=None,
         )
 
@@ -203,7 +207,7 @@ class RepositoryImportTests(unittest.TestCase):
         self.assertIs(completed, step)
         self.assertEqual(
             {
-                "tool_name": "query_clickhouse",
+                "tool_name": "get_active_alarms",
                 "started_by": "runtime",
                 "usage": {"tokens": 10},
             },

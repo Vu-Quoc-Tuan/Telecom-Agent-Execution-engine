@@ -187,6 +187,7 @@ class AgentExecutionService:
                     )
                     return
 
+                ApprovalRepository.expire_pending_requests(db, run_id=run_record.id)
                 pending_approvals = [
                     approval
                     for approval in ApprovalRepository.get_pending_requests(db)
@@ -346,17 +347,6 @@ class AgentExecutionService:
             yield "error", {"message": "Approval expired or was resolved concurrently."}
             return
 
-        if (
-            action == "approved"
-            and approval.status == "pending"
-            and hasattr(approval, "required_confirmations")
-        ):
-            yield (
-                "run_suspended",
-                cls._build_run_suspended_event(run_record.id, approval, tool_call),
-            )
-            return
-
         session_id = run_record.session_id
         if action == "rejected":
             output = json.dumps(
@@ -400,7 +390,7 @@ class AgentExecutionService:
                     arguments=tool_call.arguments_json,
                     db=db,
                     settings=app_settings,
-                    approval_confirmations=getattr(approval, "confirmation_count", 1),
+                    approval_confirmations=1,
                 )
                 status = "completed"
                 error_message = None
@@ -463,6 +453,7 @@ class AgentExecutionService:
         )
         agent_app = cls.get_agent_app()
 
+        ApprovalRepository.expire_pending_requests(db, run_id=run_record.id)
         remaining_pending = [
             request
             for request in ApprovalRepository.get_pending_requests(db)
@@ -588,6 +579,7 @@ class AgentExecutionService:
                     )
                     return
 
+                ApprovalRepository.expire_pending_requests(db, run_id=run_record.id)
                 pending_approvals = [
                     approval
                     for approval in ApprovalRepository.get_pending_requests(db)
@@ -814,6 +806,4 @@ class AgentExecutionService:
             "tool_name": tool_call.skill_name if tool_call else None,
             "tool_input": tool_call.arguments_json if tool_call else None,
             "risk_level": tool_call.risk_level if tool_call else None,
-            "required_confirmations": getattr(approval, "required_confirmations", 1),
-            "confirmation_count": getattr(approval, "confirmation_count", 0),
         }

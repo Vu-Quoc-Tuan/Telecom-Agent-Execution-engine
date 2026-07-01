@@ -13,14 +13,7 @@ from app.database.repositories.tool_calls import ToolCallRepository
 
 class ApprovalService:
     @staticmethod
-    def get_approval_detail_for_ui(db: Session, approval_id: uuid.UUID) -> dict[str, Any] | None:
-        req = ApprovalRepository.get_request(db, approval_id)
-        if not req:
-            return None
-
-        tool_call = ToolCallRepository.get_tool_call(db, req.tool_call_id)
-        step = RunStepRepository.get_step(db, tool_call.run_step_id) if tool_call else None
-
+    def _format_approval_detail(req, tool_call, step) -> dict[str, Any]:
         timeline_step = None
         if step:
             timeline_step = {
@@ -45,11 +38,27 @@ class ApprovalService:
             "requested_at": req.requested_at.isoformat(),
             "expires_at": req.expires_at.isoformat() if req.expires_at else None,
             "resolved_at": req.resolved_at.isoformat() if req.resolved_at else None,
-            "required_confirmations": req.required_confirmations,
-            "confirmation_count": req.confirmation_count,
             "timeline_step": timeline_step,
             "skill_details": skill_details,
         }
+
+    @staticmethod
+    def get_approval_detail_for_ui(db: Session, approval_id: uuid.UUID) -> dict[str, Any] | None:
+        req = ApprovalRepository.get_request(db, approval_id)
+        if not req:
+            return None
+
+        tool_call = ToolCallRepository.get_tool_call(db, req.tool_call_id)
+        step = RunStepRepository.get_step(db, tool_call.run_step_id) if tool_call else None
+
+        return ApprovalService._format_approval_detail(req, tool_call, step)
+
+    @staticmethod
+    def list_pending_approval_details_for_ui(db: Session) -> list[dict[str, Any]]:
+        return [
+            ApprovalService._format_approval_detail(req, tool_call, step)
+            for req, tool_call, step in ApprovalRepository.get_pending_request_details(db)
+        ]
 
     @staticmethod
     def list_all_pending_requests(db: Session) -> list[ApprovalRequest]:
