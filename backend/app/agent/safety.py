@@ -12,7 +12,6 @@ from app.common.security_patterns import PRIVATE_KEY_PATTERN, SECRET_MASK_PATTER
 
 
 class AgentSafetyGuard:
-    # ❌ DANH SÁCH ĐEN CHẶN ĐỨNG LỆNH PHÁ HOẠI (BLOCKLIST)
     # Cấm tuyệt đối các hành vi xóa phân vùng, tắt nguồn, tải file lậu hoặc thay đổi quyền sâu
     CRITICAL_BLOCKLIST_PATTERNS = [
         r"\brm\s+-(?:rf|fr|f|r)\b",  # rm -rf, rm -f bừa bãi
@@ -106,6 +105,14 @@ class AgentSafetyGuard:
     }
 
     @classmethod
+    def is_critical_ssh_command(cls, command: str) -> bool:
+        clean_cmd = cls.normalize_ssh_command(command).strip()
+        return any(
+            re.search(pattern, clean_cmd, re.IGNORECASE)
+            for pattern in cls.CRITICAL_BLOCKLIST_PATTERNS
+        )
+
+    @classmethod
     def validate_ssh_command(cls, command: str) -> tuple[bool, str | None]:
         """
         Kiểm tra chuyên sâu câu lệnh SSH trước khi bắn ra cổng kết nối vật lý.
@@ -123,22 +130,10 @@ class AgentSafetyGuard:
         if cls._contains_sensitive_path(clean_cmd):
             return False, "CẢNH BÁO AN NINH: Lệnh SSH cố đọc đường dẫn nhạy cảm."
 
+        if cls.is_critical_ssh_command(clean_cmd):
+            return False, "CẢNH BÁO AN NINH: Lệnh SSH nằm trong danh mục cấm thực thi."
+
         return True, None
-
-    @classmethod
-    def is_critical_ssh_command(cls, command: str) -> bool:
-        clean_cmd = cls.normalize_ssh_command(command).strip()
-        return any(
-            re.search(pattern, clean_cmd, re.IGNORECASE)
-            for pattern in cls.CRITICAL_BLOCKLIST_PATTERNS
-        )
-
-    @classmethod
-    def required_ssh_confirmations(cls, command: str) -> int:
-        mode = cls.classify_ssh_command(command)
-        if mode == ExecutionMode.AUTO_EXECUTE:
-            return 0
-        return 2 if cls.is_critical_ssh_command(command) else 1
 
     @classmethod
     def verify_ssh_command(
@@ -151,10 +146,9 @@ class AgentSafetyGuard:
         if not is_valid:
             return False, error_message
 
-        required = cls.required_ssh_confirmations(command)
-        if approval_confirmations < required:
-            qualifier = "hai lần" if required == 2 else "một lần"
-            return False, f"Lệnh SSH cần được người vận hành xác nhận {qualifier} trước khi chạy."
+        mode = cls.classify_ssh_command(command)
+        if mode == ExecutionMode.REQUIRE_APPROVAL and approval_confirmations < 1:
+            return False, "Lệnh SSH cần được người vận hành xác nhận một lần trước khi chạy."
         return True, None
 
     @classmethod
@@ -205,38 +199,6 @@ class AgentSafetyGuard:
 
     @classmethod
     @lru_cache(maxsize=128)
-    def classify_sql(cls, sql: str) -> ExecutionMode:
-        is_read_only, _ = cls.verify_read_only_sql(sql)
-        if is_read_only:
-            return ExecutionMode.AUTO_EXECUTE
-
-        clean_sql = sql.strip()
-        if not clean_sql:
-            raise SafetyViolationError("SQL query is empty.")
-        without_comments = re.sub(r"/\*[\s\S]*?\*/|--[^\r\n]*", " ", clean_sql)
-        without_literals = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", " ", without_comments)
-        statements = [part.strip() for part in without_literals.split(";") if part.strip()]
-        if len(statements) != 1:
-            raise SafetyViolationError("Only one SQL statement is allowed.")
-
-        tokens = re.findall(r"\b[a-z][a-z0-9]*\b", statements[0].lower())
-        if not tokens:
-            raise SafetyViolationError("SQL statement is invalid.")
-        if tokens[0] in cls.SQL_MUTATION_STATEMENT_KEYWORDS or tokens[0] in {
-            "call",
-            "copy",
-            "merge",
-            "set",
-            "use",
-            "with",
-        }:
-            return ExecutionMode.REQUIRE_APPROVAL
-        if tokens[0] in {"select", "show", "describe", "desc", "explain"}:
-            return ExecutionMode.REQUIRE_APPROVAL
-        raise SafetyViolationError(f"Unsupported SQL statement: {tokens[0]}.")
-
-    @classmethod
-    @lru_cache(maxsize=128)
     def verify_read_only_sql(cls, sql: str) -> tuple[bool, str | None]:
         clean_sql = sql.strip()
         if not clean_sql:
@@ -248,9 +210,9 @@ class AgentSafetyGuard:
         if len(statements) != 1:
             return False, "Only one SQL statement is allowed."
 
-        # Use word-boundary tokens (splitting on non-alphanumeric/underscore)
-        # to identify SQL keywords without breaking compound identifiers.
-        # e.g. "update_count" stays as one token, not ["update", "count"].
+        # Extract lowercase word tokens — note that underscores break words,
+        # so e.g. "update_count" becomes ["update", "count"]. This is acceptable
+        # because only tokens[0] is checked against keyword sets below.
         tokens = re.findall(r"\b[a-z][a-z0-9]*\b", statements[0].lower())
         if not tokens or tokens[0] not in {"select", "with", "describe", "desc", "show", "explain"}:
             return False, "Only SELECT, WITH, DESCRIBE, DESC, SHOW, or EXPLAIN queries are allowed."

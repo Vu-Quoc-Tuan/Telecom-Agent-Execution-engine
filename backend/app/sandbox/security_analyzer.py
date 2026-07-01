@@ -52,6 +52,7 @@ class AdvancedASTSecurityAnalyzer:
         "builtins",
         "urllib",
         "importlib",
+        "pydoc",
         "ctypes",
         "_ctypes",
         "gc",
@@ -93,14 +94,6 @@ class AdvancedASTSecurityAnalyzer:
         "input",
     }
 
-    # ✅ open() được phép có điều kiện: skill script chạy trong sandbox cần đọc tham số
-    # từ workspace (ví dụ args.json mà runner ghi vào /home/user/workspace/args.json).
-    # Chỉ cho phép khi: file là chuỗi literal, đường dẫn tương đối an toàn trong workspace,
-    # và mode là chỉ-đọc. Mọi dạng open() khác (biến, ghi/append, đường dẫn tuyệt đối,
-    # vượt thư mục) đều bị chặn — xem _validate_open_call.
-
-    # ✅ Một số dunder vô hại khi đứng ở dạng tên module (vd: `if __name__ == "__main__":`).
-    # Khi đứng ở dạng thuộc tính (obj.__name__) thì vẫn chặn vì là mắt xích điều hướng class.
     BENIGN_NAME_DUNDERS = {"__name__", "__doc__", "__file__"}
 
     @classmethod
@@ -142,8 +135,6 @@ class AdvancedASTSecurityAnalyzer:
                     )
 
             # 3. Chặn "Python Jailbreak" qua thuộc tính dunder.
-            # Bịt các vector: ().__class__.__bases__[0].__subclasses__(),
-            # f.__init__.__globals__['os'], obj.__getattribute__(...), ...
             elif isinstance(node, ast.Attribute):
                 if cls._is_dunder(node.attr):
                     errors.append(
@@ -152,7 +143,6 @@ class AdvancedASTSecurityAnalyzer:
                     )
 
             # 4. Chặn tham chiếu tên dunder (vd: __builtins__['eval'], __import__, __loader__).
-            #    Bao trùm cả dạng subscript __builtins__["eval"](...) vì value là ast.Name.
             elif isinstance(node, ast.Name):
                 if cls._is_dunder(node.id) and node.id not in cls.BENIGN_NAME_DUNDERS:
                     errors.append(

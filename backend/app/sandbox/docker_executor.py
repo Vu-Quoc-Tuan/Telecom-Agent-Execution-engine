@@ -1,19 +1,3 @@
-# backend/app/sandbox/docker_executor.py
-"""Sandbox thực thi skill script bằng Docker container ephemeral trên host.
-
-Đây là backend sandbox DUY NHẤT của hệ thống (đã bỏ Cube/E2B). Không cần API key,
-không cần KVM/PVM kernel — chỉ cần Docker daemon trên host. Mỗi lần chạy:
-  1. Ghi bundled_files + args.json ra một thư mục tạm (mount thành workspace).
-  2. ``docker run --rm --network none`` (giới hạn CPU/RAM/PID, chạy bằng uid host)
-     thực thi ``python3 <script_path>`` trong workspace.
-  3. Thu stdout/stderr/exit code; nếu quá giờ thì kill container.
-  4. Xoá thư mục tạm.
-
-``run_skill_script`` chỉ chạy script đã duyệt Vòng 5 (đã qua AST scan + hash check),
-nên cô lập mức container là đủ. Container chia sẻ host kernel nên yếu hơn MicroVM;
-không khuyến nghị cho payload không tin cậy ngoài luồng skill đã duyệt.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -37,8 +21,6 @@ DEFAULT_MAX_OUTPUT_CHARS = 50_000
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
 SANDBOX_WORKSPACE_DIR = "/workspace"
 ARGS_FILE_NAME = "args.json"
-# Đệm thêm so với timeout của script để Docker kịp teardown trước khi subprocess bị giết.
-DOCKER_TEARDOWN_BUFFER_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -50,7 +32,6 @@ class SandboxExecutionResult:
     exit_code: int
     timed_out: bool = False
     output_truncated: bool = False
-    error: str | None = None
 
 
 class DockerSandboxExecutor:
@@ -65,6 +46,8 @@ class DockerSandboxExecutor:
         memory: str = "256m",
         cpus: str = "1.0",
         docker_binary: str = "docker",
+        network: str = "none",
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         self._image = image
         self._timeout_seconds = int(timeout_seconds)
@@ -72,6 +55,8 @@ class DockerSandboxExecutor:
         self._memory = memory
         self._cpus = str(cpus)
         self._docker = docker_binary
+        self._network = network
+        self._extra_env = extra_env or {}
 
     async def execute_skill_script(
         self,
@@ -157,7 +142,7 @@ class DockerSandboxExecutor:
             "--name",
             container_name,
             "--network",
-            "none",
+            self._network,
             "--memory",
             self._memory,
             "--cpus",
@@ -169,8 +154,31 @@ class DockerSandboxExecutor:
             "-w",
             SANDBOX_WORKSPACE_DIR,
         ]
-        # Chạy bằng uid:gid của host để file container ghi ra không thuộc root
-        # (tránh host không xoá được tmp dir). Chỉ áp dụng trên nền POSIX.
+        # Forward database and connection environment variables to the sandbox
+        env_vars = [
+            "CH_HOST",
+            "CH_PORT",
+            "CH_USER",
+            "CH_PASSWORD",
+            "CH_DATABASE",
+            "PG_DSN",
+            "SSH_HOST",
+            "SSH_PORT",
+            "SSH_USER",
+            "SSH_PASSWORD",
+        ]
+        # First use variables defined in settings/extra_env
+        forwarded = dict(self._extra_env)
+        # Overwrite with direct os.environ if they are set in parent process
+        for var in env_vars:
+            val = os.environ.get(var)
+            if val is not None:
+                forwarded[var] = val
+
+        for var, val in forwarded.items():
+            if val:
+                command += ["-e", f"{var}={val}"]
+
         if hasattr(os, "getuid") and hasattr(os, "getgid"):
             command += ["--user", f"{os.getuid()}:{os.getgid()}"]
         command += [self._image, "python3", script_path]
@@ -200,7 +208,7 @@ class DockerSandboxExecutor:
                     command,
                     capture_output=True,
                     text=True,
-                    timeout=effective_timeout + DOCKER_TEARDOWN_BUFFER_SECONDS,
+                    timeout=effective_timeout,
                 )
             except subprocess.TimeoutExpired:
                 logger.warning("Docker sandbox timed out for script %s", script_path)
@@ -247,7 +255,11 @@ def docker_is_available(docker_binary: str = "docker") -> bool:
 
 
 def sandbox_available(settings) -> bool:
-    """True nếu sandbox được bật (SANDBOX_ENABLED) và Docker khả dụng trên host."""
+    """True nếu sandbox được bật và Docker CLI tồn tại trên host.
+
+    Lưu ý: chỉ kiểm tra sự tồn tại của Docker CLI, không kiểm tra Docker daemon
+    đang chạy hay không. Lỗi daemon sẽ được phát hiện tại thời điểm thực thi.
+    """
     if settings is None:
         return False
     if not bool(getattr(settings, "SANDBOX_ENABLED", True)):
@@ -265,9 +277,37 @@ def build_sandbox_executor_from_settings(settings) -> DockerSandboxExecutor | No
     timeout = getattr(settings, "SANDBOX_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
     memory = (getattr(settings, "SANDBOX_MEMORY", "") or "256m").strip() or "256m"
     cpus = str(getattr(settings, "SANDBOX_CPUS", "") or "1.0").strip() or "1.0"
+    network = (getattr(settings, "SANDBOX_NETWORK", "none") or "none").strip() or "none"
+
+    pg_host = getattr(settings, "EXTERNAL_POSTGRES_HOST", "")
+    pg_port = getattr(settings, "EXTERNAL_POSTGRES_PORT", 5432)
+    pg_user = getattr(settings, "EXTERNAL_POSTGRES_USER", "")
+    pg_password = getattr(settings, "EXTERNAL_POSTGRES_PASSWORD", "")
+    pg_db = getattr(settings, "EXTERNAL_POSTGRES_DATABASE", "")
+    pg_dsn = ""
+    if pg_host:
+        from urllib.parse import quote_plus
+
+        pg_dsn = f"postgresql://{quote_plus(pg_user)}:{quote_plus(pg_password)}@{pg_host}:{pg_port}/{pg_db}"
+
+    extra_env = {
+        "CH_HOST": getattr(settings, "CLICKHOUSE_HOST", ""),
+        "CH_PORT": str(getattr(settings, "CLICKHOUSE_PORT", 8123)),
+        "CH_USER": getattr(settings, "CLICKHOUSE_USER", ""),
+        "CH_PASSWORD": getattr(settings, "CLICKHOUSE_PASSWORD", ""),
+        "CH_DATABASE": getattr(settings, "CLICKHOUSE_DATABASE", ""),
+        "PG_DSN": pg_dsn,
+        "SSH_HOST": getattr(settings, "SSH_HOST", ""),
+        "SSH_PORT": str(getattr(settings, "SSH_PORT", 22)),
+        "SSH_USER": getattr(settings, "SSH_USER", ""),
+        "SSH_PASSWORD": getattr(settings, "SSH_PASSWORD", ""),
+    }
+
     return DockerSandboxExecutor(
         image=image,
         timeout_seconds=int(timeout),
         memory=memory,
         cpus=cpus,
+        network=network,
+        extra_env=extra_env,
     )

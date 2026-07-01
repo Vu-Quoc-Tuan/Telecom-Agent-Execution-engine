@@ -807,7 +807,15 @@ class SkillValidationService:
         if depth > 4 or not isinstance(raw_schema, dict):
             return None
         schema_type = raw_schema.get("type")
-        if schema_type not in {"string", "integer", "number", "boolean", "object", "array", "null"}:
+        if not isinstance(schema_type, str) or schema_type not in {
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "object",
+            "array",
+            "null",
+        }:
             return None
 
         sanitized: dict[str, Any] = {"type": schema_type}

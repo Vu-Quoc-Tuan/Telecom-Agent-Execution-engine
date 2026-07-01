@@ -5,8 +5,13 @@ from typing import Literal
 
 from langchain_core.runnables import RunnableConfig
 
-from app.agent.builtin_tools import BUILTIN_TOOL_NAMES, classify_builtin_risk
+from app.agent.builtin_tools import (
+    BUILTIN_TOOL_NAMES,
+    build_builtin_tool_definitions,
+    classify_builtin_risk,
+)
 from app.agent.state import AgentState
+from app.agent.tool_validation import validate_tool_call_arguments
 from app.common.exceptions import TelecomAgentException
 from app.database.repositories.messages import MessageRepository
 
@@ -18,8 +23,7 @@ def decide_tool_route(
 ) -> Literal["execute_tools", "suspend_for_human", "fail"]:
     if not all_skills_ready or "prohibited" in risk_levels:
         return "fail"
-    # classify_builtin_risk phát ra "require_approval" cho mọi payload ad-hoc do LLM
-    # sinh (SSH/SQL). Giữ "dangerous_action" để tương thích nhãn cũ truyền từ ngoài vào.
+    # Giữ "dangerous_action" để tương thích nhãn cũ truyền từ ngoài vào.
     if "dangerous_action" in risk_levels or "require_approval" in risk_levels:
         return "suspend_for_human"
     return "execute_tools"
@@ -49,10 +53,25 @@ def reliability_router(
 
     db = config["configurable"]["db"]
     from app.database.repositories.skills import SkillRepository
+
     try:
-        ready_skill_names = {s.name for s in SkillRepository.list_ready_skills(db)}
+        ready_skills = SkillRepository.list_ready_skills(db)
     except Exception:
-        ready_skill_names = set()
+        ready_skills = []
+    ready_skill_names = {skill.name for skill in ready_skills}
+
+    settings = config["configurable"].get("settings")
+    try:
+        from app.sandbox.docker_executor import sandbox_available
+
+        is_sandbox_available = sandbox_available(settings)
+    except Exception:
+        is_sandbox_available = False
+    tool_catalog = build_builtin_tool_definitions(
+        ready_skills,
+        sandbox_available=is_sandbox_available,
+        settings=settings,
+    )
 
     risk_levels: list[str] = []
     all_skills_ready = True
@@ -65,9 +84,14 @@ def reliability_router(
                 all_skills_ready = False
             continue
         try:
+            validate_tool_call_arguments(
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+                tools=tool_catalog,
+            )
             risk_levels.append(classify_builtin_risk(tool_call.name, tool_call.arguments))
         except TelecomAgentException:
-            # Tool call không hợp lệ (payload cấm/sai schema): không crash router.
+            # Tool call không hợp lệ/không khả dụng: không crash router.
             has_invalid_call = True
 
     # Batch có tool call không hợp lệ → ưu tiên đẩy sang execute_tools để node tự

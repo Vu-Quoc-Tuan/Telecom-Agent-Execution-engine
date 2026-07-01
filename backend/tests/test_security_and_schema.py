@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.agent.safety import AgentSafetyGuard
 from app.common.enums import ExecutionMode
 from app.common.exceptions import SafetyViolationError
 from app.observability.redaction import DataRedactor
 from app.sandbox.domain_validator import (
+    SKILL_DOMAIN_JUDGE_FALLBACK_PROMPT,
+    SKILL_DOMAIN_JUDGE_PROMPT_NAME,
     SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT,
     TelecomDomainValidator,
 )
@@ -33,11 +36,24 @@ class SecurityAnalyzerTests(unittest.TestCase):
         self.assertTrue(any("__subclasses__" in f or "__class__" in f for f in findings))
 
     def test_blocks_importlib_and_ctypes(self) -> None:
-        for module in ("importlib", "ctypes"):
+        for module in ("importlib", "ctypes", "pydoc"):
             code = f"import {module}\n\ndef run(ssh_client):\n    return 1\n"
             is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
             self.assertFalse(is_clean, module)
             self.assertTrue(any(module in f for f in findings), module)
+
+    def test_blocks_pydoc_locate_dynamic_import_bypass(self) -> None:
+        code = (
+            "import pydoc\n\n"
+            "os = pydoc.locate('os')\n"
+            "subprocess = pydoc.locate('subprocess')\n"
+            "paramiko = pydoc.locate('paramiko')\n"
+        )
+
+        is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
+
+        self.assertFalse(is_clean)
+        self.assertTrue(any("pydoc" in finding for finding in findings), findings)
 
     def test_blocks_background_execution_primitives(self) -> None:
         for module in (
@@ -117,6 +133,79 @@ class SecurityAnalyzerTests(unittest.TestCase):
 
 
 class DomainValidatorPromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_domain_judge_compiles_managed_prompt(self) -> None:
+        class ManagedPrompt:
+            def compile(self, **variables):
+                return (
+                    f"managed:{variables['name']}|{variables['description']}|"
+                    f"{variables['code_text']}"
+                )
+
+        class CapturingGateway:
+            def __init__(self) -> None:
+                self.user_prompt = None
+
+            async def invoke(self, messages, system_prompt=None):
+                self.user_prompt = messages[0].content
+                return SimpleNamespace(
+                    content=(
+                        '{"domain_score": 0.9, "reason": "telecom workflow", '
+                        '"suspicious_points": "None"}'
+                    )
+                )
+
+        gateway = CapturingGateway()
+        with patch(
+            "app.sandbox.domain_validator.telemetry_tracker.get_prompt",
+            return_value=ManagedPrompt(),
+        ) as get_prompt:
+            await TelecomDomainValidator.invoke_llm_domain_judge(
+                gateway,
+                "check-node-status",
+                "Check telecom node status",
+                "def run(): return 'ok'",
+            )
+
+        get_prompt.assert_called_once_with(
+            SKILL_DOMAIN_JUDGE_PROMPT_NAME,
+            fallback_text=SKILL_DOMAIN_JUDGE_FALLBACK_PROMPT,
+        )
+        self.assertEqual(
+            "managed:check-node-status|Check telecom node status|def run(): return 'ok'",
+            gateway.user_prompt,
+        )
+
+    async def test_llm_domain_judge_uses_short_local_fallback_without_langfuse(self) -> None:
+        class CapturingGateway:
+            def __init__(self) -> None:
+                self.user_prompt = None
+
+            async def invoke(self, messages, system_prompt=None):
+                self.user_prompt = messages[0].content
+                return SimpleNamespace(
+                    content=(
+                        '{"domain_score": 0.9, "reason": "telecom workflow", '
+                        '"suspicious_points": "None"}'
+                    )
+                )
+
+        gateway = CapturingGateway()
+        with patch(
+            "app.sandbox.domain_validator.telemetry_tracker.get_prompt",
+            return_value=None,
+        ):
+            await TelecomDomainValidator.invoke_llm_domain_judge(
+                gateway,
+                "check-node-status",
+                "Check telecom node status",
+                "def run(): return 'ok'",
+            )
+
+        self.assertIn("check-node-status", gateway.user_prompt)
+        self.assertIn("Check telecom node status", gateway.user_prompt)
+        self.assertIn("def run(): return 'ok'", gateway.user_prompt)
+        self.assertNotIn("hack game", gateway.user_prompt)
+
     async def test_llm_domain_judge_uses_dedicated_system_prompt(self) -> None:
         class CapturingGateway:
             def __init__(self) -> None:
@@ -274,36 +363,6 @@ class SafetyGuardTests(unittest.TestCase):
             self.assertFalse(is_safe, f"Allowed prohibited query: {sql}")
             self.assertIsNotNone(err)
 
-    def test_classify_sql_edge_cases(self) -> None:
-        # Empty SQL raises SafetyViolationError
-        with self.assertRaises(SafetyViolationError):
-            AgentSafetyGuard.classify_sql("")
-        with self.assertRaises(SafetyViolationError):
-            AgentSafetyGuard.classify_sql("   ")
-
-        # Multiple statements raise SafetyViolationError
-        with self.assertRaises(SafetyViolationError):
-            AgentSafetyGuard.classify_sql("SELECT 1; SELECT 2;")
-
-        # Read-only SQL returns ExecutionMode.AUTO_EXECUTE
-        self.assertEqual(
-            ExecutionMode.AUTO_EXECUTE, AgentSafetyGuard.classify_sql("SELECT * FROM station")
-        )
-
-        # Mutation statement returns ExecutionMode.REQUIRE_APPROVAL
-        self.assertEqual(
-            ExecutionMode.REQUIRE_APPROVAL,
-            AgentSafetyGuard.classify_sql("UPDATE station SET name = 'abc'"),
-        )
-        self.assertEqual(
-            ExecutionMode.REQUIRE_APPROVAL, AgentSafetyGuard.classify_sql("DROP TABLE alarms")
-        )
-
-        # Unsupported statements raise SafetyViolationError
-        with self.assertRaises(SafetyViolationError) as ctx:
-            AgentSafetyGuard.classify_sql("INVALID_CMD table")
-        self.assertIn("Unsupported SQL statement", str(ctx.exception))
-
     def test_classify_ssh_command_edge_cases(self) -> None:
         # Empty command raises SafetyViolationError
         with self.assertRaises(SafetyViolationError):
@@ -325,13 +384,33 @@ class SafetyGuardTests(unittest.TestCase):
             AgentSafetyGuard.classify_ssh_command("systemctl restart nginx"),
         )
 
-    def test_required_ssh_confirmations(self) -> None:
-        # Auto execute -> 0 confirmations
-        self.assertEqual(0, AgentSafetyGuard.required_ssh_confirmations("hostname"))
-        # Standard mutation -> 1 confirmation
-        self.assertEqual(1, AgentSafetyGuard.required_ssh_confirmations("systemctl restart nginx"))
-        # Critical command -> 2 confirmations
-        self.assertEqual(2, AgentSafetyGuard.required_ssh_confirmations("rm -rf /"))
+    def test_verify_ssh_command_behavior(self) -> None:
+        # Auto execute command requires 0 confirmations and is safe
+        is_safe, err = AgentSafetyGuard.verify_ssh_command("hostname", approval_confirmations=0)
+        self.assertTrue(is_safe)
+        self.assertIsNone(err)
+
+        # Standard mutation command requires at least 1 confirmation
+        is_safe, err = AgentSafetyGuard.verify_ssh_command(
+            "systemctl restart nginx", approval_confirmations=0
+        )
+        self.assertFalse(is_safe)
+        self.assertIn("xác nhận một lần", err)
+
+        is_safe, err = AgentSafetyGuard.verify_ssh_command(
+            "systemctl restart nginx", approval_confirmations=1
+        )
+        self.assertTrue(is_safe)
+        self.assertIsNone(err)
+
+        # Critical command fails validation completely, even with confirmations
+        is_safe, err = AgentSafetyGuard.verify_ssh_command("rm -rf /", approval_confirmations=1)
+        self.assertFalse(is_safe)
+        self.assertIn("cấm thực thi", err)
+
+        is_safe, err = AgentSafetyGuard.verify_ssh_command("rm -rf /", approval_confirmations=2)
+        self.assertFalse(is_safe)
+        self.assertIn("cấm thực thi", err)
 
     def test_truncate_output(self) -> None:
         text = "a" * 20000

@@ -63,7 +63,7 @@ class TelcoClickHouseConnector(BaseConnector):
             },
         )
 
-        # 🟢 Chuyển đổi dữ liệu bảng thô về dạng List[Dict] sạch để Agent dễ đọc hiểu cấu trúc
+        # Chuyển đổi dữ liệu bảng thô về dạng List[Dict] sạch để Agent dễ đọc hiểu cấu trúc
         return [dict(zip(result.column_names, row, strict=False)) for row in result.result_rows]
 
     def _sync_execute(

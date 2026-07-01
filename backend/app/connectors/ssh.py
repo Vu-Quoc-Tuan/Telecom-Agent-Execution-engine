@@ -1,4 +1,3 @@
-# backend/app/connectors/ssh.py
 from __future__ import annotations
 
 import asyncio
@@ -72,7 +71,7 @@ class TelcoSSHConnector(BaseConnector):
         Ví dụ: stdout, stderr = await ssh_client.execute_command("pm2 status")
         """
         command = AgentSafetyGuard.normalize_ssh_command(command)
-        # 1. 🛡️ CHỐT CHẶN AN NINH: Kiểm tra lệnh cấm (rm -rf, shutdown,...) trước khi gửi đi
+        # 1. Kiểm tra lệnh cấm (rm -rf, shutdown,...) trước khi gửi đi
         is_safe, error_msg = AgentSafetyGuard.verify_ssh_command(
             command,
             approval_confirmations=approval_confirmations,
@@ -106,6 +105,7 @@ class TelcoSSHConnector(BaseConnector):
 
         # 3. Rào chắn Output Limit: Cắt giảm dữ liệu nếu log trạm trả về dài quá ngưỡng cho phép
         stdout_str, _ = AgentSafetyGuard.truncate_output(stdout_str)
+        stderr_str, _ = AgentSafetyGuard.truncate_output(stderr_str)
         return stdout_str, stderr_str
 
     def close(self) -> None:

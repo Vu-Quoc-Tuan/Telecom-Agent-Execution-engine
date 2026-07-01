@@ -4,16 +4,15 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
+from app.agent.builtin_runners import execute_builtin_tool
 from app.agent.builtin_tools import (
     BUILTIN_TOOL_NAMES,
     build_builtin_tool_definitions,
     classify_builtin_risk,
-    execute_builtin_tool,
     list_backend_owned_capabilities,
-    required_approval_confirmations,
 )
 from app.common.enums import ExecutionMode
-from app.common.exceptions import ConnectorExecutionError, SafetyViolationError, SkillRuntimeError
+from app.common.exceptions import ConnectorExecutionError, SkillRuntimeError
 
 
 class FakeSkill:
@@ -56,6 +55,19 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             load_skill.input_schema["properties"]["skill_name"]["enum"],
         )
         self.assertNotIn("execute_python_in_sandbox", {tool.name for tool in with_skills})
+
+    def test_run_skill_script_skill_name_is_constrained_to_ready_skills(self) -> None:
+        tools = build_builtin_tool_definitions(
+            [types.SimpleNamespace(name="check-kpis")],
+            sandbox_available=True,
+        )
+
+        run_skill_script = next(tool for tool in tools if tool.name == "run_skill_script")
+
+        self.assertEqual(
+            ["check-kpis"],
+            run_skill_script.input_schema["properties"]["skill_name"]["enum"],
+        )
 
     def test_backend_owned_capabilities_are_auto_executable_and_described(self) -> None:
         tools = build_builtin_tool_definitions(
@@ -117,7 +129,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             def close(self):
                 pass
 
-        with patch("app.agent.builtin_tools.TelcoClickHouseConnector", FakeClickHouseConnector):
+        with patch("app.agent.builtin_runners.TelcoClickHouseConnector", FakeClickHouseConnector):
             output, truncated = await execute_builtin_tool(
                 tool_name="get_site_alarm_summary",
                 arguments={"site_id": "site-a", "window_minutes": 15, "limit": 20},
@@ -155,7 +167,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             def close(self):
                 pass
 
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
+        with patch("app.agent.builtin_runners.TelcoSSHConnector", FakeSSHConnector):
             output, truncated = await execute_builtin_tool(
                 tool_name="get_node_health_snapshot",
                 arguments={"node_name": "site-a"},
@@ -211,7 +223,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             QUERY_MAX_RESULT_ROWS=100,
         )
 
-        with patch("app.agent.builtin_tools.TelcoClickHouseConnector", FakeClickHouseConnector):
+        with patch("app.agent.builtin_runners.TelcoClickHouseConnector", FakeClickHouseConnector):
             output, _ = await execute_builtin_tool(
                 tool_name="get_active_alarms",
                 arguments={"window_minutes": 30, "limit": 50},
@@ -226,7 +238,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             FakeClickHouseConnector.params,
         )
 
-        with patch("app.agent.builtin_tools.TelcoClickHouseConnector", FakeClickHouseConnector):
+        with patch("app.agent.builtin_runners.TelcoClickHouseConnector", FakeClickHouseConnector):
             await execute_builtin_tool(
                 tool_name="get_active_alarms",
                 arguments={"window_minutes": 30, "limit": 50, "severity": "critical"},
@@ -257,7 +269,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             def close(self):
                 pass
 
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
+        with patch("app.agent.builtin_runners.TelcoSSHConnector", FakeSSHConnector):
             output, _ = await execute_builtin_tool(
                 tool_name="ping_node",
                 arguments={"node_name": "site-a", "count": 3},
@@ -282,20 +294,126 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             classify_builtin_risk("ping_node", {"node_name": "site-a", "count": 3}),
         )
 
+    async def test_restart_service_is_exposed_as_approval_only_backend_action(self) -> None:
+        settings = types.SimpleNamespace(
+            SSH_ALLOWED_NODES="site-a",
+            SSH_NODE_HOST_MAP="site-a=10.0.0.11",
+            SSH_HOST="",
+            SSH_PORT=22,
+            SSH_USER="noc",
+            SSH_PASSWORD="pwd",
+            SSH_TIMEOUT_SECONDS=5,
+            SSH_KNOWN_HOSTS="",
+            SSH_AUTO_ADD_HOST_KEYS=False,
+            SSH_RESTART_ALLOWED_SERVICES="nginx,node-exporter",
+        )
+        tools = build_builtin_tool_definitions([], settings=settings)
+        restart_tool = next(tool for tool in tools if tool.name == "restart_service")
+
+        self.assertEqual(
+            ExecutionMode.REQUIRE_APPROVAL.value,
+            classify_builtin_risk(
+                "restart_service",
+                {"node_name": "site-a", "service_name": "nginx"},
+            ),
+        )
+        self.assertEqual(
+            ["nginx", "node-exporter"],
+            restart_tool.input_schema["properties"]["service_name"]["enum"],
+        )
+        with self.assertRaises(SkillRuntimeError):
+            await execute_builtin_tool(
+                tool_name="restart_service",
+                arguments={"node_name": "site-a", "service_name": "nginx"},
+                db=object(),
+                settings=settings,
+            )
+
+    async def test_restart_service_filters_unsafe_allowlist_entries(self) -> None:
+        settings = types.SimpleNamespace(
+            SSH_ALLOWED_NODES="site-a",
+            SSH_NODE_HOST_MAP="site-a=10.0.0.11",
+            SSH_HOST="",
+            SSH_PORT=22,
+            SSH_USER="noc",
+            SSH_PASSWORD="pwd",
+            SSH_TIMEOUT_SECONDS=5,
+            SSH_KNOWN_HOSTS="",
+            SSH_AUTO_ADD_HOST_KEYS=False,
+            SSH_RESTART_ALLOWED_SERVICES="nginx, bad service, nginx;reboot",
+        )
+
+        tools = build_builtin_tool_definitions([], settings=settings)
+        restart_tool = next(tool for tool in tools if tool.name == "restart_service")
+
+        self.assertEqual(["nginx"], restart_tool.input_schema["properties"]["service_name"]["enum"])
+        with self.assertRaises(SkillRuntimeError) as ctx:
+            await execute_builtin_tool(
+                tool_name="restart_service",
+                arguments={"node_name": "site-a", "service_name": "bad service"},
+                db=object(),
+                settings=settings,
+                approval_confirmations=1,
+            )
+        self.assertIn("SSH_RESTART_ALLOWED_SERVICES", ctx.exception.message)
+
+    async def test_restart_service_runs_hardcoded_commands_after_approval(self) -> None:
+        class FakeSSHConnector:
+            commands = []
+
+            def __init__(self, **kwargs):
+                pass
+
+            async def execute_command(self, command, *, approval_confirmations=0):
+                FakeSSHConnector.commands.append((command, approval_confirmations))
+                return "ok", ""
+
+            def close(self):
+                pass
+
+        settings = types.SimpleNamespace(
+            SSH_ALLOWED_NODES="site-a",
+            SSH_NODE_HOST_MAP="site-a=10.0.0.11",
+            SSH_HOST="",
+            SSH_PORT=22,
+            SSH_USER="noc",
+            SSH_PASSWORD="pwd",
+            SSH_TIMEOUT_SECONDS=5,
+            SSH_KNOWN_HOSTS="",
+            SSH_AUTO_ADD_HOST_KEYS=False,
+            SSH_RESTART_ALLOWED_SERVICES="nginx",
+        )
+
+        with patch("app.agent.builtin_runners.TelcoSSHConnector", FakeSSHConnector):
+            output, truncated = await execute_builtin_tool(
+                tool_name="restart_service",
+                arguments={"node_name": "site-a", "service_name": "nginx"},
+                db=object(),
+                settings=settings,
+                approval_confirmations=1,
+            )
+
+        self.assertFalse(truncated)
+        self.assertIn("systemctl restart nginx", output)
+        self.assertEqual(
+            [("systemctl restart nginx", 1), ("systemctl is-active nginx", 0)],
+            FakeSSHConnector.commands,
+        )
+
     def test_tool_argument_validator_covers_required_extra_type_and_enum_edges(self) -> None:
         from app.agent.tool_validation import validate_tool_call_arguments
 
         tools = build_builtin_tool_definitions([types.SimpleNamespace(name="check-kpis")])
 
         validate_tool_call_arguments(
-            tool_name="query_clickhouse",
-            arguments={"sql": "SELECT 1"},
+            tool_name="load_skill",
+            arguments={"skill_name": "check-kpis"},
             tools=tools,
         )
 
         with self.assertRaises(SkillRuntimeError) as missing_ctx:
             validate_tool_call_arguments(
-                tool_name="query_clickhouse",
+                tool_name="load_skill",
                 arguments={},
                 tools=tools,
             )
@@ -303,16 +421,16 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(SkillRuntimeError) as extra_ctx:
             validate_tool_call_arguments(
-                tool_name="query_clickhouse",
-                arguments={"sql": "SELECT 1", "limit": 1},
+                tool_name="load_skill",
+                arguments={"skill_name": "check-kpis", "limit": 1},
                 tools=tools,
             )
         self.assertIn("Unexpected argument", extra_ctx.exception.message)
 
         with self.assertRaises(SkillRuntimeError) as type_ctx:
             validate_tool_call_arguments(
-                tool_name="query_clickhouse",
-                arguments={"sql": 123},
+                tool_name="load_skill",
+                arguments={"skill_name": 123},
                 tools=tools,
             )
         self.assertIn("must be string", type_ctx.exception.message)
@@ -604,178 +722,27 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("output contract", ctx.exception.message)
 
-    async def test_ssh_command_raises_if_node_not_allowed(self) -> None:
-        settings = types.SimpleNamespace(
-            SSH_ALLOWED_NODES="site-a,site-b",
-            SSH_HOST="",
-            SSH_PORT=22,
-            SSH_USER="noc",
-            SSH_PASSWORD="pwd",
-            SSH_TIMEOUT_SECONDS=5,
+    async def test_raw_proposal_tools_are_not_exposed_or_executable(self) -> None:
+        raw_tools = {"run_ssh_command", "query_clickhouse", "query_postgres"}
+        tools = build_builtin_tool_definitions(
+            [types.SimpleNamespace(name="check-kpis")],
+            sandbox_available=True,
+            settings=types.SimpleNamespace(
+                CLICKHOUSE_HOST="clickhouse.example.test",
+                EXTERNAL_POSTGRES_HOST="postgres.example.test",
+                SSH_ALLOWED_NODES="site-a",
+                SSH_HOST="",
+            ),
         )
 
-        with self.assertRaises(SkillRuntimeError) as ctx:
-            await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "unauthorized-node", "command": "hostname"},
-                db=object(),
-                settings=settings,
-            )
-
-        self.assertIn("SSH_ALLOWED_NODES", ctx.exception.message)
-
-    async def test_ssh_uses_requested_node_when_allowlist_is_configured(self) -> None:
-        class FakeSSHConnector:
-            instances = []
-
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                FakeSSHConnector.instances.append(self)
-
-            async def execute_command(self, command: str, *, approval_confirmations=0):
-                self.command = command
-                return "ok", ""
-
-            def close(self):
-                self.closed = True
-
-        settings = types.SimpleNamespace(
-            SSH_ALLOWED_NODES="site-a,site-b",
-            SSH_HOST="global-host.example.test",
-            SSH_PORT=22,
-            SSH_USER="noc",
-            SSH_PASSWORD="pwd",
-            SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
-        )
-
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
-            output, truncated = await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-b", "command": "hostname"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        self.assertEqual("ok", output)
-        self.assertFalse(truncated)
-        self.assertEqual("site-b", FakeSSHConnector.instances[0].kwargs["host"])
-
-    async def test_ssh_can_resolve_logical_node_to_configured_host(self) -> None:
-        class FakeSSHConnector:
-            instances = []
-
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                FakeSSHConnector.instances.append(self)
-
-            async def execute_command(self, command: str, *, approval_confirmations=0):
-                return "ok", ""
-
-            def close(self):
-                pass
-
-        settings = types.SimpleNamespace(
-            SSH_ALLOWED_NODES="site-a,site-b",
-            SSH_NODE_HOST_MAP="site-a=10.0.0.11, site-b=node-b.internal",
-            SSH_HOST="global-host.example.test",
-            SSH_PORT=22,
-            SSH_USER="noc",
-            SSH_PASSWORD="pwd",
-            SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
-        )
-
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
-            output, truncated = await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-b", "command": "hostname"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        self.assertEqual("ok", output)
-        self.assertFalse(truncated)
-        self.assertEqual("node-b.internal", FakeSSHConnector.instances[0].kwargs["host"])
-
-    async def test_ssh_resolver_accepts_legacy_json_node_host_map(self) -> None:
-        class FakeSSHConnector:
-            instances = []
-
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                FakeSSHConnector.instances.append(self)
-
-            async def execute_command(self, command: str, *, approval_confirmations=0):
-                return "ok", ""
-
-            def close(self):
-                pass
-
-        settings = types.SimpleNamespace(
-            SSH_ALLOWED_NODES="site-a",
-            SSH_NODE_HOST_MAP='{"site-a": "10.0.0.11"}',
-            SSH_HOST="global-host.example.test",
-            SSH_PORT=22,
-            SSH_USER="noc",
-            SSH_PASSWORD="pwd",
-            SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
-        )
-
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
-            output, truncated = await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-a", "command": "hostname"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        self.assertEqual("ok", output)
-        self.assertFalse(truncated)
-        self.assertEqual("10.0.0.11", FakeSSHConnector.instances[0].kwargs["host"])
-
-    async def test_ssh_tool_output_is_redacted_before_returning_to_llm(self) -> None:
-        class FakeSSHConnector:
-            def __init__(self, **kwargs):
-                pass
-
-            async def execute_command(self, command: str, *, approval_confirmations=0):
-                return "password=super-secret token: abc123", ""
-
-            def close(self):
-                pass
-
-        settings = types.SimpleNamespace(
-            SSH_ALLOWED_NODES="site-a",
-            SSH_HOST="",
-            SSH_PORT=22,
-            SSH_USER="noc",
-            SSH_PASSWORD="pwd",
-            SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
-        )
-
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
-            output, truncated = await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-a", "command": "hostname"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        self.assertFalse(truncated)
-        self.assertNotIn("super-secret", output)
-        self.assertNotIn("abc123", output)
-        self.assertIn("[REDACTED]", output)
+        self.assertTrue(raw_tools.isdisjoint(BUILTIN_TOOL_NAMES))
+        self.assertTrue(raw_tools.isdisjoint({tool.name for tool in tools}))
+        for tool_name in raw_tools:
+            with self.subTest(tool_name=tool_name):
+                with self.assertRaises(SkillRuntimeError):
+                    classify_builtin_risk(tool_name, {})
+                with self.assertRaises(SkillRuntimeError):
+                    await execute_builtin_tool(tool_name=tool_name, arguments={}, db=object())
 
     async def test_ssh_known_hosts_error_explains_trust_configuration(self) -> None:
         from app.connectors.ssh import TelcoSSHConnector
@@ -799,304 +766,6 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SSH_AUTO_ADD_HOST_KEYS=true", ctx.exception.message)
         self.assertEqual("host.test", ctx.exception.details["host"])
         self.assertEqual(2222, ctx.exception.details["port"])
-
-    async def test_ssh_strips_safe_output_limit_pipe_before_execution(self) -> None:
-        class FakeSSHConnector:
-            command = None
-
-            def __init__(self, **kwargs):
-                pass
-
-            async def execute_command(self, command: str, *, approval_confirmations=0):
-                FakeSSHConnector.command = command
-                return "ok", ""
-
-            def close(self):
-                pass
-
-        settings = types.SimpleNamespace(
-            SSH_ALLOWED_NODES="site-a",
-            SSH_HOST="",
-            SSH_PORT=22,
-            SSH_USER="noc",
-            SSH_PASSWORD="pwd",
-            SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
-        )
-        command = "ps -eo pid,ppid,comm,%mem,%cpu --sort=-%cpu | head -n 10"
-
-        risk = classify_builtin_risk(
-            tool_name="run_ssh_command",
-            arguments={"node_name": "site-a", "command": command},
-        )
-
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
-            output, truncated = await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-a", "command": command},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-        self.assertEqual("ps -eo pid,ppid,comm,%mem,%cpu --sort=-%cpu", FakeSSHConnector.command)
-        self.assertEqual("ok", output)
-        self.assertFalse(truncated)
-
-    def test_classify_builtin_risk_checks_dangerous_terms(self) -> None:
-        # Safe command
-        risk = classify_builtin_risk(
-            tool_name="run_ssh_command",
-            arguments={"node_name": "site-a", "command": "show configuration"},
-        )
-        self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-        # Dangerous command
-        risk = classify_builtin_risk(
-            tool_name="run_ssh_command",
-            arguments={"node_name": "site-a", "command": "systemctl restart telco_service"},
-        )
-        self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-    def test_ssh_state_changes_require_approval(self) -> None:
-        for command in ("touch /tmp/pwn", "sed -i s/a/b/ /etc/app.conf", "mkdir /tmp/work"):
-            with self.subTest(command=command):
-                risk = classify_builtin_risk(
-                    tool_name="run_ssh_command",
-                    arguments={"node_name": "site-a", "command": command},
-                )
-                self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-    def test_ssh_critical_commands_require_two_confirmations(self) -> None:
-        risk = classify_builtin_risk(
-            tool_name="run_ssh_command",
-            arguments={"node_name": "site-a", "command": "rm -rf /"},
-        )
-        confirmations = required_approval_confirmations(
-            tool_name="run_ssh_command",
-            arguments={"node_name": "site-a", "command": "rm -rf /"},
-        )
-
-        self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-        self.assertEqual(2, confirmations)
-
-    def test_ssh_sensitive_file_reads_remain_blocked_by_validation(self) -> None:
-        for command in (
-            "cat /etc/shadow",
-            "cat /etc/../etc/shadow",
-            "tail ~/.ssh/id_rsa",
-            "tail ~/.ssh/../.ssh/id_rsa",
-            "grep token .env",
-            "grep token ./.env",
-            "head /proc/self/environ",
-        ):
-            with self.subTest(command=command):
-                with self.assertRaises(SafetyViolationError):
-                    classify_builtin_risk(
-                        tool_name="run_ssh_command",
-                        arguments={"node_name": "site-a", "command": command},
-                    )
-
-    async def test_critical_ssh_execution_requires_both_confirmations(self) -> None:
-        settings = types.SimpleNamespace(
-            SSH_ALLOWED_NODES="site-a",
-            SSH_NODE_HOST_MAP="site-a=10.0.0.10",
-            SSH_HOST="",
-            SSH_PORT=22,
-            SSH_USER="noc",
-            SSH_PASSWORD="pwd",
-            SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
-        )
-
-        with self.assertRaises(SafetyViolationError):
-            await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-a", "command": "rm -rf /var/tmp/cache"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        class FakeSSHConnector:
-            confirmations = None
-
-            def __init__(self, **kwargs):
-                pass
-
-            async def execute_command(self, command, *, approval_confirmations=0):
-                FakeSSHConnector.confirmations = approval_confirmations
-                return "removed", ""
-
-            def close(self):
-                return None
-
-        with patch("app.agent.builtin_tools.TelcoSSHConnector", FakeSSHConnector):
-            output, _ = await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-a", "command": "rm -rf /var/tmp/cache"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=2,
-            )
-
-        self.assertEqual(2, FakeSSHConnector.confirmations)
-        self.assertEqual("removed", output)
-
-        with self.assertRaises(SafetyViolationError):
-            await execute_builtin_tool(
-                tool_name="run_ssh_command",
-                arguments={"node_name": "site-a", "command": "cat ~/.ssh/id_rsa"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=2,
-            )
-
-    def test_clickhouse_mutations_require_approval(self) -> None:
-        for sql in (
-            "DROP TABLE alarms",
-            "ALTER TABLE alarms DELETE WHERE id = 1",
-        ):
-            with self.subTest(sql=sql):
-                risk = classify_builtin_risk(
-                    tool_name="query_clickhouse",
-                    arguments={"sql": sql},
-                )
-                self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-    def test_multiple_sql_statements_are_rejected_by_validation(self) -> None:
-        with self.assertRaises(SafetyViolationError):
-            classify_builtin_risk(
-                tool_name="query_clickhouse",
-                arguments={"sql": "SELECT 1; DROP TABLE alarms"},
-            )
-
-    def test_clickhouse_select_requires_approval_even_when_read_only(self) -> None:
-        risk = classify_builtin_risk(
-            tool_name="query_clickhouse",
-            arguments={
-                "sql": "WITH 5 AS threshold SELECT * FROM alarms WHERE severity > threshold"
-            },
-        )
-        self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-    def test_clickhouse_system_database_select_is_read_only(self) -> None:
-        risk = classify_builtin_risk(
-            tool_name="query_clickhouse",
-            arguments={"sql": "SELECT count() FROM system.tables"},
-        )
-        self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-    def test_postgres_mutations_require_approval(self) -> None:
-        for sql in (
-            "DROP TABLE alarms",
-            "UPDATE inventory SET status = 'down'",
-        ):
-            with self.subTest(sql=sql):
-                risk = classify_builtin_risk(
-                    tool_name="query_postgres",
-                    arguments={"sql": sql},
-                )
-                self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-    def test_postgres_select_requires_approval_even_when_read_only(self) -> None:
-        risk = classify_builtin_risk(
-            tool_name="query_postgres",
-            arguments={"sql": "SELECT * FROM inventory LIMIT 1"},
-        )
-        self.assertEqual(ExecutionMode.REQUIRE_APPROVAL.value, risk)
-
-    async def test_postgres_mutation_only_executes_after_approval(self) -> None:
-        settings = types.SimpleNamespace(
-            EXTERNAL_POSTGRES_HOST="postgres.example.test",
-            EXTERNAL_POSTGRES_PORT=5432,
-            EXTERNAL_POSTGRES_USER="operator",
-            EXTERNAL_POSTGRES_PASSWORD="secret",
-            EXTERNAL_POSTGRES_DATABASE="telecom",
-            EXTERNAL_CONNECTOR_TIMEOUT_SECONDS=5,
-            QUERY_MAX_RESULT_ROWS=20,
-        )
-
-        with self.assertRaises(SafetyViolationError):
-            await execute_builtin_tool(
-                tool_name="query_postgres",
-                arguments={"sql": "UPDATE inventory SET status = 'down' WHERE id = 7"},
-                db=object(),
-                settings=settings,
-            )
-
-        class FakePostgresConnector:
-            read_only = None
-
-            def __init__(self, **kwargs):
-                FakePostgresConnector.read_only = kwargs["read_only"]
-
-            async def query(self, sql, params=None):
-                return [{"status": "SUCCESS", "affected_rows": 1}]
-
-            def close(self):
-                return None
-
-        with patch("app.agent.builtin_tools.TelcoPostgresConnector", FakePostgresConnector):
-            output, truncated = await execute_builtin_tool(
-                tool_name="query_postgres",
-                arguments={"sql": "UPDATE inventory SET status = 'down' WHERE id = 7"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        self.assertFalse(FakePostgresConnector.read_only)
-        self.assertIn('"affected_rows": 1', output)
-        self.assertFalse(truncated)
-
-    async def test_clickhouse_mutation_only_executes_after_approval(self) -> None:
-        settings = types.SimpleNamespace(
-            CLICKHOUSE_HOST="clickhouse.example.test",
-            CLICKHOUSE_PORT=8123,
-            CLICKHOUSE_USER="operator",
-            CLICKHOUSE_PASSWORD="secret",
-            CLICKHOUSE_DATABASE="telecom",
-            EXTERNAL_CONNECTOR_TIMEOUT_SECONDS=5,
-            QUERY_MAX_RESULT_ROWS=20,
-        )
-
-        with self.assertRaises(SafetyViolationError):
-            await execute_builtin_tool(
-                tool_name="query_clickhouse",
-                arguments={"sql": "ALTER TABLE alarms DELETE WHERE id = 7"},
-                db=object(),
-                settings=settings,
-            )
-
-        class FakeClickHouseConnector:
-            allow_mutation = None
-
-            def __init__(self, **kwargs):
-                pass
-
-            async def execute(self, sql, *, allow_mutation=False):
-                FakeClickHouseConnector.allow_mutation = allow_mutation
-                return [{"status": "SUCCESS"}]
-
-            def close(self):
-                return None
-
-        with patch("app.agent.builtin_tools.TelcoClickHouseConnector", FakeClickHouseConnector):
-            output, truncated = await execute_builtin_tool(
-                tool_name="query_clickhouse",
-                arguments={"sql": "ALTER TABLE alarms DELETE WHERE id = 7"},
-                db=object(),
-                settings=settings,
-                approval_confirmations=1,
-            )
-
-        self.assertTrue(FakeClickHouseConnector.allow_mutation)
-        self.assertIn('"status": "SUCCESS"', output)
-        self.assertFalse(truncated)
 
 
 class ExternalPostgresConnectorTests(unittest.TestCase):

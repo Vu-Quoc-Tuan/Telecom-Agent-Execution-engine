@@ -11,7 +11,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 from sqlalchemy.orm import Session
 
-from app.agent.builtin_tools import execute_builtin_tool
+from app.agent.builtin_runners import execute_builtin_tool
 from app.agent.graph import build_telecom_agent
 from app.agent.prompts import TELECOM_AGENT_PROMPT_VERSION
 from app.agent.safety import AgentSafetyGuard

@@ -10,8 +10,13 @@ from pydantic import BaseModel, Field
 from app.common.utils import extract_json_object
 from app.llm.gateway import LLMGateway
 from app.llm.schemas import LLMMessage, MessageRole
+from app.observability.langfuse import SKILL_DOMAIN_JUDGE_PROMPT_NAME, telemetry_tracker
 from app.observability.redaction import DataRedactor
 
+SKILL_DOMAIN_JUDGE_FALLBACK_PROMPT = (
+    "Đánh giá mức liên quan viễn thông của Skill từ 0.0 đến 1.0. "
+    "Tên: {{name}}. Mô tả: {{description}}. Mã Python:\n{{code_text}}"
+)
 SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT = (
     "Bạn chỉ được phép phản hồi DUY NHẤT một object JSON hợp lệ khớp chính xác "
     "định dạng yêu cầu (các khóa: domain_score, reason, suspicious_points). "
@@ -70,36 +75,43 @@ class TelecomDomainValidator:
         # Trả về tỷ lệ mật độ từ khóa khớp trên tổng tập từ khóa chuẩn
         return min(len(matched_keywords) / 4, 1.0)
 
+    @staticmethod
+    def _local_domain_judge_prompt(name: str, description: str, code_text: str) -> str:
+        variables = {
+            "name": name,
+            "description": description,
+            "code_text": code_text,
+        }
+        return re.sub(
+            r"\{\{(name|description|code_text)\}\}",
+            lambda match: variables[match.group(1)],
+            SKILL_DOMAIN_JUDGE_FALLBACK_PROMPT,
+        )
+
     @classmethod
     async def invoke_llm_domain_judge(
         cls, llm_gateway: LLMGateway, name: str, description: str, code_text: str
     ) -> LLMDomainJudgeOutput:
-        """🟢 LỚP 2: DÙNG LLM GATEWAY LÀM TRỌNG TÀI THẨM ĐỊNH LOGIC SÂU"""
-        prompt = f"""
-        Bạn là một chuyên gia kiểm toán quy trình và kiến trúc mạng Viễn thông cấp cao.
-        Hãy phân tích kịch bản tự động hóa (Skill) sau đây để xác định xem nó có thực sự phục vụ mục đích vận hành, xử lý sự cố mạng viễn thông không.
-
-        Thông tin kịch bản:
-        - Tên hàm: {name}
-        - Mô tả: {description}
-        - Mã nguồn Python:
-        {code_text}
-
-        Nhiệm vụ: Chấm điểm từ 0.0 (Không liên quan, ví dụ: hack game, download video, spam mail, đào coin) đến 1.0 (Tuyệt đối phục vụ Telco).
-        """
-
-        # Không ép response_format ở đây: param này chỉ hợp lệ với OpenAI-compatible API,
-        # còn Anthropic Messages API sẽ báo lỗi tham số. Thay vào đó ràng buộc JSON qua
-        # system prompt + parser tolerant bên dưới -> chạy đồng nhất trên mọi provider.
+        """DÙNG LLM GATEWAY LÀM TRỌNG TÀI THẨM ĐỊNH LOGIC SÂU"""
+        prompt_obj = telemetry_tracker.get_prompt(
+            SKILL_DOMAIN_JUDGE_PROMPT_NAME,
+            fallback_text=SKILL_DOMAIN_JUDGE_FALLBACK_PROMPT,
+        )
+        if prompt_obj is not None:
+            try:
+                prompt = prompt_obj.compile(
+                    name=name,
+                    description=description,
+                    code_text=code_text,
+                )
+            except Exception:
+                prompt = cls._local_domain_judge_prompt(name, description, code_text)
+        else:
+            prompt = cls._local_domain_judge_prompt(name, description, code_text)
         response = await llm_gateway.invoke(
             messages=[LLMMessage(role=MessageRole.USER, content=prompt)],
             system_prompt=SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT,
         )
-
-        # Parse chuỗi kết quả sang Pydantic Object để ép kiểu nghiêm ngặt.
-        # Một số OpenAI-compatible gateway không luôn tuân thủ system prompt tuyệt đối:
-        # response có thể bị bọc markdown, đổi tên key, hoặc trả score dạng "85%".
-        # Parser bên dưới chịu các biến thể đó nhưng vẫn fail-closed nếu không thấy dữ liệu rõ ràng.
         raw_content = response.content or ""
         try:
             data = cls._parse_judge_payload(raw_content)

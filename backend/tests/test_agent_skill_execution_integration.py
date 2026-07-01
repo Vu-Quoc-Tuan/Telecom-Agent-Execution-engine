@@ -189,20 +189,6 @@ class DeterministicGateway:
                 ],
             )
 
-        if "nginx" in lowered and "run_ssh_command" in tool_names:
-            return LLMResponse(
-                provider="fake",
-                model="deterministic",
-                finish_reason=FinishReason.TOOL,
-                tool_calls=[
-                    NormalizedToolCall(
-                        id="call-ssh",
-                        name="run_ssh_command",
-                        arguments={"node_name": "HNI-002", "command": "systemctl restart nginx"},
-                    )
-                ],
-            )
-
         forced_tool = getattr(getattr(options, "tool_choice", None), "tool_name", None)
         if forced_tool == "load_skill" and "load_skill" in tool_names:
             load_skill = next(tool for tool in tools if tool.name == "load_skill")
@@ -474,92 +460,6 @@ if __name__ == "__main__":
 
         self.assertTrue(tool_executed, "Agent must execute the ping_node tool.")
         print("[INTEGRATION TEST] Default built-in capability execution verified successfully.")
-
-    @patch("app.agent.builtin_tools._connector_is_configured", return_value=True)
-    async def test_adhoc_command_triggers_hitl_and_execution(self, mock_connector_configured):
-        from app.agent.nodes import execute_builtin_tool as real_execute
-
-        async def side_effect(tool_name, arguments, db, settings, approval_confirmations=0):
-            if tool_name == "run_ssh_command" and "systemctl restart nginx" in arguments.get(
-                "command", ""
-            ):
-                return ("nginx restarted successfully.", False)
-            return await real_execute(tool_name, arguments, db, settings, approval_confirmations)
-
-        # Create session
-        session = SessionRepository.create_session(self.db, title="Test Session SSH")
-        session_id = session.id
-        self.created_session_ids.append(session_id)
-
-        prompt = (
-            "Yêu cầu: Hãy khởi động lại dịch vụ nginx trên trạm HNI-002.\n"
-            "Bạn PHẢI sử dụng công cụ run_ssh_command với command='systemctl restart nginx' và node_name='HNI-002' để thực hiện."
-        )
-
-        # 1. Run the lifecycle. It should suspend because "systemctl restart nginx" is a state-changing ad-hoc command.
-        events_1 = []
-
-        with (
-            patch("app.agent.nodes.execute_builtin_tool", side_effect=side_effect),
-            patch("app.services.agent_execution.execute_builtin_tool", side_effect=side_effect),
-        ):
-            async for event_type, payload in AgentExecutionService.run_agent_lifecycle(
-                db=self.db,
-                llm_gateway=DeterministicGateway(),
-                session_id=session_id,
-                user_content=prompt,
-                provider="fake",
-                model="deterministic",
-            ):
-                events_1.append((event_type, payload))
-                print(f"[EVENT-1] {event_type}: {payload}")
-
-        # Assert run is suspended
-        suspended_events = [e for e in events_1 if e[0] == "run_suspended"]
-        self.assertEqual(len(suspended_events), 1, "Run should be suspended for operator approval.")
-
-        payload = suspended_events[0][1]
-        approval_id = uuid.UUID(payload["approval_request_id"])
-        self.assertEqual(payload["tool_name"], "run_ssh_command")
-
-        # 2. Operator approves the request and resumes the lifecycle
-        events_2 = []
-        with (
-            patch("app.agent.nodes.execute_builtin_tool", side_effect=side_effect),
-            patch("app.services.agent_execution.execute_builtin_tool", side_effect=side_effect),
-        ):
-            async for (
-                event_type,
-                payload,
-            ) in AgentExecutionService.resolve_approval_and_resume_lifecycle(
-                db=self.db,
-                llm_gateway=DeterministicGateway(),
-                approval_id=approval_id,
-                action="approved",
-            ):
-                events_2.append((event_type, payload))
-                print(f"[EVENT-2] {event_type}: {payload}")
-
-        # Assert completed
-        completion_events = [e for e in events_2 if e[0] == "run_completed"]
-        self.assertEqual(
-            len(completion_events), 1, "Agent execution should complete after approval."
-        )
-
-        # Verify tool call was completed and verified
-        timeline_events = [e for e in events_2 if e[0] == "timeline_updated"]
-        tool_executed = False
-        for te in timeline_events:
-            for step in te[1].get("steps", []):
-                if step.get("tool_name") == "run_ssh_command":
-                    tool_executed = True
-                    tool_input = step.get("tool_input", {})
-                    self.assertIn("systemctl restart nginx", tool_input.get("command", ""))
-                    self.assertEqual(step.get("tool_status"), "completed")
-                    self.assertFalse(step.get("is_error"))
-
-        self.assertTrue(tool_executed, "Agent must execute the approved run_ssh_command tool.")
-        print("[INTEGRATION TEST] Ad-hoc command with HITL approval verified successfully.")
 
 
 if __name__ == "__main__":
