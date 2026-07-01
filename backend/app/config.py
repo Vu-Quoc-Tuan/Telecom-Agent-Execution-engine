@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     SSH_NODE_HOST_MAP: str = ""
     SSH_KNOWN_HOSTS: str = ""
     SSH_AUTO_ADD_HOST_KEYS: bool = False
+    SSH_RESTART_ALLOWED_SERVICES: str = ""
 
     # Sandbox chạy run_skill_script bằng Docker container trên host.
     # SANDBOX_ENABLED=false để tắt hẳn; image/limits tuỳ chỉnh nếu cần.
@@ -73,6 +74,7 @@ class Settings(BaseSettings):
     SANDBOX_TIMEOUT_SECONDS: int = 30
     SANDBOX_MEMORY: str = "256m"
     SANDBOX_CPUS: str = "1.0"
+    SANDBOX_NETWORK: str = "none"
 
     EXTERNAL_CONNECTOR_TIMEOUT_SECONDS: int = 15
     QUERY_MAX_RESULT_ROWS: int = 1000
@@ -143,15 +145,16 @@ settings = Settings()
 
 
 def build_llm_gateway(configuration: Settings):
-    from app.llm.anthropic_provider import AnthropicAdapter, AnthropicConfig
     from app.llm.gateway import LLMGateway
-    from app.llm.openai_provider import OpenAICompatibleAdapter, OpenAICompatibleConfig
+    from app.llm.langchain_adapter import LangChainChatAdapter
+    from app.llm.langchain_model import LangChainChatConfig
 
     adapters = []
     if configuration.OPENAI_API_KEY:
         adapters.append(
-            OpenAICompatibleAdapter(
-                OpenAICompatibleConfig(
+            LangChainChatAdapter(
+                LangChainChatConfig(
+                    provider="openai",
                     model=configuration.OPENAI_MODEL_NAME,
                     api_key=configuration.OPENAI_API_KEY,
                     base_url=configuration.OPENAI_API_URL,
@@ -159,19 +162,23 @@ def build_llm_gateway(configuration: Settings):
                     max_retries=configuration.LLM_MAX_RETRIES,
                     default_max_tokens=configuration.LLM_MAX_TOKENS,
                     supports_tool_strict=configuration.openai_supports_tool_strict,
+                    stream_usage=True,
                 )
             )
         )
     if configuration.ANTHROPIC_API_KEY:
         adapters.append(
-            AnthropicAdapter(
-                AnthropicConfig(
+            LangChainChatAdapter(
+                LangChainChatConfig(
+                    provider="anthropic",
                     model=configuration.ANTHROPIC_MODEL_NAME,
                     api_key=configuration.ANTHROPIC_API_KEY,
                     base_url=configuration.ANTHROPIC_API_URL,
                     timeout_seconds=configuration.LLM_TIMEOUT_SECONDS,
                     max_retries=configuration.LLM_MAX_RETRIES,
                     default_max_tokens=configuration.LLM_MAX_TOKENS,
+                    supports_tool_strict=False,
+                    stream_usage=True,
                 )
             )
         )

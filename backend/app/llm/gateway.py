@@ -175,5 +175,3 @@ class LLMGateway:
         errors = [item for item in results if isinstance(item, Exception)]
         if errors:
             raise RuntimeError(f"Failed to close {len(errors)} LLM adapter(s)") from errors[0]
-
-

@@ -43,37 +43,12 @@ class LLMConfigurationError(LLMError):
     pass
 
 
-class LLMAuthenticationError(LLMError):
-    pass
-
-
-class LLMPermissionError(LLMError):
-    pass
-
-
-class LLMRateLimitError(LLMError):
-    pass
-
-
-class LLMTimeoutError(LLMError):
-    pass
-
-
-class LLMConnectionError(LLMError):
-    pass
-
-
 class LLMInvalidRequestError(LLMError):
     pass
 
 
 class LLMProviderUnavailableError(LLMError):
     pass
-
-
-class LLMResponseFormatError(LLMError):
-    pass
-
 
 
 class LLMAllProvidersFailedError(LLMError):

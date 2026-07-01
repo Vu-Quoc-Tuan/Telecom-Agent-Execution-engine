@@ -1,249 +1,220 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
 
-from app.llm.anthropic_provider import AnthropicAdapter
+from langchain_core.messages import AIMessage, AIMessageChunk
+
 from app.llm.exceptions import LLMAllProvidersFailedError, LLMProviderUnavailableError
-from app.llm.openai_provider import OpenAICompatibleAdapter, OpenAICompatibleConfig
 from app.llm.schemas import (
     FinishReason,
     LLMMessage,
     LLMRequestOptions,
     LLMToolDefinition,
     MessageRole,
-    NormalizedToolCall,
+    ToolChoice,
+    ToolChoiceMode,
 )
 
 
-class ProviderNormalizationTests(unittest.TestCase):
-    def test_openai_tool_calls_finish_reason_is_normalized(self) -> None:
-        self.assertEqual(
-            FinishReason.TOOL,
-            OpenAICompatibleAdapter._normalize_finish_reason("tool_calls"),
-        )
+class LangChainChatAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invoke_normalizes_langchain_tool_calls_and_usage(self) -> None:
+        from app.llm.langchain_adapter import LangChainChatAdapter
+        from app.llm.langchain_model import LangChainChatConfig
 
-    def test_anthropic_tool_use_finish_reason_is_normalized(self) -> None:
-        self.assertEqual(
-            FinishReason.TOOL,
-            AnthropicAdapter._normalize_finish_reason("tool_use"),
-        )
-
-
-class OpenAIStreamingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_tool_name_deltas_are_concatenated_without_deduplication(self) -> None:
-        class FakeStream:
+        class FakeChatModel:
             def __init__(self) -> None:
-                self.chunks = [
-                    SimpleNamespace(
-                        id="response-1",
-                        model="test-model",
-                        usage=None,
-                        choices=[
-                            SimpleNamespace(
-                                delta=SimpleNamespace(
-                                    content=None,
-                                    tool_calls=[
-                                        SimpleNamespace(
-                                            index=0,
-                                            id="call-1",
-                                            function=SimpleNamespace(name="query_", arguments="{}"),
-                                        )
-                                    ],
-                                ),
-                                finish_reason=None,
-                            )
-                        ],
-                    ),
-                    SimpleNamespace(
-                        id="response-1",
-                        model="test-model",
-                        usage=None,
-                        choices=[
-                            SimpleNamespace(
-                                delta=SimpleNamespace(
-                                    content=None,
-                                    tool_calls=[
-                                        SimpleNamespace(
-                                            index=0,
-                                            id=None,
-                                            function=SimpleNamespace(name="query_", arguments=None),
-                                        )
-                                    ],
-                                ),
-                                finish_reason="tool_calls",
-                            )
-                        ],
-                    ),
-                ]
+                self.bound_tools = None
+                self.bound_kwargs = None
+                self.messages = None
+                self.config = None
 
-            def __aiter__(self):
-                return self._iterate()
+            def bind_tools(self, tools, **kwargs):
+                self.bound_tools = tools
+                self.bound_kwargs = kwargs
+                return self
 
-            async def _iterate(self):
-                for chunk in self.chunks:
-                    yield chunk
+            async def ainvoke(self, messages, config=None):
+                self.messages = messages
+                self.config = config
+                return AIMessage(
+                    content="",
+                    id="msg-1",
+                    tool_calls=[
+                        {
+                            "name": "get_active_alarms",
+                            "args": {"limit": 5},
+                            "id": "call-1",
+                        }
+                    ],
+                    usage_metadata={
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                    response_metadata={
+                        "model_name": "fake-model",
+                        "finish_reason": "tool_calls",
+                    },
+                )
 
-            async def close(self) -> None:
-                return None
-
-        class FakeCompletions:
-            async def create(self, **params):
-                return FakeStream()
-
-        adapter = OpenAICompatibleAdapter(
-            OpenAICompatibleConfig(model="test-model", api_key="sk-test")
+        fake_model = FakeChatModel()
+        adapter = LangChainChatAdapter(
+            LangChainChatConfig(provider="openai", model="gpt-4o", api_key="sk-test")
         )
-        adapter._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+        adapter._chat_model = fake_model
+        response = await adapter.invoke(
+            [LLMMessage(role=MessageRole.USER, content="show alarms")],
+            system_prompt="system prompt",
+            tools=[
+                LLMToolDefinition(
+                    name="get_active_alarms",
+                    description="List active alarms.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"limit": {"type": "integer"}},
+                        "required": ["limit"],
+                    },
+                )
+            ],
+            options=LLMRequestOptions(
+                tool_choice=ToolChoice(mode=ToolChoiceMode.SPECIFIC, tool_name="get_active_alarms"),
+                parallel_tool_calls=False,
+            ),
+            callbacks=["callback"],
+        )
+
+        self.assertEqual(FinishReason.TOOL, response.finish_reason)
+        self.assertEqual("fake-model", response.model)
+        self.assertEqual("call-1", response.tool_calls[0].id)
+        self.assertEqual({"limit": 5}, response.tool_calls[0].arguments)
+        self.assertEqual(11, response.usage.input_tokens)
+        self.assertEqual(["callback"], fake_model.config["callbacks"])
+        self.assertEqual("get_active_alarms", fake_model.bound_kwargs["tool_choice"])
+        self.assertFalse(fake_model.bound_kwargs["parallel_tool_calls"])
+        self.assertTrue(fake_model.bound_tools[0]["function"]["strict"])
+
+    def test_non_strict_tool_keeps_optional_schema_fields(self) -> None:
+        from app.llm.langchain_model import to_langchain_tools
+
+        payload = to_langchain_tools(
+            [
+                LLMToolDefinition(
+                    name="search",
+                    description="Search with an optional filter.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "filter": {"type": "string"},
+                        },
+                        "required": ["query"],
+                    },
+                    strict=False,
+                )
+            ],
+            supports_strict=True,
+        )[0]["function"]
+
+        self.assertNotIn("strict", payload)
+        self.assertEqual(["query"], payload["parameters"]["required"])
+
+    async def test_tool_choice_none_skips_tool_binding(self) -> None:
+        from app.llm.langchain_adapter import LangChainChatAdapter
+        from app.llm.langchain_model import LangChainChatConfig
+
+        class FakeChatModel:
+            def bind_tools(self, tools, **kwargs):
+                raise AssertionError("tools must not be bound when tool_choice is none")
+
+            async def ainvoke(self, messages, config=None):
+                return AIMessage(
+                    content="No tool call",
+                    response_metadata={"model_name": "fake", "finish_reason": "stop"},
+                )
+
+        adapter = LangChainChatAdapter(
+            LangChainChatConfig(provider="anthropic", model="claude-test", api_key="sk-test")
+        )
+        adapter._chat_model = FakeChatModel()
+
+        response = await adapter.invoke(
+            [LLMMessage(role=MessageRole.USER, content="continue")],
+            tools=[
+                LLMToolDefinition(
+                    name="get_active_alarms",
+                    description="List active alarms.",
+                    input_schema={"type": "object", "properties": {}},
+                )
+            ],
+            options=LLMRequestOptions(
+                tool_choice=ToolChoice(mode=ToolChoiceMode.NONE),
+                parallel_tool_calls=False,
+            ),
+        )
+
+        self.assertEqual("No tool call", response.content)
+        self.assertEqual(FinishReason.STOP, response.finish_reason)
+
+    async def test_forwards_stop_sequences_to_langchain_model(self) -> None:
+        from app.llm.langchain_adapter import LangChainChatAdapter
+        from app.llm.langchain_model import LangChainChatConfig
+
+        class FakeChatModel:
+            def __init__(self) -> None:
+                self.call_kwargs = None
+
+            async def ainvoke(self, messages, config=None, **kwargs):
+                self.call_kwargs = kwargs
+                return AIMessage(
+                    content="done",
+                    response_metadata={"model_name": "fake", "finish_reason": "stop"},
+                )
+
+        fake_model = FakeChatModel()
+        adapter = LangChainChatAdapter(
+            LangChainChatConfig(provider="openai", model="gpt-4o", api_key="sk-test")
+        )
+        adapter._chat_model = fake_model
+
+        await adapter.invoke(
+            [LLMMessage(role=MessageRole.USER, content="hi")],
+            options=LLMRequestOptions(stop=["DONE", "END"]),
+        )
+
+        self.assertEqual(["DONE", "END"], fake_model.call_kwargs["stop"])
+
+    async def test_stream_emits_text_deltas_and_final_response(self) -> None:
+        from app.llm.langchain_adapter import LangChainChatAdapter
+        from app.llm.langchain_model import LangChainChatConfig
+
+        class FakeChatModel:
+            async def astream(self, messages, config=None):
+                yield AIMessageChunk(content="hel", response_metadata={"model_name": "fake"})
+                yield AIMessageChunk(
+                    content="lo",
+                    id="msg-2",
+                    usage_metadata={
+                        "input_tokens": 3,
+                        "output_tokens": 2,
+                        "total_tokens": 5,
+                    },
+                    response_metadata={"model_name": "fake", "finish_reason": "stop"},
+                )
+
+        adapter = LangChainChatAdapter(
+            LangChainChatConfig(provider="openai", model="gpt-4o", api_key="sk-test")
+        )
+        adapter._chat_model = FakeChatModel()
 
         chunks = [
             chunk
-            async for chunk in adapter.stream([LLMMessage(role=MessageRole.USER, content="run")])
+            async for chunk in adapter.stream([LLMMessage(role=MessageRole.USER, content="hi")])
         ]
 
-        self.assertEqual("query_query_", chunks[-1].final_response.tool_calls[0].name)
-
-
-class PerRequestModelOverrideTests(unittest.TestCase):
-    def _adapter(self) -> OpenAICompatibleAdapter:
-        return OpenAICompatibleAdapter(OpenAICompatibleConfig(model="gpt-4o", api_key="sk-test"))
-
-    def test_request_model_overrides_configured_model(self) -> None:
-        adapter = self._adapter()
-        params = adapter._build_request_params(
-            [LLMMessage(role=MessageRole.USER, content="hi")],
-            system_prompt=None,
-            tools=None,
-            options=LLMRequestOptions(model="gpt-4o-mini"),
-            stream=False,
-            provider_kwargs={},
-        )
-        self.assertEqual("gpt-4o-mini", params["model"])
-
-    def test_falls_back_to_configured_model_when_unset(self) -> None:
-        adapter = self._adapter()
-        params = adapter._build_request_params(
-            [LLMMessage(role=MessageRole.USER, content="hi")],
-            system_prompt=None,
-            tools=None,
-            options=None,
-            stream=False,
-            provider_kwargs={},
-        )
-        self.assertEqual("gpt-4o", params["model"])
-
-    def test_assistant_tool_call_history_omits_natural_language_content(self) -> None:
-        adapter = self._adapter()
-        params = adapter._build_request_params(
-            [
-                LLMMessage(
-                    role=MessageRole.ASSISTANT,
-                    content="Tôi sẽ kiểm tra bảng trước.",
-                    tool_calls=[
-                        NormalizedToolCall(
-                            id="call-1",
-                            name="query_clickhouse",
-                            arguments={"sql": "SHOW TABLES"},
-                        )
-                    ],
-                ),
-                LLMMessage(
-                    role=MessageRole.TOOL,
-                    tool_call_id="call-1",
-                    content='[{"name":"alarm"}]',
-                ),
-            ],
-            system_prompt=None,
-            tools=None,
-            options=None,
-            stream=False,
-            provider_kwargs={},
-        )
-
-        assistant_message = params["messages"][0]
-        self.assertIsNone(assistant_message["content"])
-        self.assertEqual("call-1", assistant_message["tool_calls"][0]["id"])
-
-    def test_tool_strict_serialization_uses_provider_capability_not_model_name(self) -> None:
-        tool = LLMToolDefinition(
-            name="query_clickhouse",
-            description="Query ClickHouse.",
-            input_schema={
-                "type": "object",
-                "properties": {"sql": {"type": "string"}},
-                "required": ["sql"],
-                "additionalProperties": False,
-            },
-        )
-
-        strict_capable = OpenAICompatibleAdapter(
-            OpenAICompatibleConfig(
-                model="mistral-large",
-                api_key="sk-test",
-                supports_tool_strict=True,
-            )
-        )
-        strict_params = strict_capable._build_request_params(
-            [LLMMessage(role=MessageRole.USER, content="hi")],
-            system_prompt=None,
-            tools=[tool],
-            options=LLMRequestOptions(model="mimo-router-model"),
-            stream=False,
-            provider_kwargs={},
-        )
-
-        strict_function = strict_params["tools"][0]["function"]
-        self.assertTrue(strict_function["strict"])
-
-        non_strict_capable = OpenAICompatibleAdapter(
-            OpenAICompatibleConfig(
-                model="gpt-4o",
-                api_key="sk-test",
-                supports_tool_strict=False,
-            )
-        )
-        non_strict_params = non_strict_capable._build_request_params(
-            [LLMMessage(role=MessageRole.USER, content="hi")],
-            system_prompt=None,
-            tools=[tool],
-            options=LLMRequestOptions(model="gpt-4.1"),
-            stream=False,
-            provider_kwargs={},
-        )
-
-        non_strict_function = non_strict_params["tools"][0]["function"]
-        self.assertNotIn("strict", non_strict_function)
-
-    def test_tool_definition_can_opt_out_of_strict_when_provider_supports_it(self) -> None:
-        tool = LLMToolDefinition(
-            name="query_clickhouse",
-            description="Query ClickHouse.",
-            input_schema={
-                "type": "object",
-                "properties": {"sql": {"type": "string"}},
-                "required": ["sql"],
-                "additionalProperties": False,
-            },
-            strict=False,
-        )
-        adapter = OpenAICompatibleAdapter(
-            OpenAICompatibleConfig(
-                model="gpt-4o",
-                api_key="sk-test",
-                supports_tool_strict=True,
-            )
-        )
-
-        params = adapter._build_request_params(
-            [LLMMessage(role=MessageRole.USER, content="hi")],
-            system_prompt=None,
-            tools=[tool],
-            options=None,
-            stream=False,
-            provider_kwargs={},
-        )
-
-        self.assertNotIn("strict", params["tools"][0]["function"])
+        self.assertEqual(["hel", "lo"], [c.content_delta for c in chunks[:2]])
+        self.assertTrue(chunks[-1].is_final)
+        self.assertEqual("hello", chunks[-1].final_response.content)
+        self.assertEqual(5, chunks[-1].final_response.usage.total_tokens)
 
 
 class LLMConfigTests(unittest.TestCase):

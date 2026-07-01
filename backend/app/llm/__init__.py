@@ -1,10 +1,7 @@
-from app.llm.anthropic_provider import AnthropicAdapter, AnthropicConfig
 from app.llm.base import BaseLLMAdapter, LLMAdapterConfig
 from app.llm.gateway import LLMGateway
-from app.llm.openai_provider import (
-    OpenAICompatibleAdapter,
-    OpenAICompatibleConfig,
-)
+from app.llm.langchain_adapter import LangChainChatAdapter
+from app.llm.langchain_model import LangChainChatConfig
 from app.llm.schemas import (
     FinishReason,
     LLMMessage,
@@ -21,10 +18,10 @@ from app.llm.schemas import (
 )
 
 __all__ = [
-    "AnthropicAdapter",
-    "AnthropicConfig",
     "BaseLLMAdapter",
     "FinishReason",
+    "LangChainChatAdapter",
+    "LangChainChatConfig",
     "LLMAdapterConfig",
     "LLMGateway",
     "LLMMessage",
@@ -34,8 +31,6 @@ __all__ = [
     "LLMToolDefinition",
     "MessageRole",
     "NormalizedToolCall",
-    "OpenAICompatibleAdapter",
-    "OpenAICompatibleConfig",
     "StreamEventType",
     "TokenUsage",
     "ToolChoice",
