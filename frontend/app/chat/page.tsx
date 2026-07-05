@@ -1318,10 +1318,11 @@ export default function ChatPage() {
           <button
             type="button"
             onClick={() => void createSession()}
-            className="flex h-9 items-center justify-center gap-2 rounded-lg border border-warm-border bg-surface-card px-4 text-xs font-medium transition hover:border-accent-active hover:bg-main-background"
+            aria-label="Phiên hội thoại mới"
+            className="flex h-9 w-11 items-center justify-center gap-2 rounded-lg border border-warm-border bg-surface-card text-xs font-medium transition hover:border-accent-active hover:bg-main-background sm:w-auto sm:px-4"
           >
             <PlusIcon className="h-4 w-4" />
-            Phiên hội thoại mới
+            <span className="hidden sm:inline">Phiên hội thoại mới</span>
           </button>
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-6">
