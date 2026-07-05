@@ -8,6 +8,12 @@ on:
         required: false
         default: "main"
         type: string
+      public_url:
+        description: "Single public URL for the edge proxy, for example https://xxx.ngrok-free.app."
+        required: false
+        default: ""
+        type: string
+
 
 concurrency:
   group: production-deploy
@@ -20,6 +26,9 @@ jobs:
 
     env:
       DEPLOY_BRANCH: ${{ inputs.branch }}
+      PUBLIC_URL_INPUT: ${{ inputs.public_url }}
+
+      UV_CACHE_DIR: /tmp/uv-cache
 
     steps:
       - name: Deploy application
@@ -34,28 +43,114 @@ jobs:
           git fetch origin "$branch"
           git reset --hard "origin/$branch"
 
+          touch .env
+
+          upsert_env() {
+            local key="$1"
+            local value="$2"
+            local file=".env"
+            if [[ -z "$value" ]]; then
+              return 0
+            fi
+            if grep -qE "^${key}=" "$file"; then
+              sed -i "s#^${key}=.*#${key}=${value}#" "$file"
+            else
+              printf "\n%s=%s\n" "$key" "$value" >> "$file"
+            fi
+          }
+
+          public_url="${PUBLIC_URL_INPUT%/}"
+
+          if [[ -n "$public_url" ]]; then
+            upsert_env NEXT_PUBLIC_API_BASE_URL "/api/v1"
+            upsert_env CORS_ORIGINS "$public_url,http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://127.0.0.1:3000"
+          fi
+
           cd backend
-          UV_CACHE_DIR=/tmp/uv-cache uv sync
+          uv sync
 
           set -a
           source ../.env
           set +a
 
-          UV_CACHE_DIR=/tmp/uv-cache uv run alembic upgrade head
+          uv run alembic upgrade head
           cd ..
 
-          docker compose up --build -d postgres frontend
+          case "${SANDBOX_ENABLED:-true}" in
+            true|TRUE|1|yes|YES)
+              sandbox_image="${SANDBOX_IMAGE:-telecom-agent-sandbox:latest}"
+              docker build -t "$sandbox_image" -f sandbox.Dockerfile .
+              ;;
+          esac
+
+          docker compose up --build -d --remove-orphans postgres frontend edge
 
           sudo systemctl restart telecom-backend
 
+          local_ready=0
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
-              echo "Backend healthy"
-              docker compose ps
-              exit 0
+            backend_health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health || true)"
+            edge_health="$(curl -fsS --max-time 5 http://127.0.0.1:8080/health || true)"
+            if [[ "$backend_health" == *'"service":"telecom-ai-agent-backend"'* ]] \
+              && [[ "$edge_health" == *'"service":"telecom-ai-agent-backend"'* ]] \
+              && curl -fsS --max-time 5 http://127.0.0.1:8080/chat >/dev/null; then
+              local_ready=1
+              break
             fi
             sleep 2
           done
 
-          sudo journalctl -u telecom-backend -n 80 --no-pager
-          exit 1
+          if [[ "$local_ready" != "1" ]]; then
+            echo "Local backend/edge/frontend health verification failed." >&2
+            docker compose ps
+            docker compose logs --tail=80 frontend edge
+            sudo journalctl -u telecom-backend -n 80 --no-pager
+            exit 1
+          fi
+
+          if [[ -n "$public_url" ]]; then
+            case "${NGROK_MANAGED:-false}" in
+              true|TRUE|1|yes|YES)
+                ngrok_config_path="${NGROK_CONFIG_PATH:-$HOME/.config/ngrok/ngrok.yml}"
+                ngrok_internal_url="${NGROK_INTERNAL_URL:-https://default.internal}"
+                ngrok_image="${NGROK_IMAGE:-ngrok/ngrok:latest}"
+                if [[ ! -f "$ngrok_config_path" ]]; then
+                  echo "Managed ngrok config does not exist: $ngrok_config_path" >&2
+                  exit 1
+                fi
+                docker rm -f telecom_agent_ngrok >/dev/null 2>&1 || true
+                docker run -d \
+                  --name telecom_agent_ngrok \
+                  --restart unless-stopped \
+                  --network host \
+                  -v "$ngrok_config_path:/etc/ngrok.yml:ro" \
+                  "$ngrok_image" \
+                  http http://127.0.0.1:8080 \
+                  --url "$ngrok_internal_url" \
+                  --config /etc/ngrok.yml \
+                  --log stdout
+                ;;
+            esac
+
+            public_ready=0
+            for _ in $(seq 1 15); do
+              public_health="$(
+                curl -fsS --max-time 10 \
+                  -H "ngrok-skip-browser-warning: deploy-healthcheck" \
+                  "$public_url/health" || true
+              )"
+              if [[ "$public_health" == *'"service":"telecom-ai-agent-backend"'* ]]; then
+                public_ready=1
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$public_ready" != "1" ]]; then
+              echo "Public ngrok endpoint is not forwarding to the deployed edge: $public_url" >&2
+              docker logs --tail=80 telecom_agent_ngrok 2>/dev/null || true
+              exit 1
+            fi
+          fi
+
+          echo "Backend, edge, frontend, and public endpoint are healthy."
+          docker compose ps

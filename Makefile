@@ -28,7 +28,8 @@ help:
 	@printf "Telecom Agent make targets\n\n"
 	@printf "Docker:\n"
 	@printf "  make up              Start DB + frontend + reloadable backend in background\n"
-	@printf "  make down            Stop backend, frontend, and database\n"
+	@printf "  PUBLIC_URL=... make up  Start for one-origin ngrok edge testing\n"
+	@printf "  make down            Stop backend, edge, frontend, and database\n"
 	@printf "  make restart         Restart the full local stack\n"
 	@printf "  make build           Build compose images\n"
 	@printf "  make rebuild         Rebuild images without cache and start\n"
@@ -82,12 +83,28 @@ up:
 	done; \
 	echo "Starting postgres + frontend containers"; \
 	echo "BACKEND_PORT=$$bport FRONTEND_PORT=$$fport"; \
+	local_cors_origins="http://localhost:$$fport,http://127.0.0.1:$$fport"; \
+	public_url=$${PUBLIC_URL:-}; \
+	public_url=$${public_url%/}; \
+	if [[ -n "$$public_url" ]]; then \
+		local_cors_origins="$$public_url,$$local_cors_origins"; \
+	fi; \
 	BACKEND_PORT=$$bport FRONTEND_PORT=$$fport \
 	NEXT_PUBLIC_API_BASE_URL=$${NEXT_PUBLIC_API_BASE_URL:-http://127.0.0.1:$$bport/api/v1} \
-	$(COMPOSE) up --build -d postgres frontend || exit 1; \
+	$(COMPOSE) up --build -d postgres frontend edge || exit 1; \
 	echo "Starting reloadable backend on http://127.0.0.1:$$bport"; \
 	cd "$(BACKEND_DIR)"; \
-	nohup setsid env UV_CACHE_DIR=/tmp/uv-cache uv run uvicorn app.main:app \
+	if command -v uv >/dev/null 2>&1; then \
+		backend_launcher=(uv run uvicorn app.main:app); \
+	elif [[ -x ".venv/bin/python" ]]; then \
+		backend_launcher=(.venv/bin/python -m uvicorn app.main:app); \
+	else \
+		echo "Neither 'uv' nor $(BACKEND_DIR)/.venv/bin/python is available. Run 'make setup-backend' first." >&2; \
+		exit 1; \
+	fi; \
+	nohup setsid env UV_CACHE_DIR=/tmp/uv-cache \
+		CORS_ORIGINS=$${CORS_ORIGINS:-$$local_cors_origins} \
+		"$${backend_launcher[@]}" \
 		--reload --host 0.0.0.0 --port $$bport \
 		>"$(BACKEND_LOG_FILE)" 2>&1 < /dev/null & \
 	backend_pid=$$!; \
@@ -152,7 +169,7 @@ build:
 
 rebuild:
 	$(COMPOSE) build --no-cache
-	$(COMPOSE) up -d postgres frontend
+	$(COMPOSE) up -d postgres frontend edge
 
 logs:
 	$(COMPOSE) logs -f
@@ -184,6 +201,7 @@ test-evals:
 	cd $(BACKEND_DIR) && PYTHONPATH=.. UV_CACHE_DIR=/tmp/uv-cache uv run pytest -q ../evals
 
 test-frontend:
+	cd $(FRONTEND_DIR) && npm test
 	cd $(FRONTEND_DIR) && npm run lint
 	cd $(FRONTEND_DIR) && npx tsc --noEmit
 	cd $(FRONTEND_DIR) && npm run build

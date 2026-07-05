@@ -91,6 +91,74 @@ The chat model picker reads `GET /api/v1/chat/options` and exposes the configure
 Claude adapters. Use `skill_mode: "auto"` without `skill_name` to let the agent choose a ready
 skill.
 
+## Ngrok Deploy
+
+ngrok free accounts include one automatically assigned Dev Domain. Use that stable domain with the
+local edge proxy so the browser sees a single public origin for both the frontend and `/api/v1`.
+
+Start the app stack in one-origin mode, then expose the edge port:
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=/api/v1 \
+PUBLIC_URL=https://karlene-thermostable-tabatha.ngrok-free.dev \
+make up
+```
+
+If your ngrok Cloud Endpoint traffic policy uses `forward-internal` to `https://default.internal`,
+run the agent against that internal URL:
+
+```bash
+ngrok http 8080 --url https://default.internal
+```
+
+The public URL remains the Cloud Endpoint URL shown in the ngrok dashboard, for example
+`https://karlene-thermostable-tabatha.ngrok-free.dev`.
+
+By default, the ngrok agent is managed outside the application stack and must already be running on
+the deploy host, typically as a systemd service or a long-running container. For a Docker agent
+while the edge remains loopback-only, use host networking:
+
+```bash
+docker run -d \
+  --name telecom_agent_ngrok \
+  --restart unless-stopped \
+  --network host \
+  -v "$HOME/.config/ngrok/ngrok.yml:/etc/ngrok.yml:ro" \
+  ngrok/ngrok:latest \
+  http http://127.0.0.1:8080 \
+  --url https://default.internal \
+  --config /etc/ngrok.yml \
+  --log stdout
+```
+
+Do not use Docker's default bridge with `host.docker.internal:8080` while the edge port is bound to
+`127.0.0.1`; the bridge gateway cannot reach that loopback-only listener.
+
+Alternatively, set `NGROK_MANAGED=true` and optionally `NGROK_CONFIG_PATH`,
+`NGROK_INTERNAL_URL`, and `NGROK_IMAGE` in the deploy host's `.env`. The `Deploy` workflow then
+recreates the agent with the host-network configuration above. When `public_url` is supplied, the
+workflow polls that URL and fails the deployment if the agent is not forwarding to the edge.
+
+When dispatching the `Deploy` workflow, set:
+
+```bash
+public_url=https://karlene-thermostable-tabatha.ngrok-free.dev
+```
+
+The workflow writes:
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=/api/v1
+CORS_ORIGINS=<public_url>,http://localhost:8080,http://127.0.0.1:8080,...
+```
+
+The `edge` service routes `/api/v1/*` to the FastAPI backend with buffering disabled, and routes
+everything else to the Next.js frontend. That keeps SSE streaming on one stable URL without needing
+two ngrok domains.
+
+The current application has no authentication. A public ngrok URL is suitable only for a trusted
+development/demo audience until authentication and authorization are implemented.
+
 ## Run Operations
 
 Cancel an active run:

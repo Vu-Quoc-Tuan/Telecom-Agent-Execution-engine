@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-telecom_agent}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_app_data:/var/lib/postgresql/data
     healthcheck:
@@ -21,17 +21,39 @@ services:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://127.0.0.1:8000/api/v1}
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api/v1}
     container_name: telecom_agent_frontend
     restart: unless-stopped
     environment:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api/v1}
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
+
+  edge:
+    image: nginx:1.27-alpine
+    container_name: telecom_agent_edge
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      BACKEND_PORT: ${BACKEND_PORT:-8000}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${EDGE_PORT:-8080}:8080"
+    volumes:
+      - ./deploy/nginx/ngrok-edge.conf:/etc/nginx/templates/default.conf.template:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
 # Backend chạy trên HOST bằng `make dev-backend` để có Docker CLI cho run_skill_script.
-# Browser (trên host) gọi backend qua 127.0.0.1:8000.
+# Public/ngrok traffic can use the edge service on port 8080:
+#   ngrok http 8080 --url https://default.internal
 
 volumes:
   postgres_app_data:

@@ -39,13 +39,21 @@ jobs:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: telecom_agent
+
+      # Keep test checkpointer in memory to avoid extra Postgres startup coupling.
       CHECKPOINTER_BACKEND: memory
+      # Disable the background sweeper during tests to avoid timing-sensitive failures.
       RUN_TIMEOUT_SWEEPER_ENABLED: "false"
+      # This job provisions PostgreSQL, so run the database-backed integration suite.
+      RUN_INTEGRATION_TESTS: "1"
+      # Store Promptfoo state in a temp dir cleaned up after the job.
       PROMPTFOO_CONFIG_DIR: /tmp/telecom-promptfoo
+      # Disable Promptfoo WAL/telemetry/cache for deterministic CI runs.
       PROMPTFOO_DISABLE_WAL_MODE: "true"
       PROMPTFOO_DISABLE_TELEMETRY: "true"
       PROMPTFOO_CACHE_ENABLED: "false"
       PROMPTFOO_VERSION: "0.121.17"
+      # Avoid running dependency postinstall scripts in CI.
       npm_config_ignore_scripts: "true"
 
     steps:
@@ -109,6 +117,10 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+        working-directory: frontend
+
+      - name: Test frontend
+        run: npm test
         working-directory: frontend
 
       - name: Lint frontend
