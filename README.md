@@ -53,11 +53,12 @@ passes those gates can be executed later by path as an approved skill script. Th
 the backend with `skill_name`, `script_path`, and JSON arguments; it should not copy script source
 into a free-form code execution tool.
 
-Runtime auto-execution is limited to approved skill scripts and backend-owned built-in
-capabilities. Model-generated Python, shell, SQL, SSH commands, wrappers, or script bodies are not
-pre-approved. They are rejected unless implemented as a reviewed skill script or backend-owned
-capability, even when a static scanner says they look safe. Infrastructure credentials, connector
-access, risk routing, and human approval stay under backend control.
+Backend-owned read-only capabilities may auto-execute. Every invocation of an approved skill
+script requires per-run human approval before the sandbox starts. Model-generated Python, shell,
+SQL, SSH commands, wrappers, or script bodies are not pre-approved. They are rejected unless
+implemented as a reviewed skill script or backend-owned capability, even when a static scanner says
+they look safe. Infrastructure credentials, connector access, risk routing, and human approval stay
+under backend control.
 
 Backend-owned capabilities are fixed runners/templates with JSON arguments, for example
 `get_site_alarm_summary`, `get_site_kpi_snapshot`, `get_site_inventory`,

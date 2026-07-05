@@ -44,7 +44,7 @@ flowchart TD
     %% Connections
     F --> G
     D --> I
-    I -->|No Network / Read-Only Workspace| G
+    I -->|Network denied by default / Read-Only Workspace| G
     D --> H
     H --> J & K & L
 ```
@@ -57,7 +57,7 @@ flowchart TD
 4. **Agent Skills Registry:** Manages user-uploaded skills packages structured according to the `agentskills.io` specification.
 5. **Security & Sandbox Layer:** Implements strict containment and validation rules:
    - **Static AST Scan:** Evaluates uploaded Python scripts to block unauthorized imports and system calls.
-   - **Docker Sandbox Executor:** Launches short-lived, network-isolated, CPU/memory-constrained containers to execute approved skill scripts.
+   - **Docker Sandbox Executor:** Launches short-lived, read-only, CPU/memory-constrained containers. Network access is denied by default and must be enabled explicitly for reviewed runtime skills.
    - **Safety Guards:** Filters runtime SQL commands (read-only enforcement) and SSH commands (command blocking and privilege escalation prevention).
 6. **Telemetry & Observability (Langfuse):** Logs execution traces, session runs, model invocation latency, input/output tokens, and hosts prompt templates versioned under the `production` tag.
 
@@ -90,7 +90,7 @@ To prevent token exhaustion during multi-turn diagnostic tasks, the engine enfor
 - `context_compaction_trigger_ratio` (Default: `0.65`): Compaction starts when estimated tokens exceed $65\%$ of the limit.
 - `context_compaction_target_ratio` (Default: `0.45`): Compaction trims history down to target $45\%$ of the limit.
 
-When triggered, the engine summarizes older turns into a single system message (`[AUTO-COMPACTED CONTEXT]`) while preserving recent turns and tool-calling parity.
+When triggered, the engine keeps recent turns and valid tool-call pairs, then asks the configured LLM to summarize the older prefix using the `telecom-context-compactor` prompt managed in Langfuse. The returned summary is inserted as a single system message (`[AUTO-COMPACTED CONTEXT]`).
 
 ---
 
@@ -101,9 +101,10 @@ When triggered, the engine summarizes older turns into a single system message (
 Every skill ZIP uploaded is verified against a strict pipeline:
 
 1. **Package & Structure Scan:** Verifies archive integrity, file path safety (no path traversal, no backslashes), file sizes (archive $\le 10$ MB, single file $\le 5$ MB), and confirms a valid `SKILL.md` is present.
-2. **Static AST Scan:** Parses Python code using `AdvancedASTSecurityAnalyzer` to block:
-   - System imports (`os`, `subprocess`, `sys`, `socket`, `paramiko`, etc.).
-   - Execution helpers (`eval`, `exec`, `getattr`, `__import__`).
+2. **Static AST Scan:** Parses Python code using `AdvancedASTSecurityAnalyzer` as a defense-in-depth review gate:
+   - Blocks process, reflection, background-execution, native-memory, and dynamic-import primitives such as `subprocess`, `sys`, `importlib`, and `ctypes`.
+   - Allows reviewed connection clients such as `requests`, `httpx`, and `paramiko`; runtime network access is still denied unless explicitly enabled.
+   - Blocks execution helpers (`eval`, `exec`, `getattr`, `__import__`) and shell/process calls such as `os.system`.
    - Private attributes (dunder references).
    - Sensitive file paths (`/etc/passwd`, `.env`, `id_rsa`).
 3. **Taxonomy Validation:** Scores telecom keyword occurrences in the skill definition to ensure relevance.
@@ -124,6 +125,9 @@ When the agent invokes an approved skill script using `run_skill_script`, three 
                v
   [Gate 2: Input JSON Schema Validation]  ---> Invalid? ---> [Abort & Raise Error]
                | (Matches parameters schema)
+               v
+  [Per-run Human Approval]
+               |
                v
   [Docker Sandbox Execution (Isolated)]
                |
@@ -149,3 +153,40 @@ Observability is handled via the **Langfuse SDK**, pushing traces asynchronously
 - **Trace Routing:** Every execution run starts a trace identified by `run_id` and grouped under `session_id`.
 - **DLP Redactor:** A local regex-based data loss prevention layer (`DataRedactor`) scrubs API keys, passwords, and private key strings from trace inputs/outputs, replacing them with `[[MASKED_SECRET]]` before they leave the host.
 - **Prompt Registry:** Prompt templates are fetched dynamically from the Langfuse registry using the `production` tag, enabling safe, live updates to safety prompts without code modification.
+
+## 5. CI and Evaluation Workflows
+
+Pull request / push main
+└── ci.yml
+    ├── pytest backend
+    ├── pytest evals
+    │   ├── test_provider.py
+    │   │   └── backend_policy.py
+    │   └── test_assertions.py
+    │       └── validate_agent_output.py
+    │
+    └── Promptfoo offline
+        └── promptfoo.yaml
+            ├── scenarios.yaml
+            ├── backend_policy.py
+            └── validate_agent_output.py
+
+
+Manual hoặc lịch hằng ngày
+└── online-eval.yml
+    ├── tải online_scenarios.yaml
+    ├── pytest evals
+    └── promptfoo.online.yaml
+        ├── online_scenarios.yaml
+        ├── backend_policy.py
+        └── validate_agent_output.py
+
+
+Manual only
+└── redteam.yml
+    ├── start PostgreSQL
+    ├── start backend
+    └── redteam.yaml
+        ├── OpenAI sinh prompt tấn công
+        └── backend_http.py
+            └── gọi Agent backend thật
