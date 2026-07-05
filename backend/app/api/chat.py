@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
@@ -89,14 +89,18 @@ async def stream_agent_conversation(
     llm_gateway = get_llm_gateway()
 
     provider = (body.provider or settings.PROVIDER).strip().lower()
+    if provider not in llm_gateway.providers:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unsupported LLM provider '{provider}'. "
+                f"Available providers: {', '.join(llm_gateway.providers) or 'none'}."
+            ),
+        )
     if body.model:
         model = body.model
-    elif provider in llm_gateway.providers:
-        model = llm_gateway.get_adapter(provider).model
     else:
-        model = (
-            settings.ANTHROPIC_MODEL_NAME if provider == "anthropic" else settings.OPENAI_MODEL_NAME
-        )
+        model = llm_gateway.get_adapter(provider).model
 
     # DB session phải sống xuyên suốt vòng đời của stream, không lấy từ Depends(get_db):
     # FastAPI đóng dependency-session ngay khi endpoint trả về StreamingResponse, trong khi

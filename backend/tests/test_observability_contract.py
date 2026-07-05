@@ -316,6 +316,20 @@ class SystemPromptBuildTests(unittest.TestCase):
         self.assertIn("## Skill vận hành khả dụng", prompt)
         self.assertIn("## Tài nguyên backend đang cấu hình", prompt)
 
+    @patch("app.agent.prompts.telemetry_tracker.get_prompt", return_value=None)
+    def test_build_context_compaction_prompt_uses_fallback(self, mock_get) -> None:
+        from app.agent.prompts import build_context_compaction_prompt
+        from app.observability.langfuse import CONTEXT_COMPACTOR_PROMPT_NAME
+
+        prompt = build_context_compaction_prompt()
+
+        self.assertIn("bộ nén lịch sử hội thoại", prompt)
+        self.assertIn("Không tạo tool call", prompt)
+        mock_get.assert_called_once_with(
+            CONTEXT_COMPACTOR_PROMPT_NAME,
+            fallback_text=unittest.mock.ANY,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

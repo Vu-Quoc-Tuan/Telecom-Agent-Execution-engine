@@ -1063,6 +1063,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch("app.agent.nodes.RunStepRepository.complete_step"),
             patch("app.agent.nodes.SkillRepository.list_ready_skills", return_value=[]),
             patch("app.agent.nodes.MessageRepository.list_pending_interventions", return_value=[]),
+            patch("app.agent.nodes.build_context_compaction_prompt") as build_compaction_prompt,
         ):
             result = await AgentNodes.call_llm_gateway(
                 state,
@@ -1088,6 +1089,7 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(gateway.options.temperature)
         self.assertIsNone(gateway.options.max_tokens)
         self.assertIsNone(gateway.options.timeout_seconds)
+        build_compaction_prompt.assert_not_called()
 
     async def test_call_llm_gateway_injects_pending_operator_interventions(self) -> None:
         from app.agent.nodes import AgentNodes

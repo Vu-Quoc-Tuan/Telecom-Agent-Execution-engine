@@ -1,4 +1,3 @@
-# backend/app/observability/langfuse.py
 from __future__ import annotations
 
 import os
@@ -20,6 +19,7 @@ from app.observability.redaction import DataRedactor
 
 # Tên prompt được quản lý tập trung trên Langfuse Prompt Management.
 PROMPT_NAME = "telecom-agent-system"
+CONTEXT_COMPACTOR_PROMPT_NAME = "telecom-context-compactor"
 SKILL_DOMAIN_JUDGE_PROMPT_NAME = "SKILL_DOMAIN_JUDGE_SYSTEM_PROMPT"
 
 
@@ -200,9 +200,6 @@ class LangfuseTelemetryTracker:
                         return metadata
                     return {k: v for k, v in metadata.items() if not k.startswith("langgraph_")}
 
-                # Chặn chain-level observations: LangChain tạo rất nhiều span
-                # "chain start/end" nội bộ (wrapper, serialized chain, ...) gây
-                # trùng lặp và làm cây trace Langfuse rất rối. Chỉ giữ LLM generation.
                 def on_chain_start(self, *args: Any, **kwargs: Any) -> Any:
                     pass
 

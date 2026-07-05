@@ -18,7 +18,7 @@ from app.agent.builtin_tools import (
     connector_name_for,
 )
 from app.agent.context_window import compact_messages_if_needed
-from app.agent.prompts import build_system_prompt
+from app.agent.prompts import build_context_compaction_prompt, build_system_prompt
 from app.agent.safety import AgentSafetyGuard
 from app.agent.state import AgentState
 from app.agent.tool_validation import validate_tool_call_arguments
@@ -107,6 +107,18 @@ def _sandbox_available(settings: Any) -> bool:
 
 
 class AgentNodes:
+    @staticmethod
+    def _record_llm_step_failure(db, step_id: uuid.UUID, exc: Exception) -> dict[str, str]:
+        db.rollback()
+        error_message = str(exc)
+        RunStepRepository.complete_step(
+            db=db,
+            step_id=step_id,
+            status="failed",
+            summary=error_message,
+        )
+        return {"execution_error": error_message}
+
     @staticmethod
     def _record_tool_validation_error(
         *,
@@ -219,8 +231,6 @@ class AgentNodes:
         RunStepRepository.complete_step(db=db, step_id=step_id, status=status, summary=output)
 
         # Ghi tool span con vào Langfuse dưới root span của lượt chạy hiện tại.
-        # QUAN TRỌNG: dùng run_uuid.hex (giống trace_run_start) để _ensure_root
-        # tìm đúng root span đã tạo, tránh tạo orphan observation.
         try:
             turn_index = telemetry_tracker.get_turn_index(run_uuid.hex)
             telemetry_tracker.trace_span(
@@ -583,14 +593,20 @@ class AgentNodes:
 
         context_window_tokens = _positive_int_config(run_config, "context_window_tokens", 200_000)
 
-        context_plan = compact_messages_if_needed(
-            messages_for_llm,
-            system_prompt=system_prompt,
-            tools=llm_tools,
-            context_window_tokens=context_window_tokens,
-            trigger_ratio=trigger_ratio,
-            target_ratio=target_ratio,
-        )
+        try:
+            context_plan = await compact_messages_if_needed(
+                messages_for_llm,
+                llm_gateway=llm_gateway,
+                compaction_prompt=build_context_compaction_prompt,
+                provider=provider,
+                system_prompt=system_prompt,
+                tools=llm_tools,
+                context_window_tokens=context_window_tokens,
+                trigger_ratio=trigger_ratio,
+                target_ratio=target_ratio,
+            )
+        except Exception as exc:
+            return AgentNodes._record_llm_step_failure(db, step.id, exc)
 
         langfuse_callback = telemetry_tracker.get_langchain_callback_handler(str(run_uuid))
         provider_kwargs: dict[str, Any] = {}
@@ -633,7 +649,6 @@ class AgentNodes:
                 status="completed",
                 summary=summary,
                 metadata={
-                    "usage": response.usage.model_dump(),
                     "model_used": response.model,
                     "context_window": {
                         "original_tokens_estimate": context_plan.original_tokens,
@@ -663,11 +678,7 @@ class AgentNodes:
                 "current_step_index": state.current_step_index + 1,
             }
         except Exception as exc:
-            db.rollback()
-            RunStepRepository.complete_step(
-                db=db, step_id=step.id, status="failed", summary=str(exc)
-            )
-            return {"execution_error": str(exc)}
+            return AgentNodes._record_llm_step_failure(db, step.id, exc)
 
     @staticmethod
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict[str, Any]:

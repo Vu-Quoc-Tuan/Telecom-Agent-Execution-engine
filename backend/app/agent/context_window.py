@@ -1,14 +1,27 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from langchain_core.messages.utils import count_tokens_approximately, trim_messages
 
 from app.agent.safety import AgentSafetyGuard
 from app.llm.langchain_messages import to_langchain_messages
 from app.llm.langchain_model import to_langchain_tools
-from app.llm.schemas import LLMMessage, LLMToolDefinition, MessageRole
+from app.llm.schemas import (
+    LLMMessage,
+    LLMRequestOptions,
+    LLMToolDefinition,
+    MessageRole,
+    ToolChoice,
+    ToolChoiceMode,
+)
+from app.observability.logging import app_logger
+from app.observability.redaction import DataRedactor
+
+if TYPE_CHECKING:
+    from app.llm.gateway import LLMGateway
 
 
 @dataclass(frozen=True)
@@ -53,15 +66,165 @@ def _trim_recent_messages(
     return []
 
 
-def compact_messages_if_needed(
+def _sanitize_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return AgentSafetyGuard.sanitize_input_prompt(DataRedactor.redact_text(value))
+
+
+def _sanitize_messages(messages: Sequence[LLMMessage]) -> list[LLMMessage]:
+    return [
+        message.model_copy(
+            update={
+                "content": _sanitize_text(message.content),
+                "tool_calls": [
+                    tool_call.model_copy(
+                        update={"arguments": DataRedactor.redact_dict(tool_call.arguments)}
+                    )
+                    for tool_call in message.tool_calls
+                ],
+            }
+        )
+        for message in messages
+    ]
+
+
+def _summarize_messages_deterministically(
+    messages: Sequence[LLMMessage], *, max_characters: int
+) -> str:
+    lines = ["Older conversation/tool outputs were compressed to protect the context window."]
+    for index, message in enumerate(messages, start=1):
+        prefix = f"{index}. {message.role.value}"
+        content = _preview(message.content)
+        if message.role is MessageRole.ASSISTANT and message.tool_calls:
+            tools = ", ".join(
+                f"{tool_call.name}({_preview(str(tool_call.arguments), limit=180)})"
+                for tool_call in message.tool_calls
+            )
+            lines.append(f"{prefix}: requested tool(s): {tools}; said: {content}")
+        elif message.role is MessageRole.TOOL:
+            lines.append(
+                f"{prefix}: tool_call_id={message.tool_call_id}; "
+                f"chars={len(message.content or '')}; output={content}"
+            )
+        else:
+            lines.append(f"{prefix}: {content}")
+
+    summary = "\n".join(lines)
+    if len(summary) <= max_characters:
+        return summary
+    return summary[:max_characters] + "\n... [DETERMINISTIC SUMMARY TRUNCATED] ..."
+
+
+def _preview(value: str | None, *, limit: int = 500) -> str:
+    normalized = " ".join((value or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _fit_compacted_messages(
+    summary: str,
+    retained: Sequence[LLMMessage],
+    *,
+    system_prompt: str | None,
+    tools: Sequence[LLMToolDefinition] | None,
+    max_tokens: int,
+) -> tuple[list[LLMMessage], int] | None:
+    def build(summary_text: str) -> list[LLMMessage]:
+        return [
+            LLMMessage(
+                role=MessageRole.SYSTEM,
+                content=f"[AUTO-COMPACTED CONTEXT]\n{summary_text}",
+            ),
+            *retained,
+        ]
+
+    full_messages = build(summary)
+    full_tokens = estimate_context_tokens(
+        full_messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
+    if full_tokens <= max_tokens:
+        return full_messages, full_tokens
+
+    empty_messages = build("")
+    empty_tokens = estimate_context_tokens(
+        empty_messages,
+        system_prompt=system_prompt,
+        tools=tools,
+    )
+    if empty_tokens > max_tokens:
+        return None
+
+    low = 0
+    high = len(summary)
+    best_messages = empty_messages
+    best_tokens = empty_tokens
+    while low <= high:
+        midpoint = (low + high) // 2
+        suffix = (
+            "\n... [SUMMARY TRUNCATED TO FIT CONTEXT BUDGET] ..."
+            if midpoint < len(summary)
+            else ""
+        )
+        candidate_messages = build(summary[:midpoint] + suffix)
+        candidate_tokens = estimate_context_tokens(
+            candidate_messages,
+            system_prompt=system_prompt,
+            tools=tools,
+        )
+        if candidate_tokens <= max_tokens:
+            best_messages = candidate_messages
+            best_tokens = candidate_tokens
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return best_messages, best_tokens
+
+
+async def _summarize_messages_with_llm(
     messages: Sequence[LLMMessage],
     *,
+    llm_gateway: LLMGateway,
+    compaction_prompt: str,
+    provider: str | None,
+    max_tokens: int,
+    timeout_seconds: float,
+) -> str:
+    response = await llm_gateway.invoke(
+        messages,
+        provider=provider,
+        system_prompt=compaction_prompt,
+        tools=[],
+        options=LLMRequestOptions(
+            temperature=0,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+            tool_choice=ToolChoice(mode=ToolChoiceMode.NONE),
+            parallel_tool_calls=False,
+        ),
+    )
+    summary = (response.content or "").strip()
+    if not summary:
+        raise RuntimeError("Context compactor returned an empty summary.")
+    return _sanitize_text(summary) or ""
+
+
+async def compact_messages_if_needed(
+    messages: Sequence[LLMMessage],
+    *,
+    llm_gateway: LLMGateway,
+    compaction_prompt: str | Callable[[], str],
+    provider: str | None = None,
     system_prompt: str | None = None,
     tools: Sequence[LLMToolDefinition] | None = None,
     context_window_tokens: int,
     trigger_ratio: float,
     target_ratio: float,
-    summary_max_characters: int = 6000,
+    summary_max_tokens: int = 1200,
+    summary_timeout_seconds: float = 30.0,
 ) -> ContextWindowPlan:
     threshold_tokens = max(1, int(context_window_tokens * trigger_ratio))
     original_tokens = estimate_context_tokens(
@@ -108,21 +271,50 @@ def compact_messages_if_needed(
             was_compacted=False,
         )
 
-    compacted_messages = [
-        LLMMessage(
-            role=MessageRole.SYSTEM,
-            content=_summarize_messages(
-                old_messages,
-                max_characters=summary_max_characters,
-            ),
-        ),
-        *retained,
-    ]
-    compacted_tokens = estimate_context_tokens(
-        compacted_messages,
+    sanitized_old_messages = _sanitize_messages(old_messages)
+    try:
+        resolved_prompt = compaction_prompt() if callable(compaction_prompt) else compaction_prompt
+        summary = await _summarize_messages_with_llm(
+            sanitized_old_messages,
+            llm_gateway=llm_gateway,
+            compaction_prompt=resolved_prompt,
+            provider=provider,
+            max_tokens=summary_max_tokens,
+            timeout_seconds=summary_timeout_seconds,
+        )
+    except Exception as exc:
+        app_logger.warning(
+            "LLM context compaction failed; using deterministic fallback (%s).",
+            type(exc).__name__,
+        )
+        summary = _summarize_messages_deterministically(
+            sanitized_old_messages,
+            max_characters=max(500, summary_max_tokens * 4),
+        )
+    fitted = _fit_compacted_messages(
+        summary,
+        retained,
         system_prompt=system_prompt,
         tools=tools,
+        max_tokens=min(target_tokens, original_tokens - 1),
     )
+    if fitted is None:
+        fitted = _fit_compacted_messages(
+            summary,
+            retained,
+            system_prompt=system_prompt,
+            tools=tools,
+            max_tokens=original_tokens - 1,
+        )
+    if fitted is None:
+        compacted_messages = list(retained)
+        compacted_tokens = estimate_context_tokens(
+            compacted_messages,
+            system_prompt=system_prompt,
+            tools=tools,
+        )
+    else:
+        compacted_messages, compacted_tokens = fitted
     return ContextWindowPlan(
         messages=compacted_messages,
         original_tokens=original_tokens,
@@ -130,45 +322,3 @@ def compact_messages_if_needed(
         threshold_tokens=threshold_tokens,
         was_compacted=True,
     )
-
-
-def _summarize_messages(messages: Sequence[LLMMessage], *, max_characters: int) -> str:
-    lines = [
-        "[AUTO-COMPACTED CONTEXT]",
-        "Older conversation/tool outputs were compressed to protect the LLM context window.",
-    ]
-    for index, message in enumerate(messages, start=1):
-        prefix = f"{index}. {message.role.value}"
-        content = _preview(message.content)
-        if message.role is MessageRole.ASSISTANT and message.tool_calls:
-            tools = ", ".join(
-                f"{tool_call.name}({_preview(str(tool_call.arguments), limit=180)})"
-                for tool_call in message.tool_calls
-            )
-            lines.append(f"{prefix}: requested tool(s): {tools}; said: {content}")
-            continue
-        if message.role is MessageRole.TOOL:
-            lines.append(
-                f"{prefix}: tool_call_id={message.tool_call_id}; "
-                f"chars={len(message.content or '')}; output={content}"
-            )
-            continue
-        lines.append(f"{prefix}: {content}")
-
-    summary = "\n".join(lines)
-    if len(summary) <= max_characters:
-        return summary
-    return (
-        summary[:max_characters]
-        + "\n... [AUTO-COMPACTION SUMMARY TRUNCATED TO FIT CONTEXT BUDGET] ..."
-    )
-
-
-def _preview(value: str | None, *, limit: int = 500) -> str:
-    if not value:
-        return ""
-    sanitized = AgentSafetyGuard.sanitize_input_prompt(value)
-    normalized = " ".join(sanitized.split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3] + "..."
