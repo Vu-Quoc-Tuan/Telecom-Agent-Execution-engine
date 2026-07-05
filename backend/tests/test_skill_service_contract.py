@@ -135,7 +135,7 @@ Instructions here.
         )
         manifest = repository.created[0].script_manifest
         self.assertIn("scripts/helper.py", manifest)
-        self.assertEqual("pending_sandbox", manifest["scripts/helper.py"]["status"])
+        self.assertEqual("passed", manifest["scripts/helper.py"]["status"])
         self.assertIn("sha256:", manifest["scripts/helper.py"]["script_hash"])
         self.assertEqual(
             {"type": "object", "additionalProperties": True},

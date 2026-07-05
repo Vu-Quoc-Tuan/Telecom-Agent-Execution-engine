@@ -1,4 +1,3 @@
-# backend/app/agent/safety.py
 from __future__ import annotations
 
 import posixpath
@@ -197,9 +196,9 @@ class AgentSafetyGuard:
             return ExecutionMode.AUTO_EXECUTE
         return ExecutionMode.REQUIRE_APPROVAL
 
-    @classmethod
+    @staticmethod
     @lru_cache(maxsize=128)
-    def verify_read_only_sql(cls, sql: str) -> tuple[bool, str | None]:
+    def verify_read_only_sql(sql: str) -> tuple[bool, str | None]:
         clean_sql = sql.strip()
         if not clean_sql:
             return False, "SQL query is empty."
@@ -211,15 +210,13 @@ class AgentSafetyGuard:
             return False, "Only one SQL statement is allowed."
 
         # Extract lowercase word tokens — note that underscores break words,
-        # so e.g. "update_count" becomes ["update", "count"]. This is acceptable
-        # because only tokens[0] is checked against keyword sets below.
         tokens = re.findall(r"\b[a-z][a-z0-9]*\b", statements[0].lower())
         if not tokens or tokens[0] not in {"select", "with", "describe", "desc", "show", "explain"}:
             return False, "Only SELECT, WITH, DESCRIBE, DESC, SHOW, or EXPLAIN queries are allowed."
         normalized_stmt = statements[0].lower()
-        if tokens[0] in cls.SQL_MUTATION_STATEMENT_KEYWORDS:
+        if tokens[0] in AgentSafetyGuard.SQL_MUTATION_STATEMENT_KEYWORDS:
             return False, f"SQL contains prohibited statement: {tokens[0]}."
-        for pattern in cls.SQL_PROHIBITED_READ_PATTERNS:
+        for pattern in AgentSafetyGuard.SQL_PROHIBITED_READ_PATTERNS:
             match = pattern.search(normalized_stmt)
             if match:
                 return False, f"SQL contains prohibited clause: {match.group(0).strip()}."

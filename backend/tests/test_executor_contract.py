@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent.builtin_runners import execute_builtin_tool
 from app.agent.builtin_tools import (
@@ -38,6 +44,113 @@ class FakeSkillRepository:
 
     def get_skill_by_name(self, db, name: str):
         return self.skill if self.skill.name == name else None
+
+
+class AlarmExtractionScriptTests(unittest.TestCase):
+    @staticmethod
+    def _script_path() -> Path:
+        return (
+            Path(__file__).resolve().parents[2]
+            / "Agent_skill/noc-alarm-enrichment/scripts/extract_content.py"
+        )
+
+    @classmethod
+    def _run_script(cls, arguments: dict) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as workspace:
+            Path(workspace, "args.json").write_text(json.dumps(arguments), encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, str(cls._script_path())],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_args_json_accepts_native_pattern_object(self) -> None:
+        sandbox_arguments = {
+            "text": "Alarm INC-1234 on 10.0.0.1",
+            "patterns": {"ticket_ids": r"\bINC-[0-9]+\b"},
+        }
+
+        completed = self._run_script(sandbox_arguments)
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("", completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(["INC-1234"], result["extracted"]["ticket_ids"])
+
+    def test_args_json_rejects_non_object_patterns(self) -> None:
+        completed = self._run_script(
+            {"text": "Alarm INC-1234 on 10.0.0.1", "patterns": ["not-an-object"]}
+        )
+
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("patterns must be a JSON object", completed.stderr)
+
+    def test_requires_text_or_input_instead_of_returning_mock_data(self) -> None:
+        completed = self._run_script({})
+
+        self.assertEqual(2, completed.returncode)
+        self.assertIn("one of --text or --input is required", completed.stderr)
+
+    def test_script_passes_the_same_security_analyzer_used_during_upload(self) -> None:
+        from app.sandbox.security_analyzer import AdvancedASTSecurityAnalyzer
+
+        allowed, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(
+            self._script_path().read_text(encoding="utf-8")
+        )
+
+        self.assertTrue(allowed, findings)
+
+
+class AlarmEnrichmentScriptTests(unittest.TestCase):
+    @staticmethod
+    def _run_script(arguments: dict) -> subprocess.CompletedProcess[str]:
+        script_path = (
+            Path(__file__).resolve().parents[2]
+            / "Agent_skill/noc-alarm-enrichment/scripts/run_enrichment.py"
+        )
+        environment = os.environ.copy()
+        for key in ("CH_HOST", "PG_DSN"):
+            environment.pop(key, None)
+        with tempfile.TemporaryDirectory() as workspace:
+            Path(workspace, "args.json").write_text(json.dumps(arguments), encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_missing_database_config_fails_closed_without_dry_run(self) -> None:
+        completed = self._run_script({"alarm_type": "LINK_DOWN"})
+
+        self.assertEqual(2, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertIn("database connection settings are required", completed.stderr)
+
+    def test_explicit_dry_run_still_returns_simulated_pipeline(self) -> None:
+        completed = self._run_script({"alarm_type": "LINK_DOWN", "dry_run": True})
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertGreater(len(result), 0)
+        self.assertTrue(all("enrichment" in alarm for alarm in result))
+
+    def test_script_passes_the_same_security_analyzer_used_during_upload(self) -> None:
+        from app.sandbox.security_analyzer import AdvancedASTSecurityAnalyzer
+
+        script_path = (
+            Path(__file__).resolve().parents[2]
+            / "Agent_skill/noc-alarm-enrichment/scripts/run_enrichment.py"
+        )
+        allowed, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(
+            script_path.read_text(encoding="utf-8")
+        )
+
+        self.assertTrue(allowed, findings)
 
 
 class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -103,6 +216,31 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             ["get_active_alarms", "get_site_alarm_summary", "get_site_kpi_snapshot"],
             [item["name"] for item in summaries],
         )
+
+    def test_run_skill_script_requires_per_run_human_approval(self) -> None:
+        arguments = {
+            "skill_name": "node-health-autoremediate",
+            "script_path": "scripts/health_action.py",
+            "arguments": {"execute": True},
+        }
+
+        self.assertEqual(
+            ExecutionMode.REQUIRE_APPROVAL.value,
+            classify_builtin_risk("run_skill_script", arguments),
+        )
+
+    async def test_run_skill_script_cannot_bypass_approval_via_direct_dispatch(self) -> None:
+        with self.assertRaisesRegex(SkillRuntimeError, "phê duyệt"):
+            await execute_builtin_tool(
+                tool_name="run_skill_script",
+                arguments={
+                    "skill_name": "node-health-autoremediate",
+                    "script_path": "scripts/health_action.py",
+                    "arguments": {"execute": True},
+                },
+                db=object(),
+                approval_confirmations=0,
+            )
 
     async def test_free_form_sandbox_tool_is_fully_removed(self) -> None:
         self.assertNotIn("execute_python_in_sandbox", BUILTIN_TOOL_NAMES)
@@ -180,8 +318,6 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                     SSH_USER="noc",
                     SSH_PASSWORD="pwd",
                     SSH_TIMEOUT_SECONDS=5,
-                    SSH_KNOWN_HOSTS="",
-                    SSH_AUTO_ADD_HOST_KEYS=False,
                 ),
             )
 
@@ -282,8 +418,6 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                     SSH_USER="noc",
                     SSH_PASSWORD="pwd",
                     SSH_TIMEOUT_SECONDS=5,
-                    SSH_KNOWN_HOSTS="",
-                    SSH_AUTO_ADD_HOST_KEYS=False,
                 ),
             )
 
@@ -303,8 +437,6 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             SSH_USER="noc",
             SSH_PASSWORD="pwd",
             SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
             SSH_RESTART_ALLOWED_SERVICES="nginx,node-exporter",
         )
         tools = build_builtin_tool_definitions([], settings=settings)
@@ -338,8 +470,6 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             SSH_USER="noc",
             SSH_PASSWORD="pwd",
             SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
             SSH_RESTART_ALLOWED_SERVICES="nginx, bad service, nginx;reboot",
         )
 
@@ -379,8 +509,6 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             SSH_USER="noc",
             SSH_PASSWORD="pwd",
             SSH_TIMEOUT_SECONDS=5,
-            SSH_KNOWN_HOSTS="",
-            SSH_AUTO_ADD_HOST_KEYS=False,
             SSH_RESTART_ALLOWED_SERVICES="nginx",
         )
 
@@ -396,7 +524,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(truncated)
         self.assertIn("systemctl restart nginx", output)
         self.assertEqual(
-            [("systemctl restart nginx", 1), ("systemctl is-active nginx", 0)],
+            [("systemctl restart nginx", 1), ("systemctl is-active nginx", 1)],
             FakeSSHConnector.commands,
         )
 
@@ -552,6 +680,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                     },
                     db=object(),
                     settings=types.SimpleNamespace(SANDBOX_ENABLED=True),
+                    approval_confirmations=1,
                 )
 
         finally:
@@ -596,6 +725,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                         "arguments": {},
                     },
                     db=object(),
+                    approval_confirmations=1,
                 )
         finally:
             SkillRepository.get_skill_by_name = orig_get
@@ -650,6 +780,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                         "arguments": {"site_id": "site-a", "window_minutes": 0},
                     },
                     db=object(),
+                    approval_confirmations=1,
                 )
         finally:
             SkillRepository.get_skill_by_name = orig_get
@@ -716,6 +847,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                         },
                         db=object(),
                         settings=types.SimpleNamespace(SANDBOX_ENABLED=True),
+                        approval_confirmations=1,
                     )
         finally:
             SkillRepository.get_skill_by_name = orig_get
@@ -744,7 +876,7 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(SkillRuntimeError):
                     await execute_builtin_tool(tool_name=tool_name, arguments={}, db=object())
 
-    async def test_ssh_known_hosts_error_explains_trust_configuration(self) -> None:
+    async def test_ssh_connector_error_reports_host_and_port(self) -> None:
         from app.connectors.ssh import TelcoSSHConnector
 
         connector = TelcoSSHConnector(
@@ -754,18 +886,54 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             port=2222,
         )
 
-        async def raise_known_hosts_error(*args, **kwargs):
-            raise RuntimeError("Server '[host.test]:2222' not found in known_hosts")
+        async def raise_connection_error(*args, **kwargs):
+            raise RuntimeError("connection failed")
 
-        with patch("app.connectors.ssh.asyncio.to_thread", raise_known_hosts_error):
+        with patch("app.connectors.ssh.asyncio.to_thread", raise_connection_error):
             with self.assertRaises(ConnectorExecutionError) as ctx:
                 await connector.execute_command("hostname")
 
-        self.assertIn("known_hosts", ctx.exception.message)
-        self.assertIn("SSH_KNOWN_HOSTS", ctx.exception.message)
-        self.assertNotIn("SSH_AUTO_ADD_HOST_KEYS=true", ctx.exception.message)
+        self.assertIn("connection failed", ctx.exception.message)
         self.assertEqual("host.test", ctx.exception.details["host"])
         self.assertEqual(2222, ctx.exception.details["port"])
+
+    def test_ssh_connector_rejects_unknown_host_keys_by_default(self) -> None:
+        import paramiko
+
+        from app.connectors.ssh import TelcoSSHConnector
+
+        ssh_client = MagicMock()
+        with patch("app.connectors.ssh.paramiko.SSHClient", return_value=ssh_client):
+            connector = TelcoSSHConnector(
+                host="host.test",
+                username="noc",
+                password="pwd",
+                port=2222,
+            )
+            connector.connect()
+
+        ssh_client.load_system_host_keys.assert_called_once_with()
+        policy = ssh_client.set_missing_host_key_policy.call_args.args[0]
+        self.assertIsInstance(policy, paramiko.RejectPolicy)
+
+    def test_ssh_connector_can_auto_trust_host_keys_when_explicitly_enabled(self) -> None:
+        import paramiko
+
+        from app.connectors.ssh import TelcoSSHConnector
+
+        ssh_client = MagicMock()
+        with patch("app.connectors.ssh.paramiko.SSHClient", return_value=ssh_client):
+            connector = TelcoSSHConnector(
+                host="host.test",
+                username="noc",
+                password="pwd",
+                port=2222,
+                auto_add_host_keys=True,
+            )
+            connector.connect()
+
+        policy = ssh_client.set_missing_host_key_policy.call_args.args[0]
+        self.assertIsInstance(policy, paramiko.AutoAddPolicy)
 
 
 class ExternalPostgresConnectorTests(unittest.TestCase):
@@ -836,7 +1004,7 @@ class ClickHouseConnectorSafetyTests(unittest.TestCase):
 
 
 class DockerSandboxExecutorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_skill_script_writes_args_json_and_builds_docker_command(self) -> None:
+    def test_skill_script_writes_args_json_and_builds_docker_command(self) -> None:
         from app.sandbox.docker_executor import SANDBOX_WORKSPACE_DIR, DockerSandboxExecutor
 
         captured: dict[str, object] = {}
@@ -853,12 +1021,11 @@ class DockerSandboxExecutorTests(unittest.IsolatedAsyncioTestCase):
             patch("app.sandbox.docker_executor.shutil.which", return_value="/usr/bin/docker"),
             patch("app.sandbox.docker_executor.subprocess.run", side_effect=fake_run),
         ):
-            result = await executor.execute_skill_script(
-                script_path="scripts/check.py",
-                arguments={},
-                bundled_files={
-                    "scripts/check.py": {"encoding": "utf-8", "content": "print('latency ok')\n"}
-                },
+            result = executor._run_in_container(
+                "scripts/check.py",
+                {},
+                {"scripts/check.py": {"encoding": "utf-8", "content": "print('latency ok')\n"}},
+                None,
             )
 
         self.assertEqual("latency ok", result.stdout)
@@ -868,13 +1035,59 @@ class DockerSandboxExecutorTests(unittest.IsolatedAsyncioTestCase):
         command = captured["command"]
         self.assertIn("--network", command)
         self.assertIn("none", command)
+        self.assertIn("--read-only", command)
+        self.assertIn("--cap-drop", command)
+        self.assertIn("ALL", command)
+        self.assertIn("--security-opt", command)
+        self.assertIn("no-new-privileges", command)
         self.assertIn(SANDBOX_WORKSPACE_DIR, command)
+        workspace_mount = command[command.index("-v") + 1]
+        self.assertTrue(workspace_mount.endswith(f":{SANDBOX_WORKSPACE_DIR}:ro"))
         self.assertEqual(
             ["python:3.12-slim", "python3", "scripts/check.py"],
             command[-3:],
         )
 
-    async def test_skill_script_passes_spaced_path_as_single_argv(self) -> None:
+    async def test_upload_validation_forces_no_network_and_does_not_forward_credentials(
+        self,
+    ) -> None:
+        from app.sandbox.docker_executor import DockerSandboxExecutor, SandboxExecutionResult
+
+        executor = DockerSandboxExecutor(
+            network="host",
+            extra_env={"PG_DSN": "postgresql://secret", "SSH_PASSWORD": "secret"},
+        )
+        result = SandboxExecutionResult(stdout="{}", stderr="", exit_code=0)
+        with patch(
+            "app.sandbox.docker_executor.asyncio.to_thread",
+            new=AsyncMock(return_value=result),
+        ) as to_thread:
+            await executor.validate_skill_script(
+                script_path="scripts/check.py",
+                bundled_files={
+                    "scripts/check.py": {
+                        "encoding": "utf-8",
+                        "content": "print('{}')\n",
+                    }
+                },
+            )
+
+        call_args = to_thread.call_args.args
+        self.assertEqual("none", call_args[-2])
+        self.assertFalse(call_args[-1])
+
+        with tempfile.TemporaryDirectory() as workspace:
+            command = executor._docker_run_command(
+                Path(workspace),
+                "skill_sb_test",
+                "scripts/check.py",
+                network="none",
+                forward_connection_env=False,
+            )
+        self.assertEqual("none", command[command.index("--network") + 1])
+        self.assertNotIn("-e", command)
+
+    def test_skill_script_passes_spaced_path_as_single_argv(self) -> None:
         from app.sandbox.docker_executor import DockerSandboxExecutor
 
         captured: dict[str, object] = {}
@@ -888,12 +1101,12 @@ class DockerSandboxExecutorTests(unittest.IsolatedAsyncioTestCase):
             patch("app.sandbox.docker_executor.shutil.which", return_value="/usr/bin/docker"),
             patch("app.sandbox.docker_executor.subprocess.run", side_effect=fake_run),
         ):
-            await executor.execute_skill_script(script_path="scripts/check latency.py")
+            executor._run_in_container("scripts/check latency.py", {}, {}, None)
 
         # Không dùng shell → đường dẫn có khoảng trắng vẫn là MỘT phần tử argv, không cần quote.
         self.assertEqual("scripts/check latency.py", captured["command"][-1])
 
-    async def test_skill_script_reports_timeout(self) -> None:
+    def test_skill_script_reports_timeout(self) -> None:
         import subprocess
 
         from app.sandbox.docker_executor import DockerSandboxExecutor
@@ -906,18 +1119,18 @@ class DockerSandboxExecutorTests(unittest.IsolatedAsyncioTestCase):
             patch("app.sandbox.docker_executor.shutil.which", return_value="/usr/bin/docker"),
             patch("app.sandbox.docker_executor.subprocess.run", side_effect=fake_run),
         ):
-            result = await executor.execute_skill_script(script_path="scripts/slow.py")
+            result = executor._run_in_container("scripts/slow.py", {}, {}, None)
 
         self.assertTrue(result.timed_out)
         self.assertEqual(124, result.exit_code)
 
-    async def test_skill_script_requires_docker_on_host(self) -> None:
+    def test_skill_script_requires_docker_on_host(self) -> None:
         from app.sandbox.docker_executor import DockerSandboxExecutor
 
         executor = DockerSandboxExecutor()
         with patch("app.sandbox.docker_executor.shutil.which", return_value=None):
             with self.assertRaises(SkillRuntimeError) as ctx:
-                await executor.execute_skill_script(script_path="scripts/check.py")
+                executor._run_in_container("scripts/check.py", {}, {}, None)
 
         self.assertIn("Docker", ctx.exception.message)
 

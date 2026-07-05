@@ -1,14 +1,14 @@
-import json
 import argparse
-import pydoc
 import codecs
+import json
+import os
 import shlex
+import time
 
-# Load optional runtime modules for the trusted demo runner.
-sys = pydoc.locate("sys")
-os = pydoc.locate("os")
-subprocess = pydoc.locate("subprocess")
-paramiko = pydoc.locate("paramiko")
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
 
 REMOTE_METRICS_SH = """#!/bin/sh
 total_mem=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
@@ -57,13 +57,23 @@ disk_pct=$(df / | tail -n 1 | awk '{print $5}' | tr -d '%')
 printf '{"mem_pct": %s, "cpu_pct": %s, "load1": %s, "disk_pct": %s}\\n' "$mem_pct" "$cpu_pct" "$load1" "$disk_pct"
 """
 
-def run_remote_ssh(host, port, user, ssh_pass, key_path, cmd, stdin_data=None):
+def run_remote_ssh(
+    host,
+    port,
+    user,
+    ssh_pass,
+    key_path,
+    known_hosts_path,
+    cmd,
+    stdin_data=None,
+):
     """Executes a command on a remote node via SSH using paramiko."""
     if not paramiko:
         raise ImportError("paramiko is not available")
 
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.load_host_keys(known_hosts_path)
+    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
 
     try:
         if key_path:
@@ -98,6 +108,11 @@ def main():
     parser.add_argument("--port", type=int, default=22, help="SSH port")
     parser.add_argument("--passcode", help="SSH password")
     parser.add_argument("--ssh-key", help="Path to SSH private key")
+    parser.add_argument(
+        "--known-hosts",
+        default="known_hosts",
+        help="Trusted known_hosts file used to verify the SSH server fingerprint",
+    )
     parser.add_argument("--log-lines", type=int, default=200, help="Lines of log to tail")
     parser.add_argument("--execute", action="store_true", help="Execute the remediation actions")
     parser.add_argument("--from-json", help="Read metrics from JSON file/string or '-' for stdin")
@@ -157,6 +172,11 @@ def main():
             elif "ssh-key" in sandbox_args:
                 args.ssh_key = sandbox_args["ssh-key"]
 
+            if "known_hosts" in sandbox_args:
+                args.known_hosts = sandbox_args["known_hosts"]
+            elif "known-hosts" in sandbox_args:
+                args.known_hosts = sandbox_args["known-hosts"]
+
             # Log lines
             if "log_lines" in sandbox_args:
                 args.log_lines = int(sandbox_args["log_lines"])
@@ -183,7 +203,7 @@ def main():
     metrics = None
     if args.from_json:
         if args.from_json == "-":
-            raw_input = sys.stdin.read().strip()
+            parser.error("--from-json - is not supported; provide JSON or a workspace-relative path")
         else:
             if os.path.exists(args.from_json):
                 with codecs.open(args.from_json, "r", encoding="utf-8") as f:
@@ -212,7 +232,7 @@ def main():
             # We run the script contents directly via standard input of a shell
             ssh_pass = os.environ.get("SSH_PASSWORD") or args.passcode
             exit_code, out_text, err_text = run_remote_ssh(
-                args.host, args.port, args.user, ssh_pass, args.ssh_key,
+                args.host, args.port, args.user, ssh_pass, args.ssh_key, args.known_hosts,
                 "sh", stdin_data=REMOTE_METRICS_SH
             )
             if exit_code != 0:
@@ -220,7 +240,7 @@ def main():
                     "error": f"Failed to get remote metrics: exit code {exit_code}",
                     "stderr": err_text
                 }))
-                sys.exit(1)
+                return
             metrics = json.loads(out_text.strip())
 
     # 2. Evaluate Decision Tree
@@ -245,7 +265,7 @@ def main():
         command = None
 
     result = {
-        "timestamp": pydoc.locate("time").strftime("%Y-%m-%dT%H:%M:%SZ", pydoc.locate("time").gmtime()) if pydoc.locate("time") else "2026-07-01T12:00:00Z",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": args.host,
         "thresholds": {
             "ram": args.ram_threshold,
@@ -271,7 +291,7 @@ def main():
         else:
             ssh_pass = os.environ.get("SSH_PASSWORD") or args.passcode
             exit_code, out_text, err_text = run_remote_ssh(
-                args.host, args.port, args.user, ssh_pass, args.ssh_key,
+                args.host, args.port, args.user, ssh_pass, args.ssh_key, args.known_hosts,
                 command
             )
             result["executed"] = True

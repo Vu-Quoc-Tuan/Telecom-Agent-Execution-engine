@@ -1,4 +1,5 @@
 # backend/tests/test_agent_skill_execution_integration.py
+# Chạy full suite: RUN_INTEGRATION_TESTS=1 pytest tests/test_agent_skill_execution_integration.py
 import asyncio
 import io
 import json
@@ -217,6 +218,10 @@ class DeterministicGateway:
         )
 
 
+@unittest.skipUnless(
+    os.getenv("RUN_INTEGRATION_TESTS") == "1",
+    "Integration tests require RUN_INTEGRATION_TESTS=1 and a live PostgreSQL database.",
+)
 class AgentSkillExecutionIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.db = SessionLocal()
@@ -353,10 +358,11 @@ if __name__ == "__main__":
         print(f"[INTEGRATION TEST] Sending prompt to agent: '{prompt}'")
 
         events = []
+        gateway = DeterministicGateway()
 
         async for event_type, payload in AgentExecutionService.run_agent_lifecycle(
             db=self.db,
-            llm_gateway=DeterministicGateway(),
+            llm_gateway=gateway,
             session_id=session_id,
             user_content=prompt,
             provider="fake",
@@ -373,6 +379,24 @@ if __name__ == "__main__":
                 last_node = payload.get("last_executed_node", "")
                 print(f"\n[Timeline update] node: {last_node}")
 
+        suspension_events = [event for event in events if event[0] == "run_suspended"]
+        self.assertEqual(
+            1,
+            len(suspension_events),
+            "Skill execution must suspend for per-run human approval.",
+        )
+        approval_id = uuid.UUID(suspension_events[0][1]["approval_request_id"])
+        async for event_type, payload in (
+            AgentExecutionService.resolve_approval_and_resume_lifecycle(
+                db=self.db,
+                llm_gateway=gateway,
+                approval_id=approval_id,
+                action="approved",
+            )
+        ):
+            events.append((event_type, payload))
+            print(f"[APPROVAL EVENT] {event_type}: {payload}")
+
         print("\n[INTEGRATION TEST] Execution finished.")
 
         # 5. Assertions on Agent behavior
@@ -382,28 +406,31 @@ if __name__ == "__main__":
 
         # Ensure there was a tool call execution event for run_skill_script
         timeline_events = [e for e in events if e[0] == "timeline_updated"]
-        tool_executed = False
-        for te in timeline_events:
-            for step in te[1].get("steps", []):
-                if step.get("tool_name") == "run_skill_script":
-                    tool_executed = True
-                    tool_input = step.get("tool_input", {})
-                    # Ensure the agent called the correct skill name and script path
-                    self.assertEqual(tool_input.get("skill_name"), skill_name)
-                    self.assertEqual(tool_input.get("script_path"), "scripts/check_kpi.py")
-                    # Ensure arguments contain the node_id
-                    script_args = tool_input.get("arguments", {})
-                    self.assertIn("HNI-002", str(script_args.get("node_id", "")))
+        script_steps = [
+            step
+            for _, timeline_payload in timeline_events
+            for step in timeline_payload.get("steps", [])
+            if step.get("tool_name") == "run_skill_script"
+        ]
+        self.assertTrue(script_steps, "Agent must execute the skill script tool.")
+        self.assertTrue(
+            any(step.get("tool_status") == "waiting_approval" for step in script_steps),
+            "Timeline must expose the waiting approval state.",
+        )
 
-                    # Ensure the output contract passed successfully
-                    self.assertEqual(step.get("tool_status"), "completed")
-                    self.assertFalse(step.get("is_error"))
-                    tool_output = json.loads(step.get("tool_output", "{}"))
-                    self.assertEqual(tool_output.get("status"), "degraded")
-                    self.assertEqual(tool_output.get("node_id"), "HNI-002")
-                    print(f"[INTEGRATION TEST] Verified tool call: {step}")
+        final_script_step = script_steps[-1]
+        tool_input = final_script_step.get("tool_input", {})
+        self.assertEqual(tool_input.get("skill_name"), skill_name)
+        self.assertEqual(tool_input.get("script_path"), "scripts/check_kpi.py")
+        script_args = tool_input.get("arguments", {})
+        self.assertIn("HNI-002", str(script_args.get("node_id", "")))
 
-        self.assertTrue(tool_executed, "Agent must execute the skill script tool.")
+        self.assertEqual(final_script_step.get("tool_status"), "completed")
+        self.assertFalse(final_script_step.get("is_error"))
+        tool_output = json.loads(final_script_step.get("tool_output", "{}"))
+        self.assertEqual(tool_output.get("status"), "degraded")
+        self.assertEqual(tool_output.get("node_id"), "HNI-002")
+        print(f"[INTEGRATION TEST] Verified tool call: {final_script_step}")
         print("[INTEGRATION TEST] All assertions passed successfully! 100% Correct.")
 
     @patch("app.agent.builtin_tools._connector_is_configured", return_value=True)

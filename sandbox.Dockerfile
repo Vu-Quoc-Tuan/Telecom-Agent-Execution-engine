@@ -7,7 +7,9 @@ ENV PYTHONUNBUFFERED=1
 # Install runtime dependencies for the sandbox
 RUN pip install --no-cache-dir \
     clickhouse-connect==0.7.16 \
+    httpx \
     psycopg2-binary==2.9.9 \
+    requests \
     paramiko==3.4.0 \
     cryptography==42.0.5
 

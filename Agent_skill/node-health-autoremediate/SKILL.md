@@ -36,13 +36,13 @@ So sánh "cao" dùng `>` chặt theo đúng đề; giá trị đúng bằng ngư
 |----|----|---------|
 | A  | `--host` / `-A` | host/IP của node (bắt buộc) |
 | B  | `--user` / `-B` | user SSH (bắt buộc khi SSH thật) |
-| C  | env `SSH_PASSWORD` (khuyến nghị) hoặc `--password`, hoặc `--ssh-key` | thông tin xác thực |
+| C  | env `SSH_PASSWORD` (khuyến nghị) hoặc `--passcode`, hoặc `--ssh-key` | thông tin xác thực |
 | X  | `--ram-threshold` / `-x` | ngưỡng RAM tính theo % (bắt buộc) |
 | Y  | `--cpu-threshold` / `-y` | ngưỡng CPU tính theo % (bắt buộc) |
 | Z  | `--service` / `-Z` | tên container/service docker (cần cho nhánh đọc log & restart service) |
 
-Tham số phụ: `--port` (mặc định 22), `--log-lines` (mặc định 200), `--compose` (dùng
-`docker compose` thay cho `docker`), `--timeout` (giây), `--ssh-key`.
+Tham số phụ: `--port` (mặc định 22), `--log-lines` (mặc định 200), `--ssh-key`, và
+`--known-hosts` (mặc định là file `known_hosts` trong workspace).
 
 ## An toàn — mặc định DRY-RUN
 
@@ -52,6 +52,7 @@ mới thật sự restart/đọc log. Quy trình khuyến nghị: chạy không 
 ngưỡng X/Y trên số liệu thật, khi yên tâm mới thêm `--execute`.
 
 Mật khẩu C nên đặt qua env `SSH_PASSWORD` (tránh lộ qua `ps`); an toàn nhất là dùng `--ssh-key`.
+SSH host key luôn được xác minh bằng `known_hosts`; host chưa được trust sẽ bị từ chối.
 
 ## Cách chạy
 
@@ -75,10 +76,10 @@ python3 scripts/health_action.py \
   -A <A> -B <B> -x <X> -y <Y> -Z <Z> --execute
 ```
 
-Test cây quyết định KHÔNG cần node (truyền metric giả qua stdin):
+Test cây quyết định KHÔNG cần node (truyền metric giả trực tiếp):
 ```bash
-echo '{"mem_pct":91,"cpu_pct":88}' | \
-  python3 scripts/health_action.py -A demo -x 80 -y 75 -Z myapp --from-json -
+python3 scripts/health_action.py -A demo -x 80 -y 75 -Z myapp \
+  --from-json '{"mem_pct":91,"cpu_pct":88}'
 ```
 
 Điều kiện về sudo/nhóm docker, bản thay thế `sshpass`, host key, tinh chỉnh ngưỡng và chống
@@ -120,6 +121,8 @@ Output: `action=read_logs`, `command="docker logs --timestamps --tail 200 alert-
 - **`sudo -n`** khiến lệnh fail ngay nếu thiếu quyền thay vì treo chờ nhập mật khẩu — nếu nhánh
   `restart_docker` báo lỗi sudo, cấp NOPASSWD theo `references/prerequisites.md`.
 - **Tên Z được quote** (`shlex.quote`) trước khi ghép vào lệnh, tránh lỗi/escape ngoài ý muốn.
+- **SSH host key bắt buộc:** bundle hoặc mount file `known_hosts` đã xác minh fingerprint và
+  truyền `--known-hosts <path>` nếu không dùng tên mặc định.
 - **Restart docker engine là hành động nặng** (kéo theo mọi container) — chỉ dùng cho nhánh
   RAM cao *và* CPU cao. Muốn chỉ đụng một container thì đó là nhánh `restart_service`.
 - **Chạy định kỳ:** cân nhắc yêu cầu vài lần đo liên tiếp vượt ngưỡng + cooldown để tránh

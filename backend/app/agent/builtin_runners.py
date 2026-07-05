@@ -35,7 +35,6 @@ from app.database.repositories.skills import SkillRepository
 from app.observability.redaction import DataRedactor
 
 
-# ------ Read from env.external file -------
 def _allowed_nodes(settings) -> set[str]:
     raw = getattr(settings, "SSH_ALLOWED_NODES", "") or ""
     return {item.strip() for item in raw.split(",") if item.strip()}
@@ -44,9 +43,6 @@ def _allowed_nodes(settings) -> set[str]:
 def _node_host_map(settings) -> dict[str, str]:
     raw = getattr(settings, "SSH_NODE_HOST_MAP", "") or ""
     return parse_node_host_map(raw)
-
-
-# --------------------------
 
 
 def _prepare_tool_output(output: str) -> tuple[str, bool]:
@@ -314,7 +310,7 @@ async def _run_restart_service(arguments: dict[str, Any], settings) -> tuple[str
         )
         status_stdout, status_stderr = await connector.execute_command(
             f"systemctl is-active {service_name}",
-            approval_confirmations=0,
+            approval_confirmations=1,
         )
     finally:
         connector.close()
@@ -490,6 +486,12 @@ async def execute_builtin_tool(
     Mọi lỗi nghiệp vụ/hạ tầng được ném dưới dạng TelecomAgentException để node
     execute_tools ghi nhận failed và phản hồi lại cho LLM đọc tiếp.
     """
+    if (
+        classify_builtin_risk(tool_name, arguments) == ExecutionMode.REQUIRE_APPROVAL.value
+        and approval_confirmations < 1
+    ):
+        raise SkillRuntimeError(f"Tool '{tool_name}' cần phê duyệt trước khi chạy.")
+
     if tool_name == LOAD_SKILL:
         return _run_load_skill(db, arguments)
     if tool_name == READ_SKILL_FILE:
@@ -497,11 +499,6 @@ async def execute_builtin_tool(
     if tool_name == RUN_SKILL_SCRIPT:
         return await _run_skill_script(db, arguments, settings)
 
-    if (
-        classify_builtin_risk(tool_name, arguments) == ExecutionMode.REQUIRE_APPROVAL.value
-        and approval_confirmations < 1
-    ):
-        raise SkillRuntimeError(f"Tool '{tool_name}' cần phê duyệt trước khi chạy.")
     runner = _BACKEND_OWNED_RUNNERS.get(tool_name)
     if runner is not None:
         return await runner(arguments, settings)

@@ -88,10 +88,10 @@ class TelcoSSHConnector(BaseConnector):
         except Exception as e:
             error_text = str(e)
             guidance = ""
-            if "known_hosts" in error_text.lower():
+            if "known_hosts" in error_text.lower() or "not found in" in error_text.lower():
                 guidance = (
-                    " Host key chưa được trust. Cấu hình SSH_KNOWN_HOSTS trỏ tới "
-                    "file known_hosts chứa fingerprint của server rồi restart backend."
+                    " Configure SSH_KNOWN_HOSTS with the trusted server fingerprint. "
+                    "Use SSH_AUTO_ADD_HOST_KEYS=true only for an explicitly trusted dev environment."
                 )
             raise ConnectorExecutionError(
                 f"Lỗi kết nối SSH vật lý tới trạm: {error_text}.{guidance}",
@@ -99,7 +99,6 @@ class TelcoSSHConnector(BaseConnector):
                     "host": self.host,
                     "port": self.port,
                     "known_hosts_path": self.known_hosts_path,
-                    "auto_add_host_keys": self.auto_add_host_keys,
                 },
             ) from e
 

@@ -22,7 +22,6 @@ class ConnectorIntegrationTests(unittest.IsolatedAsyncioTestCase):
             username=settings.SSH_USER,
             password=settings.SSH_PASSWORD,
             timeout=10,
-            auto_add_host_keys=True,
         )
         try:
             # We run a simple whoami command

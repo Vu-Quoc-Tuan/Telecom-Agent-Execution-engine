@@ -404,6 +404,6 @@ def classify_builtin_risk(tool_name: str, arguments: dict[str, Any]) -> str:
     if tool_def and isinstance(tool_def.input_schema, dict):
         from app.agent.tool_validation import validate_json_value_against_schema
         validate_json_value_against_schema(value=arguments, schema=tool_def.input_schema, path=tool_name)
-    if tool_name == RESTART_SERVICE:
+    if tool_name in {RESTART_SERVICE, RUN_SKILL_SCRIPT}:
         return ExecutionMode.REQUIRE_APPROVAL.value
     return ExecutionMode.AUTO_EXECUTE.value

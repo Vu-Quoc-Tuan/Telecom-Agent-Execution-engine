@@ -1,11 +1,10 @@
-import re
-import json
 import argparse
-import pydoc
 import codecs
+import json
+import logging
+import re
 
-# Locate sys if needed for stdin/stdout streams
-sys = pydoc.locate("sys")
+logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
 DEFAULT_PATTERNS = {
     "ips": r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
@@ -13,8 +12,9 @@ DEFAULT_PATTERNS = {
     "interfaces": r"\b(?:GigabitEthernet|FastEthernet|Ethernet|TenGigE|Ge|Eth|Fa)[0-9]+/[0-9]+(?:/[0-9]+)?(?:\.[0-9]+)?\b",
     "cell_ids": r"\b(?:[A-Z]{3,4}_[0-9]{4}|cell[-_][0-9a-zA-Z]+)\b",
     "as_numbers": r"\bAS[0-9]+\b",
-    "vlans": r"\bvlan[-_]?[0-9]+\b"
+    "vlans": r"\bvlan[-_]?[0-9]+\b",
 }
+
 
 def extract_entities(text, custom_patterns=None):
     patterns = dict(DEFAULT_PATTERNS)
@@ -47,44 +47,66 @@ def extract_entities(text, custom_patterns=None):
 
     return extracted, lookup_keys
 
+
 def main():
     parser = argparse.ArgumentParser(description="NOC Alarm Content Entity Extractor")
     parser.add_argument("--text", help="Single text content to parse")
     parser.add_argument("--input", help="Path to input JSONL file containing batch alarms")
-    parser.add_argument("--content-field", default="content", help="Field name containing alarm text")
-    parser.add_argument("--patterns", help="JSON string or path to JSON file containing custom override patterns")
+    parser.add_argument(
+        "--content-field", default="content", help="Field name containing alarm text"
+    )
+    parser.add_argument(
+        "--patterns", help="JSON string or path to JSON file containing custom override patterns"
+    )
 
     args = parser.parse_args()
 
+    # Overlay arguments from args.json if running in the sandbox
+    try:
+        with open("args.json", encoding="utf-8") as f:
+            sandbox_args = json.load(f)
+            if "text" in sandbox_args:
+                args.text = sandbox_args["text"]
+            if "input" in sandbox_args:
+                args.input = sandbox_args["input"]
+            if "content_field" in sandbox_args:
+                args.content_field = sandbox_args["content_field"]
+            elif "content-field" in sandbox_args:
+                args.content_field = sandbox_args["content-field"]
+            if "patterns" in sandbox_args:
+                args.patterns = sandbox_args["patterns"]
+    except FileNotFoundError:
+        pass
+
     custom_patterns = None
     if args.patterns:
-        try:
-            custom_patterns = json.loads(args.patterns)
-        except Exception:
+        if isinstance(args.patterns, dict):
+            custom_patterns = args.patterns
+        elif isinstance(args.patterns, str):
             try:
-                with codecs.open(args.patterns, "r", encoding="utf-8") as f:
-                    custom_patterns = json.load(f)
-            except Exception as e:
-                if sys:
-                    sys.stderr.write(f"Warning: Failed to load custom patterns: {e}\n")
+                custom_patterns = json.loads(args.patterns)
+            except json.JSONDecodeError:
+                try:
+                    with codecs.open(args.patterns, "r", encoding="utf-8") as f:
+                        custom_patterns = json.load(f)
+                except (OSError, json.JSONDecodeError) as exc:
+                    parser.error(f"Failed to load custom patterns: {exc}")
+        else:
+            parser.error("patterns must be a JSON object, JSON string, or JSON file path")
+
+        if not isinstance(custom_patterns, dict):
+            parser.error("patterns must resolve to a JSON object")
 
     if args.text:
         extracted, lookup_keys = extract_entities(args.text, custom_patterns)
-        result = {
-            "text": args.text,
-            "extracted": extracted,
-            "lookup_keys": lookup_keys
-        }
+        result = {"text": args.text, "extracted": extracted, "lookup_keys": lookup_keys}
         print(json.dumps(result, indent=2))
 
     elif args.input:
-        lines = []
         if args.input == "-":
-            if sys:
-                lines = sys.stdin.read().splitlines()
-        else:
-            with codecs.open(args.input, "r", encoding="utf-8") as f:
-                lines = f.read().splitlines()
+            parser.error("--input - is not supported; provide a workspace-relative JSONL path")
+        with codecs.open(args.input, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
 
         all_lookup_keys = set()
         for line in lines:
@@ -98,19 +120,10 @@ def main():
             all_lookup_keys.update(lookup_keys)
             print(json.dumps(record))
 
-        if sys:
-            sys.stderr.write(f"LOOKUP_KEYS={json.dumps(sorted(list(all_lookup_keys)))}\n")
+        logging.warning("LOOKUP_KEYS=%s", json.dumps(sorted(all_lookup_keys)))
     else:
-        # Default mock output to satisfy the JSON contract during smoke tests
-        mock_text = "Interface GigabitEthernet0/0/1 on NE HNI-CORE-01 (10.211.140.16) is DOWN"
-        extracted, lookup_keys = extract_entities(mock_text, custom_patterns)
-        result = {
-            "text": mock_text,
-            "extracted": extracted,
-            "lookup_keys": lookup_keys,
-            "notice": "Running in mock mode. Please specify --text or --input."
-        }
-        print(json.dumps(result, indent=2))
+        parser.error("one of --text or --input is required")
+
 
 if __name__ == "__main__":
     main()

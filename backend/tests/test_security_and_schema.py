@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,14 +19,68 @@ from app.sandbox.security_analyzer import AdvancedASTSecurityAnalyzer
 
 
 class SecurityAnalyzerTests(unittest.TestCase):
-    def test_blocks_dangerous_imports_and_dynamic_execution(self) -> None:
+    def test_allows_dev_connectivity_imports_but_blocks_dynamic_execution(self) -> None:
         code = "import os\n\ndef read_alarm():\n    return eval('1 + 1')\n"
 
         is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
 
         self.assertFalse(is_clean)
-        self.assertTrue(any("os" in finding for finding in findings))
+        self.assertFalse(any("os" in finding for finding in findings))
         self.assertTrue(any("eval" in finding for finding in findings))
+
+    def test_allows_reviewable_dev_connection_modules(self) -> None:
+        code = (
+            "import os\n"
+            "import ssl\n"
+            "import requests\n"
+            "import httpx\n"
+            "import paramiko\n"
+            "from urllib.parse import quote_plus\n"
+            "def run():\n"
+            "    return quote_plus(os.environ.get('NODE', ''))\n"
+        )
+
+        is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
+
+        self.assertTrue(is_clean, findings)
+
+    def test_blocks_sys_modules_dynamic_import_bypass(self) -> None:
+        code = (
+            "import sys\n"
+            "def run():\n"
+            "    return sys.modules['subprocess'].run(['id'])\n"
+        )
+
+        is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
+
+        self.assertFalse(is_clean)
+        self.assertTrue(any("sys" in finding for finding in findings), findings)
+
+    def test_sample_autoremediation_skill_rejects_unknown_ssh_host_keys(self) -> None:
+        script_path = (
+            Path(__file__).resolve().parents[2]
+            / "Agent_skill/node-health-autoremediate/scripts/health_action.py"
+        )
+        source = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("paramiko.RejectPolicy()", source)
+        self.assertIn("load_host_keys", source)
+        self.assertNotIn("paramiko.AutoAddPolicy()", source)
+
+    def test_blocks_subprocess_and_os_shell_execution(self) -> None:
+        code = (
+            "import os\n"
+            "import subprocess\n"
+            "def run():\n"
+            "    os.system('id')\n"
+            "    return subprocess.run(['id'])\n"
+        )
+
+        is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
+
+        self.assertFalse(is_clean)
+        self.assertTrue(any("subprocess" in finding for finding in findings))
+        self.assertTrue(any("os.system" in finding for finding in findings))
 
     def test_blocks_class_navigation_jailbreak(self) -> None:
         code = "def exploit_skill(ssh_client):\n    return ().__class__.__base__.__subclasses__()\n"

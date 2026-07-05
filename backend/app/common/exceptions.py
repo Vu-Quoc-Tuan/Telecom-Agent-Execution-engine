@@ -2,7 +2,7 @@ from typing import Any
 
 
 class TelecomAgentException(Exception):
-    """Ngoại lệ nền tảng tối cao của hệ thống"""
+    """Ngoại lệ nền tảng của hệ thống"""
 
     def __init__(self, message: str, code: str, details: dict[str, Any] | None = None):
         super().__init__(message)

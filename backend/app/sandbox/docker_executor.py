@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_OUTPUT_CHARS = 50_000
-DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+DEFAULT_SANDBOX_IMAGE = "telecom-agent-sandbox:latest"
 SANDBOX_WORKSPACE_DIR = "/workspace"
 ARGS_FILE_NAME = "args.json"
 
@@ -84,12 +84,16 @@ class DockerSandboxExecutor:
         bundled_files: dict[str, dict[str, Any]] | None = None,
         timeout_seconds: int = 15,
     ) -> SandboxExecutionResult:
-        """Smoke-test một script lúc upload (Vòng 5), dùng cùng runner như runtime."""
-        return await self.execute_skill_script(
-            script_path=script_path,
-            arguments=arguments or {},
-            bundled_files=bundled_files,
-            timeout_seconds=timeout_seconds,
+        """Smoke-test upload without network access or infrastructure credentials."""
+        safe_path = self._safe_relative_path(script_path)
+        return await asyncio.to_thread(
+            self._run_in_container,
+            safe_path,
+            arguments or {},
+            bundled_files or {},
+            timeout_seconds,
+            "none",
+            False,
         )
 
     # --- Nội bộ -------------------------------------------------------------
@@ -133,7 +137,13 @@ class DockerSandboxExecutor:
         )
 
     def _docker_run_command(
-        self, workspace: Path, container_name: str, script_path: str
+        self,
+        workspace: Path,
+        container_name: str,
+        script_path: str,
+        *,
+        network: str | None = None,
+        forward_connection_env: bool = True,
     ) -> list[str]:
         command = [
             self._docker,
@@ -142,15 +152,22 @@ class DockerSandboxExecutor:
             "--name",
             container_name,
             "--network",
-            self._network,
+            network or self._network,
             "--memory",
             self._memory,
             "--cpus",
             self._cpus,
             "--pids-limit",
             "128",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=16m",
             "-v",
-            f"{workspace}:{SANDBOX_WORKSPACE_DIR}",
+            f"{workspace}:{SANDBOX_WORKSPACE_DIR}:ro",
             "-w",
             SANDBOX_WORKSPACE_DIR,
         ]
@@ -167,17 +184,18 @@ class DockerSandboxExecutor:
             "SSH_USER",
             "SSH_PASSWORD",
         ]
-        # First use variables defined in settings/extra_env
-        forwarded = dict(self._extra_env)
-        # Overwrite with direct os.environ if they are set in parent process
-        for var in env_vars:
-            val = os.environ.get(var)
-            if val is not None:
-                forwarded[var] = val
+        if forward_connection_env:
+            # First use variables defined in settings/extra_env
+            forwarded = dict(self._extra_env)
+            # Overwrite with direct os.environ if they are set in parent process
+            for var in env_vars:
+                val = os.environ.get(var)
+                if val is not None:
+                    forwarded[var] = val
 
-        for var, val in forwarded.items():
-            if val:
-                command += ["-e", f"{var}={val}"]
+            for var, val in forwarded.items():
+                if val:
+                    command += ["-e", f"{var}={val}"]
 
         if hasattr(os, "getuid") and hasattr(os, "getgid"):
             command += ["--user", f"{os.getuid()}:{os.getgid()}"]
@@ -190,6 +208,8 @@ class DockerSandboxExecutor:
         arguments: dict[str, Any],
         bundled_files: dict[str, dict[str, Any]],
         timeout_seconds: int | None,
+        network: str | None = None,
+        forward_connection_env: bool = True,
     ) -> SandboxExecutionResult:
         if shutil.which(self._docker) is None:
             raise SkillRuntimeError(
@@ -202,7 +222,13 @@ class DockerSandboxExecutor:
         container_name = f"skill_sb_{workspace.name}"
         try:
             self._materialize_workspace(workspace, arguments, bundled_files)
-            command = self._docker_run_command(workspace, container_name, script_path)
+            command = self._docker_run_command(
+                workspace,
+                container_name,
+                script_path,
+                network=network,
+                forward_connection_env=forward_connection_env,
+            )
             try:
                 completed = subprocess.run(  # noqa: S603 - lệnh dựng từ tham số nội bộ
                     command,

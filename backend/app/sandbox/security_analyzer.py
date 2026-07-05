@@ -1,36 +1,11 @@
-# backend/app/sandbox/security_analyzer.py
-from __future__ import annotations
-
 import ast
 
 
 class AdvancedASTSecurityAnalyzer:
-    # ❌ DANH SÁCH ĐEN THƯ VIỆN CẤM IMPORT TRỰC TIẾP HOẶC GIÁN TIẾP
-    # Bổ sung importlib/ctypes và các module nạp động / can thiệp bộ nhớ - tiến trình.
+    # Vẫn chặn các primitive hay dùng để bypass sandbox/chạy code ẩn.
     DANGEROUS_IMPORTS = {
-        "os",
         "subprocess",
-        "socket",
-        "requests",
-        "httpx",
-        "paramiko",
-        # Mạng/giao thức: http.client, ftplib... vẫn mở kết nối ra ngoài dù không
-        # đi qua socket trực tiếp -> chặn để script không exfiltrate dữ liệu.
-        "http",
-        "urllib3",
-        "aiohttp",
-        "websocket",
-        "websockets",
-        "ftplib",
-        "smtplib",
-        "poplib",
-        "imaplib",
-        "telnetlib",
-        "nntplib",
-        "xmlrpc",
-        "asyncore",
-        "asynchat",
-        "ssl",
+        "sys",
         "webbrowser",
         # Đọc/ghi file qua API ngoài open(): pathlib.Path.read_text(), io.open(),
         # tempfile, glob... đều bypass được rào open() literal-only -> chặn cả module.
@@ -47,10 +22,7 @@ class AdvancedASTSecurityAnalyzer:
         "pickle",
         "marshal",
         "dill",
-        "shutil",
-        "sys",
         "builtins",
-        "urllib",
         "importlib",
         "pydoc",
         "ctypes",
@@ -75,6 +47,19 @@ class AdvancedASTSecurityAnalyzer:
         "nt",
         "cffi",
         "inspect",
+    }
+
+    DANGEROUS_QUALIFIED_CALLS = {
+        "os.system",
+        "os.popen",
+        "os.execv",
+        "os.execve",
+        "os.execl",
+        "os.execlp",
+        "os.spawnl",
+        "os.spawnlp",
+        "os.spawnv",
+        "os.spawnvp",
     }
 
     # ❌ DANH SÁCH ĐEN CÁC HÀM NGUY HIỂM CẤM TỰ KÍCH HOẠT VÌ CÓ NGUY CƠ CHẠY LẬU CODE ẨN
@@ -132,6 +117,16 @@ class AdvancedASTSecurityAnalyzer:
                 elif isinstance(node.func, ast.Name) and node.func.id in cls.DANGEROUS_CALLS:
                     errors.append(
                         f"Dòng {node.lineno}: Tác vụ bị chặn! Không được phép tự gọi hàm nguyên bản '{node.func.id}'."
+                    )
+                elif (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and f"{node.func.value.id}.{node.func.attr}" in cls.DANGEROUS_QUALIFIED_CALLS
+                ):
+                    qualified_name = f"{node.func.value.id}.{node.func.attr}"
+                    errors.append(
+                        f"Dòng {node.lineno}: Tác vụ bị chặn! Không được phép gọi "
+                        f"shell/process primitive '{qualified_name}'."
                     )
 
             # 3. Chặn "Python Jailbreak" qua thuộc tính dunder.

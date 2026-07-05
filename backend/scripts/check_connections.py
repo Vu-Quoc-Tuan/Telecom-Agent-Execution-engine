@@ -137,7 +137,6 @@ def test_ssh() -> bool:
 
     ssh = paramiko.SSHClient()
 
-    # Ưu tiên kiểm tra host key đã lưu trong ~/.ssh/known_hosts.
     ssh.load_system_host_keys()
     ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
 
@@ -179,8 +178,8 @@ def test_ssh() -> bool:
     except paramiko.ssh_exception.SSHException as exc:
         print(f"Lỗi SSH: {exc}")
         print(
-            "Nếu đây là lần kết nối đầu tiên, hãy chạy lệnh ssh thủ công "
-            "để xác nhận fingerprint và thêm host vào known_hosts."
+            "Nếu đây là lần kết nối đầu tiên, hãy xác minh fingerprint và thêm host "
+            "vào known_hosts trước khi chạy lại."
         )
         return False
     except Exception as exc:

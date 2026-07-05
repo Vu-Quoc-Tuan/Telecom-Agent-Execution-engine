@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     # Sandbox chạy run_skill_script bằng Docker container trên host.
     # SANDBOX_ENABLED=false để tắt hẳn; image/limits tuỳ chỉnh nếu cần.
     SANDBOX_ENABLED: bool = True
-    SANDBOX_IMAGE: str = "python:3.12-slim"
+    SANDBOX_IMAGE: str = "telecom-agent-sandbox:latest"
     SANDBOX_TIMEOUT_SECONDS: int = 30
     SANDBOX_MEMORY: str = "256m"
     SANDBOX_CPUS: str = "1.0"
