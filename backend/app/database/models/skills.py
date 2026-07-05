@@ -26,13 +26,6 @@ class Skill(Base):
         nullable=False,
     )
 
-    version = Column(
-        String(30),
-        nullable=False,
-        default="1.0.0",
-        server_default=text("'1.0.0'"),
-    )
-
     skill_md = Column(
         Text,
         nullable=False,

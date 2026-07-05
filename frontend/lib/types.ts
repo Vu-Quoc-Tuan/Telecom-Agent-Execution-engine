@@ -122,7 +122,6 @@ export type SkillSummary = {
   name: string;
   description: string;
   skill_md: string;
-  version: string;
   status: SkillStatus;
   is_malicious: boolean;
   security_review_log?: string | null;

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import uuid
 
 from sqlalchemy import select
@@ -19,14 +17,12 @@ class SkillRepository:
         frontmatter: dict | None = None,
         bundled_files: dict | None = None,
         script_manifest: dict | None = None,
-        version: str = "1.0.0",
     ) -> Skill:
         """Persist an uploaded Agent Skill package once, awaiting validation result."""
         new_skill = Skill(
             id=uuid.uuid4(),
             name=name,
             description=description,
-            version=version,
             skill_md=skill_md,
             frontmatter=frontmatter or {},
             bundled_files=bundled_files or {},

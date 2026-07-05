@@ -26,7 +26,6 @@ class FakeSkill:
         self.id = "skill-1"
         self.name = None
         self.description = None
-        self.version = "1.0.0"
         self.skill_md = None
         self.frontmatter = None
         self.bundled_files = None
@@ -57,7 +56,6 @@ class FakeSkillRepository:
         frontmatter: dict | None = None,
         bundled_files: dict | None = None,
         script_manifest: dict | None = None,
-        version: str = "1.0.0",
     ):
         skill = FakeSkill()
         skill.name = name
@@ -66,7 +64,6 @@ class FakeSkillRepository:
         skill.frontmatter = frontmatter or {}
         skill.bundled_files = bundled_files or {}
         skill.script_manifest = script_manifest or {}
-        skill.version = version
         skill.status = "uploaded"
         self.created.append(skill)
         return skill
@@ -132,7 +129,6 @@ Instructions here.
 
         self.assertEqual(result.status, "PENDING_REVIEW")
         self.assertEqual(repository.created[0].name, "collect-node-alarm")
-        self.assertEqual(repository.created[0].version, "1.0.0")
         self.assertEqual(
             repository.created[0].bundled_files["scripts/helper.py"]["encoding"],
             "utf-8",
@@ -397,7 +393,6 @@ Follow the NOC checklist.
         asset = package.bundled_files["assets/diagram.png"]
         self.assertEqual("base64", asset["encoding"])
         self.assertEqual("image/png", asset["media_type"])
-        self.assertEqual("2.0", package.version)
 
     def test_requires_exact_skill_md_filename(self) -> None:
         from app.services.skills import SkillValidationError, SkillValidationService

@@ -1,13 +1,11 @@
 import uuid
 
 from sqlalchemy import (
-    CheckConstraint,
     Column,
     DateTime,
     Index,
     String,
     func,
-    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -29,13 +27,6 @@ class Session(Base):
         nullable=False,
     )
 
-    # active | archived
-    status = Column(
-        String(30),
-        nullable=False,
-        default="active",
-        server_default=text("'active'"),
-    )
 
     created_at = Column(
         DateTime(timezone=True),
@@ -72,10 +63,6 @@ class Session(Base):
     )
 
     __table_args__ = (
-        CheckConstraint(
-            "status IN ('active', 'archived')",
-            name="ck_sessions_status",
-        ),
         Index(
             "idx_sessions_updated_at",
             "updated_at",

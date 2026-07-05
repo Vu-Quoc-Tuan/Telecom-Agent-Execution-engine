@@ -153,7 +153,6 @@ export default function SkillRegistryPage() {
               >
                 <div className="flex items-start justify-between gap-2 w-full">
                   <span className="font-semibold text-xs text-primary-text break-all line-clamp-1">{skill.name}</span>
-                  <span className="font-mono text-[10px] text-secondary-text shrink-0">v{skill.version}</span>
                 </div>
                 <span className="text-[11px] text-secondary-text line-clamp-2 leading-relaxed">{skill.description}</span>
                 {skill.status === "ready" && (
@@ -197,7 +196,7 @@ export default function SkillRegistryPage() {
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-surface-card/5 select-none">
               <TelecomLogo className="h-12 w-12 text-secondary-text/30 mb-4 animate-pulse" />
-              <h3 className="text-sm font-semibold text-secondary-text">Chưa chọn AI Skill</h3>
+              <h3 className="text-sm font-semibold text-secondary-text">Chưa chọn Agent Skill</h3>
               <p className="mt-1.5 text-xs text-secondary-text/70 max-w-xs leading-relaxed">
                 Hãy chọn một skill ở danh sách bên trái để kiểm tra chi tiết cấu trúc, mã nguồn, kết quả sandbox và thực hiện phê duyệt/cách ly.
               </p>

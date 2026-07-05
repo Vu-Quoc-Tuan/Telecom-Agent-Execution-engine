@@ -15,7 +15,6 @@ type UploadResult = {
 type SkillPackagePreview = {
   name: string;
   description: string;
-  version: string;
   frontmatter: Record<string, unknown>;
   files: Array<{
     path: string;
@@ -73,7 +72,6 @@ export default function SkillUploadPage() {
     }
     if (preview) {
       return [
-        `[READY] Package hợp lệ: ${preview.name}@${preview.version}.`,
         `[READY] ${preview.files.length} bundled file(s) sẽ đi cùng skill.`,
         "[READY] Bấm thẩm định để chạy pipeline bảo mật đầy đủ.",
       ];
@@ -219,9 +217,6 @@ export default function SkillUploadPage() {
                   <h2 className="mt-2 truncate text-lg font-semibold">{preview.name}</h2>
                   <p className="mt-2 text-sm leading-6 text-secondary-text">{preview.description}</p>
                 </div>
-                <span className="shrink-0 rounded-md bg-code-block px-2 py-1 font-mono text-xs">
-                  v{preview.version}
-                </span>
               </div>
 
               <dl className="mt-5 grid gap-3 text-sm sm:grid-cols-2">

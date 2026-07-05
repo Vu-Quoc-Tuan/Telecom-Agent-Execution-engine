@@ -62,7 +62,6 @@ def list_skills(status: str | None = None, db: Session = Depends(get_db)):
             "name": skill.name,
             "description": skill.description,
             "skill_md": skill.skill_md,
-            "version": skill.version,
             "status": skill.status,
             "is_malicious": skill.is_malicious,
             "security_review_log": skill.security_review_log,
@@ -99,7 +98,6 @@ async def inspect_skill_package(file: UploadFile = File(...)):
     return {
         "name": package.name,
         "description": package.description,
-        "version": package.version,
         "frontmatter": package.frontmatter,
         "files": [
             {
@@ -162,7 +160,6 @@ def approve_skill_for_agent(
         "status": "READY",
         "skill_id": str(approved.id),
         "name": approved.name,
-        "version": approved.version,
         "note": body.note if body else None,
     }
 

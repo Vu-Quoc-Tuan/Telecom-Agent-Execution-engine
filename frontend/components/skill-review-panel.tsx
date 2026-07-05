@@ -167,7 +167,6 @@ export function SkillReviewPanel({
             <span className={`rounded px-2 py-1 text-xs font-semibold ${statusTone(skill.status)}`}>
               {skill.status}
             </span>
-            <span className="font-mono text-xs text-secondary-text">v{skill.version}</span>
           </div>
           <h2 className="break-words text-lg font-semibold">{skill.name}</h2>
           <p className="mt-1 text-sm leading-5 text-secondary-text">{skill.description}</p>

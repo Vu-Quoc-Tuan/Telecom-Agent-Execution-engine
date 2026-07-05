@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import unittest
 import zipfile
@@ -106,6 +107,27 @@ class ApplicationImportTests(unittest.TestCase):
                 user_message="Kiểm tra KPI",
                 skill_mode="specific",
             )
+
+    def test_chat_stream_rejects_an_unsupported_provider(self) -> None:
+        from app.api.chat import ChatStreamBody, stream_agent_conversation
+
+        class FakeGateway:
+            providers = ("openai",)
+
+        body = ChatStreamBody(
+            session_id=uuid4(),
+            user_message="Kiểm tra KPI",
+            provider="not-a-provider",
+        )
+
+        with (
+            patch("app.api.chat.get_llm_gateway", return_value=FakeGateway()),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            asyncio.run(stream_agent_conversation(body))
+
+        self.assertEqual(422, raised.exception.status_code)
+        self.assertIn("not-a-provider", str(raised.exception.detail))
 
     def test_checkpoint_serializer_allows_llm_schema_types(self) -> None:
         from app.agent.checkpointer import build_checkpoint_serializer
@@ -356,7 +378,7 @@ Read status only.
         payload = await inspect_skill_package(file=file)
 
         self.assertEqual("check-olt-signal", payload["name"])
-        self.assertEqual("1.2.3", payload["version"])
+        self.assertEqual("1.2.3", payload["frontmatter"].get("metadata", {}).get("version"))
         self.assertIn("OLT optical signal", payload["description"])
         self.assertEqual(
             [

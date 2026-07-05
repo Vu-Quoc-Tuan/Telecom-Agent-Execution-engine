@@ -45,7 +45,6 @@ class ParsedSkillPackage:
     body: str
     frontmatter: dict[str, Any]
     bundled_files: dict[str, dict[str, Any]]
-    version: str
 
 
 class SkillValidationError(Exception):
@@ -145,14 +144,12 @@ class SkillValidationService:
                 skill_md_path="SKILL.md",
             )
 
-        metadata = frontmatter.get("metadata") or {}
         return ParsedSkillPackage(
             name=name,
             description=description,
             body=body,
             frontmatter=frontmatter,
             bundled_files=bundled_files,
-            version=metadata.get("version", "1.0.0"),
         )
 
     async def upload_skill(
@@ -861,7 +858,6 @@ class SkillValidationService:
             frontmatter=package.frontmatter,
             bundled_files=package.bundled_files,
             script_manifest=script_manifest or {},
-            version=package.version,
         )
 
     def _persist_package_or_conflict(
