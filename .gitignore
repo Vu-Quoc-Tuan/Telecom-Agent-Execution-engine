@@ -51,3 +51,10 @@ build/
 
 # Evaluation artifacts
 redteam-generated.yaml
+
+# Agent / Assistant rules and guidelines
+CLAUDE.md
+claude.md
+AGENTS.md
+agents.md
+agent.md

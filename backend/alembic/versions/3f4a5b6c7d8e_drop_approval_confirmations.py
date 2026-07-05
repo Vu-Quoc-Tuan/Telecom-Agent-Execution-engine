@@ -6,11 +6,11 @@ Create Date: 2026-06-30 00:00:00.000000
 
 """
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
 
+from alembic import op
 
 revision: str = "3f4a5b6c7d8e"
 down_revision: str | None = "2c6d8e9f1041"

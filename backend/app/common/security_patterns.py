@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import re
 
 # Centralized sensitive keys used in dictionary/object value checks

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from collections.abc import Sequence
 
 from langchain_core.messages import (

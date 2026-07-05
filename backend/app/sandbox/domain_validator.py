@@ -1,4 +1,3 @@
-# backend/app/sandbox/domain_validator.py
 from __future__ import annotations
 
 import json

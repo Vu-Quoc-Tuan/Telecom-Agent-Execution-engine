@@ -7,7 +7,7 @@ from app.common.security_patterns import PRIVATE_KEY_PATTERN, SECRET_KEY_PATTERN
 
 
 class DataRedactor:
-    # 🕵️ Quét Regex tìm kiếm các chuỗi nhạy cảm dạng mật mã hoặc khóa bảo mật
+    # Quét Regex tìm kiếm các chuỗi nhạy cảm dạng mật mã hoặc khóa bảo mật
     REDACT_PATTERNS = [
         (
             re.compile(

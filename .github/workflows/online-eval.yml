@@ -26,8 +26,10 @@ jobs:
     timeout-minutes: 30
 
     env:
+      # Dataset URL can come from manual input or repository secret.
       EVAL_DATASET_URL: ${{ inputs.dataset_url || secrets.EVAL_DATASET_URL }}
       EVAL_DATASET_TOKEN: ${{ secrets.EVAL_DATASET_TOKEN }}
+      # Only used when upload_results=true.
       PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
       PROMPTFOO_CONFIG_DIR: /tmp/telecom-promptfoo
       PROMPTFOO_DISABLE_WAL_MODE: "true"

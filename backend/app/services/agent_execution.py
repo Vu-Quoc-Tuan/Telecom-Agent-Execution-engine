@@ -108,7 +108,7 @@ class AgentExecutionService:
         )
 
         trace_id = run_record.id.hex
-        # 🛡️ DLP: che mặt nạ secret/PII trước khi nội dung rời hệ thống sang LLM bên thứ 3.
+        # secret/PII trước khi nội dung rời hệ thống sang LLM bên thứ 3.
         sanitized_content = AgentSafetyGuard.sanitize_input_prompt(user_content)
 
         # Đếm số lượt user message để tính turn_index, giúp đặt tên span là agent_turn #1, #2...
