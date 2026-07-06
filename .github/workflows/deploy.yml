@@ -109,28 +109,24 @@ jobs:
           fi
 
           if [[ -n "$public_url" ]]; then
-            case "${NGROK_MANAGED:-false}" in
-              true|TRUE|1|yes|YES)
-                ngrok_config_path="${NGROK_CONFIG_PATH:-$HOME/.config/ngrok/ngrok.yml}"
-                ngrok_internal_url="${NGROK_INTERNAL_URL:-https://default.internal}"
-                ngrok_image="${NGROK_IMAGE:-ngrok/ngrok:latest}"
-                if [[ ! -f "$ngrok_config_path" ]]; then
-                  echo "Managed ngrok config does not exist: $ngrok_config_path" >&2
-                  exit 1
-                fi
-                docker rm -f telecom_agent_ngrok >/dev/null 2>&1 || true
-                docker run -d \
-                  --name telecom_agent_ngrok \
-                  --restart unless-stopped \
-                  --network host \
-                  -v "$ngrok_config_path:/etc/ngrok.yml:ro" \
-                  "$ngrok_image" \
-                  http http://127.0.0.1:8080 \
-                  --url "$ngrok_internal_url" \
-                  --config /etc/ngrok.yml \
-                  --log stdout
-                ;;
-            esac
+            ngrok_config_path="${NGROK_CONFIG_PATH:-$HOME/.config/ngrok/ngrok.yml}"
+            ngrok_agent_url="${NGROK_AGENT_URL:-https://default.internal}"
+            ngrok_image="${NGROK_IMAGE:-ngrok/ngrok:latest}"
+            if [[ ! -f "$ngrok_config_path" ]]; then
+              echo "Managed ngrok config does not exist: $ngrok_config_path" >&2
+              exit 1
+            fi
+            docker rm -f telecom_agent_ngrok >/dev/null 2>&1 || true
+            docker run -d \
+              --name telecom_agent_ngrok \
+              --restart unless-stopped \
+              --network host \
+              -v "$ngrok_config_path:/etc/ngrok.yml:ro" \
+              "$ngrok_image" \
+              http http://127.0.0.1:8080 \
+              --url "$ngrok_agent_url" \
+              --config /etc/ngrok.yml \
+              --log stdout
 
             public_ready=0
             for _ in $(seq 1 15); do

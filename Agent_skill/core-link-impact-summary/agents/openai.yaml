@@ -1,0 +1,4 @@
+interface:
+  display_name: "Core Link Impact Summary"
+  short_description: "Summarize link impact from alarm batches"
+  default_prompt: "Use $core-link-impact-summary to summarize core link impact from alarm records."

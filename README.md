@@ -115,9 +115,8 @@ ngrok http 8080 --url https://default.internal
 The public URL remains the Cloud Endpoint URL shown in the ngrok dashboard, for example
 `https://karlene-thermostable-tabatha.ngrok-free.dev`.
 
-By default, the ngrok agent is managed outside the application stack and must already be running on
-the deploy host, typically as a systemd service or a long-running container. For a Docker agent
-while the edge remains loopback-only, use host networking:
+The `Deploy` workflow recreates the managed Docker ngrok agent whenever `public_url` is supplied.
+It forwards the Cloud Endpoint's internal URL to the local edge proxy with host networking:
 
 ```bash
 docker run -d \
@@ -135,10 +134,10 @@ docker run -d \
 Do not use Docker's default bridge with `host.docker.internal:8080` while the edge port is bound to
 `127.0.0.1`; the bridge gateway cannot reach that loopback-only listener.
 
-Alternatively, set `NGROK_MANAGED=true` and optionally `NGROK_CONFIG_PATH`,
-`NGROK_INTERNAL_URL`, and `NGROK_IMAGE` in the deploy host's `.env`. The `Deploy` workflow then
-recreates the agent with the host-network configuration above. When `public_url` is supplied, the
-workflow polls that URL and fails the deployment if the agent is not forwarding to the edge.
+If your ngrok config is not at `$HOME/.config/ngrok/ngrok.yml`, set `NGROK_CONFIG_PATH` on the
+deploy host. `NGROK_AGENT_URL` defaults to `https://default.internal`, and `NGROK_IMAGE` defaults
+to `ngrok/ngrok:latest`; override them only for a non-standard ngrok setup. The workflow polls
+`public_url` and fails the deployment if the agent is not forwarding to the edge.
 
 When dispatching the `Deploy` workflow, set:
 

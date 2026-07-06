@@ -1,0 +1,4 @@
+interface:
+  display_name: "RAN KPI Anomaly Triage"
+  short_description: "Triage RAN KPI anomalies for NOC review"
+  default_prompt: "Use $ran-kpi-anomaly-triage to rank RAN KPI anomalies and suggest NOC follow-up."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Memory Heavy KPI Audit"
+  short_description: "Sandbox memory failure fixture"
+  default_prompt: "Use $memory-heavy-kpi-audit to demonstrate Docker sandbox memory rejection."

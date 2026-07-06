@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unsafe Node Debug Shell"
+  short_description: "Intentional static security rejection fixture"
+  default_prompt: "Use $unsafe-node-debug-shell to demonstrate unsafe script rejection during upload."

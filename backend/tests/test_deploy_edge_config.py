@@ -83,10 +83,11 @@ def test_deploy_workflow_supports_stable_single_ngrok_url() -> None:
     assert "ngrok-skip-browser-warning" in workflow
     assert '"service":"telecom-ai-agent-backend"' in workflow
     assert 'docker build -t "$sandbox_image" -f sandbox.Dockerfile .' in workflow
-    assert 'case "${NGROK_MANAGED:-false}"' in workflow
+    assert 'case "${NGROK_MANAGED:-false}"' not in workflow
     assert "--network host" in workflow
     assert "http://127.0.0.1:8080" in workflow
-    assert '"${NGROK_INTERNAL_URL:-https://default.internal}"' in workflow
+    assert '"${NGROK_AGENT_URL:-https://default.internal}"' in workflow
+    assert "docker rm -f telecom_agent_ngrok" in workflow
 
 
 def test_ci_runs_frontend_unit_and_database_integration_tests() -> None:
