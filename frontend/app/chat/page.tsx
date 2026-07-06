@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ModelPicker, SkillCommandMenu } from "@/components/chat-config-menu";
 import {
   DatabaseIcon,
@@ -20,6 +20,7 @@ import {
 import { MarkdownMessage } from "@/components/markdown-message";
 import { apiFetch, apiUrl } from "@/lib/api";
 import { consumeSseStream, ParsedSseEvent } from "@/lib/sse";
+import { useRunTimeline } from "./use-run-timeline";
 import type {
   ChatMessage,
   ChatModelOption,
@@ -550,13 +551,6 @@ function PhaseChip({
   );
 }
 
-type RunTimelineResponse = {
-  run_id: string;
-  status: string;
-  model?: string | null;
-  steps: TimelineStep[];
-};
-
 function ThinkingPanel({
   steps,
   open,
@@ -590,7 +584,10 @@ function ThinkingPanel({
     <section className="rounded-lg border border-warm-border/80 bg-code-block/45">
       <button
         type="button"
-        onClick={onToggle}
+        onClick={(event) => {
+          event.stopPropagation();
+          onToggle();
+        }}
         className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left"
         aria-expanded={open}
       >
@@ -662,10 +659,26 @@ function AssistantMessageBubble({
 }) {
   const hasTimeline = Boolean(message.run_id);
   const showThinking = hasTimeline && message.status === "streaming";
+  const handleTimelineKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!hasTimeline || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    onSelectTimeline();
+  };
 
   return (
     <div
       onClick={hasTimeline ? onSelectTimeline : undefined}
+      onKeyDown={hasTimeline ? handleTimelineKeyDown : undefined}
+      role={hasTimeline ? "button" : undefined}
+      tabIndex={hasTimeline ? 0 : undefined}
+      aria-pressed={hasTimeline ? isSelected : undefined}
+      aria-label={
+        hasTimeline
+          ? isSelected
+            ? "Đang xem chi tiết bước của phản hồi"
+            : "Xem chi tiết bước của phản hồi"
+          : undefined
+      }
       className={`flex w-full max-w-[min(760px,92%)] flex-col gap-2 rounded-lg border px-4 py-3 transition ${
         hasTimeline ? "cursor-pointer" : ""
       } ${
@@ -799,15 +812,23 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [prompt, setPrompt] = useState("");
-  const [steps, setSteps] = useState<TimelineStep[]>([]);
-  const [selectedTimelineRunId, setSelectedTimelineRunId] = useState<string | null>(null);
-  const [timelineLoading, setTimelineLoading] = useState(false);
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [resources, setResources] = useState<ResourceItem[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"timeline" | "resources">("timeline");
+  const activateTimeline = useCallback(() => setActiveTab("timeline"), []);
+  const {
+    steps,
+    selectedTimelineRunId,
+    timelineLoading,
+    clearTimeline,
+    selectTimelineRunId,
+    getSelectedTimelineRunId,
+    applyTimelineUpdate,
+    loadRunTimeline,
+  } = useRunTimeline({ onActivate: activateTimeline, onError: setError });
   const [approval, setApproval] = useState<PendingApproval | null>(null);
   const [chatOptions, setChatOptions] = useState<ChatOptions>({
     default_model: null,
@@ -820,12 +841,12 @@ export default function ChatPage() {
   >(null);
   const [selectedSkillName, setSelectedSkillName] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const isMountedRef = useRef(true);
   const activeRunIdRef = useRef<string | null>(null);
   const activeAssistantIdRef = useRef<string | null>(null);
   const streamGenerationRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const historyRequestRef = useRef(0);
-  const selectedTimelineRunIdRef = useRef<string | null>(null);
 
   const resourceQuery = useMemo(() => {
     const match = prompt.match(/(^|\s)@([\w.-]*)$/);
@@ -855,9 +876,7 @@ export default function ChatPage() {
     setActiveSessionId(sessionId);
     setError(null);
     setApproval(null);
-    setSteps([]);
-    setSelectedTimelineRunId(null);
-    selectedTimelineRunIdRef.current = null;
+    clearTimeline();
     setExpandedThinking({});
     setActiveRunId(null);
     activeRunIdRef.current = null;
@@ -897,7 +916,7 @@ export default function ChatPage() {
     } finally {
       if (historyRequestRef.current === requestId) setLoadingMessages(false);
     }
-  }, []);
+  }, [clearTimeline]);
 
   useEffect(() => {
     apiFetch<ChatSession[]>("/sessions")
@@ -925,30 +944,17 @@ export default function ChatPage() {
   }, [messages, approval]);
 
   useEffect(() => {
-    selectedTimelineRunIdRef.current = selectedTimelineRunId;
-  }, [selectedTimelineRunId]);
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
 
   function updateAssistant(messageId: string, updater: (message: ChatMessage) => ChatMessage) {
     setMessages((current) =>
       current.map((message) => (message.id === messageId ? updater(message) : message)),
     );
-  }
-
-  async function loadRunTimeline(runId: string | null | undefined) {
-    if (!runId) return;
-    setActiveTab("timeline");
-    setSelectedTimelineRunId(runId);
-    selectedTimelineRunIdRef.current = runId;
-    setTimelineLoading(true);
-    setError(null);
-    try {
-      const timeline = await apiFetch<RunTimelineResponse>(`/runs/${runId}/timeline`);
-      setSteps(timeline.steps);
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "Không tải được mạch tư duy của run.");
-    } finally {
-      setTimelineLoading(false);
-    }
   }
 
   async function createSession() {
@@ -964,9 +970,7 @@ export default function ChatPage() {
     setActiveSessionId(optimisticId);
     setMessages([]);
     setLoadingMessages(false);
-    setSteps([]);
-    setSelectedTimelineRunId(null);
-    selectedTimelineRunIdRef.current = null;
+    clearTimeline();
     setExpandedThinking({});
     setActiveRunId(null);
     activeRunIdRef.current = null;
@@ -1006,9 +1010,7 @@ export default function ChatPage() {
     if (activeSessionId === sessionId) {
       setActiveSessionId(null);
       setMessages([]);
-      setSteps([]);
-      setSelectedTimelineRunId(null);
-      selectedTimelineRunIdRef.current = null;
+      clearTimeline();
       setExpandedThinking({});
       setActiveRunId(null);
       activeRunIdRef.current = null;
@@ -1033,8 +1035,7 @@ export default function ChatPage() {
     if (event.event === "run_started") {
       const runId = typeof payload.run_id === "string" ? payload.run_id : null;
       if (runId) {
-        setSelectedTimelineRunId(runId);
-        selectedTimelineRunIdRef.current = runId;
+        selectTimelineRunId(runId);
         setActiveRunId(runId);
         activeRunIdRef.current = runId;
         setExpandedThinking((current) => ({ ...current, [runId]: true }));
@@ -1052,11 +1053,9 @@ export default function ChatPage() {
       }));
     }
     if (event.event === "timeline_updated" && Array.isArray(payload.steps)) {
-      const selectedRunId = selectedTimelineRunIdRef.current;
-      const runId = typeof payload.run_id === "string" ? payload.run_id : selectedRunId;
-      if (!selectedRunId || selectedRunId === runId) {
-        setSteps(payload.steps as TimelineStep[]);
-      }
+      const runId =
+        typeof payload.run_id === "string" ? payload.run_id : getSelectedTimelineRunId();
+      if (runId) applyTimelineUpdate(runId, payload.steps as TimelineStep[]);
     }
     if (event.event === "run_suspended") {
       setMessages((current) => current.filter((message) => message.id !== assistantId));
@@ -1196,12 +1195,14 @@ export default function ChatPage() {
       );
     } catch (exc) {
       if (controller.signal.aborted) {
-        updateAssistant(assistantMessage.id, (message) => ({
-          ...message,
-          content: message.content || "Đã dừng stream theo yêu cầu người trực.",
-          status: "done",
-        }));
-      } else if (streamGenerationRef.current === streamGeneration) {
+        if (isMountedRef.current) {
+          updateAssistant(assistantMessage.id, (message) => ({
+            ...message,
+            content: message.content || "Đã dừng stream theo yêu cầu người trực.",
+            status: "done",
+          }));
+        }
+      } else if (isMountedRef.current && streamGenerationRef.current === streamGeneration) {
         const message = exc instanceof Error ? exc.message : "Không mở được SSE stream.";
         setError(message);
         updateAssistant(assistantMessage.id, (current) => ({
@@ -1212,9 +1213,9 @@ export default function ChatPage() {
       }
     } finally {
       if (streamGenerationRef.current === streamGeneration) {
-        setStreaming(false);
-        abortRef.current = null;
-        activeAssistantIdRef.current = null;
+        if (isMountedRef.current) setStreaming(false);
+        if (abortRef.current === controller) abortRef.current = null;
+        if (activeAssistantIdRef.current === assistantMessage.id) activeAssistantIdRef.current = null;
       }
     }
   }
@@ -1231,6 +1232,7 @@ export default function ChatPage() {
       run_id: currentApproval.run_id,
     };
     setMessages((current) => [...current, assistantMessage]);
+    activeAssistantIdRef.current = assistantMessage.id;
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -1245,17 +1247,28 @@ export default function ChatPage() {
       });
       await consumeSseStream(response, (sseEvent) => handleSseEvent(sseEvent, assistantMessage.id));
     } catch (exc) {
-      const message = exc instanceof Error ? exc.message : "Không resolve được approval.";
-      setError(message);
-      updateAssistant(assistantMessage.id, (current) => ({
-        ...current,
-        content: current.content || message,
-        status: "error",
-      }));
-      setApproval(currentApproval);
+      if (controller.signal.aborted) {
+        if (isMountedRef.current) {
+          updateAssistant(assistantMessage.id, (current) => ({
+            ...current,
+            content: current.content || "Đã dừng stream theo yêu cầu người trực.",
+            status: "done",
+          }));
+        }
+      } else if (isMountedRef.current) {
+        const message = exc instanceof Error ? exc.message : "Không resolve được approval.";
+        setError(message);
+        updateAssistant(assistantMessage.id, (current) => ({
+          ...current,
+          content: current.content || message,
+          status: "error",
+        }));
+        setApproval(currentApproval);
+      }
     } finally {
-      setStreaming(false);
-      abortRef.current = null;
+      if (isMountedRef.current) setStreaming(false);
+      if (abortRef.current === controller) abortRef.current = null;
+      if (activeAssistantIdRef.current === assistantMessage.id) activeAssistantIdRef.current = null;
     }
   }
 
@@ -1381,8 +1394,7 @@ export default function ChatPage() {
                       onSelectTimeline={() => {
                         if (!message.run_id) return;
                         if (isSelected) {
-                          setSelectedTimelineRunId(null);
-                          setSteps([]);
+                          clearTimeline();
                         } else {
                           void loadRunTimeline(message.run_id);
                         }

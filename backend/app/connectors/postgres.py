@@ -64,6 +64,7 @@ class TelcoPostgresConnector(BaseConnector):
         statement = text(sql)
         with self._engine.begin() as connection:
             if self.read_only:
+                # The external DB boundary is enforced by transaction/user permissions.
                 connection.execute(text("SET TRANSACTION READ ONLY"))
             result = connection.execute(statement, bind_params)
             if result.returns_rows:

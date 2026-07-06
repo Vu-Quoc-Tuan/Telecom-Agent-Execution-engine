@@ -145,143 +145,35 @@ class AgentExecutionService:
         }
 
         agent_app = cls.get_agent_app()
-        try:
-            with TelecomTaskTracer("agent_run", session_id=str(session_id), run_id=trace_id):
-                async for chunk in agent_app.astream(
-                    initial_state, config=graph_config, stream_mode=["updates", "custom"]
-                ):
-                    stream_mode, stream_payload = cls._normalize_graph_stream_chunk(chunk)
-                    if stream_mode == "custom":
-                        text_delta = cls._text_delta_payload(
-                            stream_payload, run_id=str(run_record.id)
-                        )
-                        if text_delta is not None:
-                            yield "text_delta", text_delta
-                        continue
 
-                    node_name = next(iter(stream_payload.keys()))
-                    RunRepository.increment_step_count(db, run_record.id)
-                    yield (
-                        "timeline_updated",
-                        {
-                            "run_id": str(run_record.id),
-                            "last_executed_node": node_name,
-                            "steps": cls._serialize_steps(db, run_record.id),
-                        },
-                    )
-
-                final_graph_state = await cls._get_graph_state(agent_app, config=graph_config)
-                latest_response = final_graph_state.values.get("latest_response")
-                execution_error = final_graph_state.values.get("execution_error")
-
-                if execution_error:
-                    error_message = cls._mark_run_failed(
-                        db,
-                        run_record.id,
-                        error_message=str(execution_error),
-                        source="agent_graph",
-                    )
-                    telemetry_tracker.trace_run_end(
-                        run_id=trace_id,
-                        output_content=error_message,
-                        status="failed",
-                    )
-                    yield (
-                        "run_failed",
-                        {
-                            "run_id": str(run_record.id),
-                            "error": error_message,
-                        },
-                    )
-                    return
-
-                ApprovalRepository.expire_pending_requests(db, run_id=run_record.id)
-                pending_approvals = [
-                    approval
-                    for approval in ApprovalRepository.get_pending_requests(db)
-                    if approval.run_id == run_record.id
-                ]
-                if pending_approvals:
-                    RunRepository.update_run_status(
-                        db, run_record.id, status=RunStatus.WAITING_APPROVAL.value
-                    )
-                    approval = pending_approvals[0]
-                    tool_call = ToolCallRepository.get_tool_call(db, approval.tool_call_id)
-                    yield (
-                        "run_suspended",
-                        cls._build_run_suspended_event(run_record.id, approval, tool_call),
-                    )
-                    return
-
-                if latest_response:
-                    assistant_text = latest_response.content or "Tác vụ hoàn thành."
-                    updated_run = RunRepository.update_run_status(
-                        db, run_record.id, status=RunStatus.COMPLETED.value
-                    )
-                    terminal_error = cls._terminal_error_message(updated_run)
-                    if terminal_error:
-                        telemetry_tracker.trace_run_end(
-                            run_id=trace_id,
-                            output_content=terminal_error,
-                            status="failed",
-                        )
-                        yield (
-                            "run_failed",
-                            {"run_id": str(run_record.id), "error": terminal_error},
-                        )
-                        return
-                    MessageRepository.save_message(
-                        db=db,
-                        session_id=session_id,
-                        run_id=run_record.id,
-                        role="assistant",
-                        content=assistant_text,
-                    )
-                    telemetry_tracker.trace_run_end(
-                        run_id=trace_id,
-                        output_content=assistant_text,
-                        status="completed",
-                    )
-                    yield (
-                        "run_completed",
-                        {"run_id": str(run_record.id), "final_answer": assistant_text},
-                    )
-                    await cls._maybe_update_session_title(
-                        db=db,
-                        llm_gateway=llm_gateway,
-                        session=session,
-                        sanitized_content=sanitized_content,
-                        provider=provider,
-                        model=model,
-                    )
-                    return
-
-                error_message = "Agent graph ended without a final response."
-                error_message = cls._mark_run_failed(
-                    db,
-                    run_record.id,
-                    error_message=error_message,
-                    source="agent_graph",
-                )
-                telemetry_tracker.trace_run_end(
-                    run_id=trace_id,
-                    output_content=error_message,
-                    status="failed",
-                )
-                yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
-        except Exception as exc:
-            error_message = cls._mark_run_failed(
-                db,
-                run_record.id,
-                error_message=str(exc),
-                source="agent_lifecycle",
+        async def update_session_title(_: str) -> None:
+            await cls._maybe_update_session_title(
+                db=db,
+                llm_gateway=llm_gateway,
+                session=session,
+                sanitized_content=sanitized_content,
+                provider=provider,
+                model=model,
             )
-            telemetry_tracker.trace_run_end(
-                run_id=trace_id,
-                output_content=error_message,
-                status="failed",
-            )
-            yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
+
+        async for event in cls._stream_graph_and_finalize(
+            db=db,
+            agent_app=agent_app,
+            graph_config=graph_config,
+            run_record=run_record,
+            session_id=session_id,
+            stream_input=initial_state,
+            tracer_name="agent_run",
+            tracer_run_id=trace_id,
+            trace_id=trace_id,
+            execution_error_source="agent_graph",
+            exception_source="agent_lifecycle",
+            completion_default_text="Tác vụ hoàn thành.",
+            missing_response_error="Agent graph ended without a final response.",
+            empty_content_uses_default=True,
+            on_completed=update_session_title,
+        ):
+            yield event
 
     @classmethod
     async def resolve_approval_and_resume_lifecycle(
@@ -492,28 +384,62 @@ class AgentExecutionService:
 
         RunRepository.update_run_status(db, run_record.id, status=RunStatus.RUNNING.value)
         yield "run_resumed", {"run_id": str(run_record.id), "action_taken": action}
+        resume_command = Command(
+            resume={
+                "messages": [message.model_dump(mode="json") for message in new_tool_messages],
+                "approval_rejected": any(
+                    request.status == "rejected" for request in batch_requests
+                ),
+            }
+        )
+        async for event in cls._stream_graph_and_finalize(
+            db=db,
+            agent_app=agent_app,
+            graph_config=graph_config,
+            run_record=run_record,
+            session_id=session_id,
+            stream_input=resume_command,
+            tracer_name="agent_resume",
+            tracer_run_id=str(run_record.id),
+            trace_id=run_record.id.hex,
+            execution_error_source="agent_resume",
+            exception_source="agent_resume",
+            completion_default_text="Tác vụ sau phê duyệt xử lý xong.",
+        ):
+            yield event
+
+    @classmethod
+    async def _stream_graph_and_finalize(
+        cls,
+        *,
+        db: Session,
+        agent_app: Any,
+        graph_config: RunnableConfig,
+        run_record: Any,
+        session_id: uuid.UUID,
+        stream_input: Any,
+        tracer_name: str,
+        tracer_run_id: str,
+        trace_id: str,
+        execution_error_source: str,
+        exception_source: str,
+        completion_default_text: str,
+        missing_response_error: str | None = None,
+        empty_content_uses_default: bool = False,
+        on_completed: Any | None = None,
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         try:
-            with TelecomTaskTracer(
-                "agent_resume", session_id=str(session_id), run_id=str(run_record.id)
-            ):
+            with TelecomTaskTracer(tracer_name, session_id=str(session_id), run_id=tracer_run_id):
                 async for chunk in agent_app.astream(
-                    Command(
-                        resume={
-                            "messages": [
-                                message.model_dump(mode="json") for message in new_tool_messages
-                            ],
-                            "approval_rejected": any(
-                                request.status == "rejected" for request in batch_requests
-                            ),
-                        }
-                    ),
+                    stream_input,
                     config=graph_config,
                     stream_mode=["updates", "custom"],
                 ):
                     stream_mode, stream_payload = cls._normalize_graph_stream_chunk(chunk)
                     if stream_mode == "custom":
                         text_delta = cls._text_delta_payload(
-                            stream_payload, run_id=str(run_record.id)
+                            stream_payload,
+                            run_id=str(run_record.id),
                         )
                         if text_delta is not None:
                             yield "text_delta", text_delta
@@ -533,15 +459,16 @@ class AgentExecutionService:
                 final_graph_state = await cls._get_graph_state(agent_app, config=graph_config)
                 latest_response = final_graph_state.values.get("latest_response")
                 execution_error = final_graph_state.values.get("execution_error")
+
                 if execution_error:
                     error_message = cls._mark_run_failed(
                         db,
                         run_record.id,
                         error_message=str(execution_error),
-                        source="agent_resume",
+                        source=execution_error_source,
                     )
                     telemetry_tracker.trace_run_end(
-                        run_id=run_record.id.hex,
+                        run_id=trace_id,
                         output_content=error_message,
                         status="failed",
                     )
@@ -562,7 +489,9 @@ class AgentExecutionService:
                 ]
                 if pending_approvals:
                     RunRepository.update_run_status(
-                        db, run_record.id, status=RunStatus.WAITING_APPROVAL.value
+                        db,
+                        run_record.id,
+                        status=RunStatus.WAITING_APPROVAL.value,
                     )
                     approval = pending_approvals[0]
                     tool_call = ToolCallRepository.get_tool_call(db, approval.tool_call_id)
@@ -571,18 +500,37 @@ class AgentExecutionService:
                         cls._build_run_suspended_event(run_record.id, approval, tool_call),
                     )
                     return
-                assistant_text = (
-                    latest_response.content
-                    if (latest_response and latest_response.content is not None)
-                    else "Tác vụ sau phê duyệt xử lý xong."
-                )
+
+                if latest_response is None and missing_response_error is not None:
+                    error_message = cls._mark_run_failed(
+                        db,
+                        run_record.id,
+                        error_message=missing_response_error,
+                        source=execution_error_source,
+                    )
+                    telemetry_tracker.trace_run_end(
+                        run_id=trace_id,
+                        output_content=error_message,
+                        status="failed",
+                    )
+                    yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
+                    return
+
+                assistant_text = completion_default_text
+                if latest_response and latest_response.content is not None:
+                    assistant_text = latest_response.content
+                    if empty_content_uses_default and not assistant_text:
+                        assistant_text = completion_default_text
+
                 updated_run = RunRepository.update_run_status(
-                    db, run_record.id, status=RunStatus.COMPLETED.value
+                    db,
+                    run_record.id,
+                    status=RunStatus.COMPLETED.value,
                 )
                 terminal_error = cls._terminal_error_message(updated_run)
                 if terminal_error:
                     telemetry_tracker.trace_run_end(
-                        run_id=run_record.id.hex,
+                        run_id=trace_id,
                         output_content=terminal_error,
                         status="failed",
                     )
@@ -598,9 +546,8 @@ class AgentExecutionService:
                     role="assistant",
                     content=assistant_text,
                 )
-
                 telemetry_tracker.trace_run_end(
-                    run_id=run_record.id.hex,
+                    run_id=trace_id,
                     output_content=assistant_text,
                     status="completed",
                 )
@@ -608,15 +555,19 @@ class AgentExecutionService:
                     "run_completed",
                     {"run_id": str(run_record.id), "final_answer": assistant_text},
                 )
+                if on_completed is not None:
+                    maybe_awaitable = on_completed(assistant_text)
+                    if inspect.isawaitable(maybe_awaitable):
+                        await maybe_awaitable
         except Exception as exc:
             error_message = cls._mark_run_failed(
                 db,
                 run_record.id,
                 error_message=str(exc),
-                source="agent_resume",
+                source=exception_source,
             )
             telemetry_tracker.trace_run_end(
-                run_id=run_record.id.hex,
+                run_id=trace_id,
                 output_content=error_message,
                 status="failed",
             )

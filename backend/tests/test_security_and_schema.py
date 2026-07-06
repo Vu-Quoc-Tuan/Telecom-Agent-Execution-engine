@@ -368,60 +368,6 @@ class SafetyGuardTests(unittest.TestCase):
         self.assertNotIn("secret-body", redacted)
         self.assertEqual("[REDACTED PRIVATE KEY]", redacted)
 
-    def test_verify_read_only_sql(self) -> None:
-        # Standard select
-        is_safe, err = AgentSafetyGuard.verify_read_only_sql("SELECT * FROM station")
-        self.assertTrue(is_safe)
-        self.assertIsNone(err)
-
-        # Allowed introspection commands
-        for cmd in [
-            "DESCRIBE TABLE alarm",
-            "DESC alarm_data.station",
-            "SHOW TABLES",
-            "EXPLAIN SELECT 1",
-        ]:
-            is_safe, err = AgentSafetyGuard.verify_read_only_sql(cmd)
-            self.assertTrue(is_safe, f"Failed on: {cmd}")
-            self.assertIsNone(err)
-
-        # Prohibited mutations
-        for cmd in [
-            "INSERT INTO station VALUES (1)",
-            "DROP TABLE station",
-            "UPDATE station SET name = 'abc'",
-        ]:
-            is_safe, err = AgentSafetyGuard.verify_read_only_sql(cmd)
-            self.assertFalse(is_safe, f"Allowed prohibited: {cmd}")
-            self.assertIsNotNone(err)
-
-    def test_verify_read_only_sql_allows_identifier_like_mutation_keywords(self) -> None:
-        allowed_queries = [
-            "SELECT update_count, delete_count FROM metrics",
-            "SELECT replace(site_name, 'old', 'new') FROM station",
-            "SHOW CREATE TABLE station",
-        ]
-        for sql in allowed_queries:
-            is_safe, err = AgentSafetyGuard.verify_read_only_sql(sql)
-            self.assertTrue(is_safe, f"Rejected read-only query: {sql}: {err}")
-            self.assertIsNone(err)
-
-    def test_verify_read_only_sql_rejects_export_and_explain_mutations(self) -> None:
-        prohibited_queries = [
-            "SELECT * FROM station INTO OUTFILE '/tmp/station.tsv'",
-            "EXPLAIN INSERT INTO station VALUES (1)",
-            "WITH removed AS (DELETE FROM station RETURNING *) SELECT * FROM removed",
-            "WITH data AS (SELECT 1) DELETE FROM station",
-            "WITH removed AS ((DELETE FROM station RETURNING *)) SELECT * FROM removed",
-            "WITH name AS (SELECT 1) (INSERT INTO station)",
-            "WITH name AS (SELECT 1) ((DELETE FROM station))",
-            "WITH removed AS( ( ( DELETE FROM station RETURNING * ) ) ) SELECT * FROM removed",
-        ]
-        for sql in prohibited_queries:
-            is_safe, err = AgentSafetyGuard.verify_read_only_sql(sql)
-            self.assertFalse(is_safe, f"Allowed prohibited query: {sql}")
-            self.assertIsNotNone(err)
-
     def test_classify_ssh_command_edge_cases(self) -> None:
         # Empty command raises SafetyViolationError
         with self.assertRaises(SafetyViolationError):

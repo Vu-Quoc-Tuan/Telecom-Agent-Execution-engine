@@ -11,17 +11,15 @@ from langgraph.types import interrupt
 
 from app.agent.builtin_runners import execute_builtin_tool
 from app.agent.builtin_tools import (
-    BUILTIN_TOOL_NAMES,
     LOAD_SKILL,
     build_builtin_tool_definitions,
-    classify_builtin_risk,
     connector_name_for,
 )
 from app.agent.context_window import compact_messages_if_needed
 from app.agent.prompts import build_context_compaction_prompt, build_system_prompt
 from app.agent.safety import AgentSafetyGuard
 from app.agent.state import AgentState
-from app.agent.tool_validation import validate_tool_call_arguments
+from app.agent.tool_batch_planner import build_tool_batch_plan
 from app.common.enums import StepType
 from app.common.exceptions import TelecomAgentException
 from app.database.repositories.approvals import ApprovalRepository
@@ -346,43 +344,30 @@ class AgentNodes:
         tool_calls = state.latest_response.tool_calls if state.latest_response else []
         executed_tool_messages: dict[str, LLMMessage] = {}
         settings = config["configurable"].get("settings")
-        tool_catalog = build_builtin_tool_definitions(
-            SkillRepository.list_ready_skills(db),
-            sandbox_available=_sandbox_available(settings),
+        plan = build_tool_batch_plan(
+            db=db,
+            tool_calls=tool_calls,
             settings=settings,
         )
 
-        for index, tool_call in enumerate(tool_calls):
+        for item in plan.items:
+            index = item.index
+            tool_call = item.tool_call
             idempotency_key = f"approval:{run_uuid}:{tool_call.id}"
             existing = ToolCallRepository.get_by_idempotency_key(db, idempotency_key)
             if existing is not None:
                 continue
 
-            try:
-                validate_tool_call_arguments(
-                    tool_name=tool_call.name,
-                    arguments=tool_call.arguments,
-                    tools=tool_catalog,
-                )
-            except TelecomAgentException as exc:
+            if item.error_message is not None:
                 RunStepRepository.create_error_step(
                     db=db,
                     run_id=run_uuid,
-                    summary=exc.message,
+                    summary=item.error_message,
                     metadata={"tool_name": tool_call.name, "tool_call_id": tool_call.id},
                 )
-                return {"execution_error": exc.message}
+                return {"execution_error": item.error_message}
 
-            try:
-                risk_level = classify_builtin_risk(tool_call.name, tool_call.arguments)
-            except TelecomAgentException as exc:
-                RunStepRepository.create_error_step(
-                    db=db,
-                    run_id=run_uuid,
-                    summary=exc.message,
-                    metadata={"tool_name": tool_call.name, "tool_call_id": tool_call.id},
-                )
-                return {"execution_error": exc.message}
+            risk_level = item.risk_level or "auto_execute"
             if risk_level == "require_approval":
                 step = RunStepRepository.create_step(
                     db=db,
@@ -690,16 +675,15 @@ class AgentNodes:
         tool_calls_to_run = state.latest_response.tool_calls if state.latest_response else []
         new_tool_messages: list[LLMMessage] = []
         settings = config["configurable"].get("settings")
-        sandbox_available = _sandbox_available(settings)
-        ready_skills = SkillRepository.list_ready_skills(db)
-        ready_skill_names = {s.name for s in ready_skills}
-        tool_catalog = build_builtin_tool_definitions(
-            ready_skills,
-            sandbox_available=sandbox_available,
+        plan = build_tool_batch_plan(
+            db=db,
+            tool_calls=tool_calls_to_run,
             settings=settings,
         )
 
-        for index, tool_call in enumerate(tool_calls_to_run):
+        for item in plan.items:
+            index = item.index
+            tool_call = item.tool_call
             step = RunStepRepository.create_step(
                 db=db,
                 run_id=run_uuid,
@@ -709,15 +693,7 @@ class AgentNodes:
             )
             RunStepRepository.start_step(db, step.id)
 
-            if tool_call.name not in BUILTIN_TOOL_NAMES:
-                if tool_call.name in ready_skill_names:
-                    error_msg = (
-                        f"Tool '{tool_call.name}' is a skill name, not a built-in tool. "
-                        f"To use/execute this skill, you must first call the 'load_skill' tool "
-                        f"with argument skill_name='{tool_call.name}' to load its documentation/files."
-                    )
-                else:
-                    error_msg = f"Tool '{tool_call.name}' is not available."
+            if item.error_message is not None:
                 new_tool_messages.append(
                     AgentNodes._record_tool_validation_error(
                         db=db,
@@ -725,44 +701,12 @@ class AgentNodes:
                         run_id=run_uuid,
                         step_id=step.id,
                         tool_call=tool_call,
-                        error_message=error_msg,
+                        error_message=item.error_message,
                     )
                 )
                 continue
 
-            try:
-                validate_tool_call_arguments(
-                    tool_name=tool_call.name,
-                    arguments=tool_call.arguments,
-                    tools=tool_catalog,
-                )
-            except TelecomAgentException as exc:
-                new_tool_messages.append(
-                    AgentNodes._record_tool_validation_error(
-                        db=db,
-                        session_id=session_uuid,
-                        run_id=run_uuid,
-                        step_id=step.id,
-                        tool_call=tool_call,
-                        error_message=exc.message,
-                    )
-                )
-                continue
-
-            try:
-                risk_level = classify_builtin_risk(tool_call.name, tool_call.arguments)
-            except TelecomAgentException as exc:
-                new_tool_messages.append(
-                    AgentNodes._record_tool_validation_error(
-                        db=db,
-                        session_id=session_uuid,
-                        run_id=run_uuid,
-                        step_id=step.id,
-                        tool_call=tool_call,
-                        error_message=exc.message,
-                    )
-                )
-                continue
+            risk_level = item.risk_level or "auto_execute"
             if risk_level == "require_approval":
                 error_msg = f"Tool '{tool_call.name}' requires human approval and cannot be executed directly."
                 new_tool_messages.append(

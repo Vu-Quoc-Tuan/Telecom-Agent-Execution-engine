@@ -106,7 +106,8 @@ class TelcoClickHouseConnector(BaseConnector):
     async def query(self, sql: str, params: dict | None = None) -> list[dict[str, Any]]:
         """
         Hàm dành cho kỹ sư query dữ liệu log/alarm tập trung.
-        Bảo vệ Parameterized queries 100%, chống SQL Injection bằng tham số truyền vào.
+        Built-in backend tools use backend-owned SQL templates; read-only enforcement
+        is handled by ClickHouse settings/user permissions instead of regex guards.
         """
         try:
             return await asyncio.to_thread(self._sync_query, sql, params)

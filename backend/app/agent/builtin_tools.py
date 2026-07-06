@@ -399,11 +399,6 @@ def classify_builtin_risk(tool_name: str, arguments: dict[str, Any]) -> str:
     """Return one of the two execution modes used by the runtime router."""
     if tool_name not in BUILTIN_TOOL_NAMES:
         raise SkillRuntimeError(f"Tool built-in không tồn tại: '{tool_name}'.")
-    # Validate arguments against the tool's input schema if available
-    tool_def = next((t for t in BUILTIN_TOOL_DEFINITIONS if t.name == tool_name), None)
-    if tool_def and isinstance(tool_def.input_schema, dict):
-        from app.agent.tool_validation import validate_json_value_against_schema
-        validate_json_value_against_schema(value=arguments, schema=tool_def.input_schema, path=tool_name)
     if tool_name in {RESTART_SERVICE, RUN_SKILL_SCRIPT}:
         return ExecutionMode.REQUIRE_APPROVAL.value
     return ExecutionMode.AUTO_EXECUTE.value

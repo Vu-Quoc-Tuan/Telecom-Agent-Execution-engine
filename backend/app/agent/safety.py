@@ -3,7 +3,6 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
-from functools import lru_cache
 
 from app.common.enums import ExecutionMode
 from app.common.exceptions import SafetyViolationError
@@ -61,44 +60,6 @@ class AgentSafetyGuard:
         "uptime",
         "whoami",
     }
-    SQL_MUTATION_STATEMENT_KEYWORDS = {
-        "alter",
-        "attach",
-        "create",
-        "delete",
-        "detach",
-        "drop",
-        "grant",
-        "insert",
-        "kill",
-        "optimize",
-        "rename",
-        "replace",
-        "revoke",
-        "truncate",
-        "update",
-    }
-    SQL_PROHIBITED_READ_PATTERNS = (
-        re.compile(r"\binto\s+(?:out|dump)?file\b", re.IGNORECASE),
-        re.compile(
-            r"^\s*explain(?:\s+\([^)]*\))?\s+"
-            r"(?:alter|attach|create|delete|detach|drop|grant|insert|kill|optimize|"
-            r"rename|replace|revoke|truncate|update)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\bas\s*\(+[\s(]*"
-            r"(?:alter|attach|create|delete|detach|drop|grant|insert|kill|optimize|"
-            r"rename|replace|revoke|truncate|update)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\)[\s()]*"
-            r"(?:alter|attach|create|delete|detach|drop|grant|insert|kill|"
-            r"optimize|rename|replace|revoke|truncate|update)\b",
-            re.IGNORECASE,
-        ),
-    )
     PII_AND_SECRET_PATTERNS = {
         "SECRET": SECRET_MASK_PATTERN,
         "PRIVATE_KEY": PRIVATE_KEY_PATTERN,
@@ -196,34 +157,6 @@ class AgentSafetyGuard:
         if first_token and first_token.group(0) in cls.READ_ONLY_SSH_COMMANDS:
             return ExecutionMode.AUTO_EXECUTE
         return ExecutionMode.REQUIRE_APPROVAL
-
-    @staticmethod
-    @lru_cache(maxsize=128)
-    def verify_read_only_sql(sql: str) -> tuple[bool, str | None]:
-        clean_sql = sql.strip()
-        if not clean_sql:
-            return False, "SQL query is empty."
-
-        without_comments = re.sub(r"/\*[\s\S]*?\*/|--[^\r\n]*", " ", clean_sql)
-        without_literals = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", " ", without_comments)
-        statements = [part.strip() for part in without_literals.split(";") if part.strip()]
-        if len(statements) != 1:
-            return False, "Only one SQL statement is allowed."
-
-        # Extract lowercase word tokens — note that underscores break words,
-        tokens = re.findall(r"\b[a-z][a-z0-9]*\b", statements[0].lower())
-        if not tokens or tokens[0] not in {"select", "with", "describe", "desc", "show", "explain"}:
-            return False, "Only SELECT, WITH, DESCRIBE, DESC, SHOW, or EXPLAIN queries are allowed."
-        normalized_stmt = statements[0].lower()
-        if tokens[0] in AgentSafetyGuard.SQL_MUTATION_STATEMENT_KEYWORDS:
-            return False, f"SQL contains prohibited statement: {tokens[0]}."
-        for pattern in AgentSafetyGuard.SQL_PROHIBITED_READ_PATTERNS:
-            match = pattern.search(normalized_stmt)
-            if match:
-                return False, f"SQL contains prohibited clause: {match.group(0).strip()}."
-        if tokens[0] == "with" and "select" not in tokens:
-            return False, "WITH queries must end in a SELECT."
-        return True, None
 
     @staticmethod
     def truncate_output(output: str, max_characters: int = 15000) -> tuple[str, bool]:

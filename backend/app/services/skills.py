@@ -65,6 +65,141 @@ class SkillValidationError(Exception):
         self.http_status_code = http_status_code
 
 
+class SkillPackageParser:
+    def __init__(self, service: SkillValidationService) -> None:
+        self._service = service
+
+    def parse(self, zip_bytes: bytes) -> ParsedSkillPackage:
+        return self._service._parse_package_impl(zip_bytes)
+
+
+class SkillSecurityScanner:
+    def scan(self, package: ParsedSkillPackage, logs: list[str]) -> bool:
+        text_sources = {"SKILL.md": package.body}
+        for path, record in package.bundled_files.items():
+            if record["encoding"] == "utf-8":
+                text_sources[path] = record["content"]
+            if path.endswith(".py") and record["encoding"] == "utf-8":
+                ast_clean, ast_errors = AdvancedASTSecurityAnalyzer.analyze_source_code(
+                    record["content"]
+                )
+                if not ast_clean:
+                    logs.extend([f"[{path} AST ERROR]: {error}" for error in ast_errors])
+                    return True
+
+        for path, content in text_sources.items():
+            for secret_type, pattern in AgentSafetyGuard.PII_AND_SECRET_PATTERNS.items():
+                if pattern.search(content):
+                    logs.append(
+                        f"[{path} SECURITY ERROR]: Phát hiện chuỗi nhạy cảm/secret ({secret_type})."
+                    )
+                    return True
+        return False
+
+
+class SkillSandboxValidator:
+    async def validate(
+        self,
+        *,
+        package: ParsedSkillPackage,
+        script_manifest: dict[str, dict[str, Any]],
+        python_scripts: dict[str, dict[str, Any]],
+        logs: list[str],
+        validate_output_contract,
+    ) -> bool:
+        logs.append("[VONG 5] Docker sandbox script smoke testing started.")
+        sandbox_passed = True
+        if python_scripts:
+            try:
+                from app.config import settings as app_settings
+                from app.sandbox.docker_executor import build_sandbox_executor_from_settings
+
+                sandbox_executor = build_sandbox_executor_from_settings(app_settings)
+                if sandbox_executor is not None:
+                    for script_path in python_scripts:
+                        logs.append(f"[VONG 5] Smoke testing script: {script_path}")
+                        try:
+                            manifest_entry = script_manifest[script_path]
+                            result = await sandbox_executor.validate_skill_script(
+                                script_path=script_path,
+                                arguments=manifest_entry.get("smoke_test", {}).get("arguments", {}),
+                                bundled_files=package.bundled_files,
+                                timeout_seconds=int(
+                                    manifest_entry.get("limits", {}).get("timeout_seconds", 15)
+                                ),
+                            )
+                            if result.exit_code != 0:
+                                sandbox_passed = False
+                                error_info = result.stderr or f"Exit code {result.exit_code}"
+                                manifest_entry["status"] = "failed"
+                                manifest_entry["sandbox_result"] = {
+                                    "exit_code": result.exit_code,
+                                    "stderr": error_info[:1000],
+                                    "timed_out": result.timed_out,
+                                }
+                                logs.append(
+                                    f"[VONG 5] Script '{script_path}' FAILED sandbox validation: "
+                                    f"{error_info[:500]}"
+                                )
+                            else:
+                                output_error = validate_output_contract(
+                                    script_path=script_path,
+                                    manifest_entry=manifest_entry,
+                                    stdout=result.stdout or "",
+                                )
+                                if output_error:
+                                    sandbox_passed = False
+                                    manifest_entry["status"] = "failed"
+                                    manifest_entry["sandbox_result"] = {
+                                        "exit_code": result.exit_code,
+                                        "stdout_preview": (result.stdout or "")[:1000],
+                                        "timed_out": result.timed_out,
+                                        "output_contract_error": output_error,
+                                    }
+                                    logs.append(
+                                        f"[VONG 5] Script '{script_path}' FAILED output contract: "
+                                        f"{output_error[:500]}"
+                                    )
+                                else:
+                                    manifest_entry["status"] = "passed"
+                                    manifest_entry["sandbox_result"] = {
+                                        "exit_code": result.exit_code,
+                                        "stdout_preview": (result.stdout or "")[:1000],
+                                        "timed_out": result.timed_out,
+                                    }
+                                    logs.append(
+                                        f"[VONG 5] Script '{script_path}' passed sandbox validation."
+                                    )
+                        except Exception as exc:
+                            sandbox_passed = False
+                            script_manifest[script_path]["status"] = "failed"
+                            script_manifest[script_path]["sandbox_result"] = {
+                                "exit_code": 1,
+                                "stderr": str(exc)[:1000],
+                                "timed_out": False,
+                            }
+                            logs.append(
+                                f"[VONG 5] Script '{script_path}' sandbox validation error: {exc}"
+                            )
+                else:
+                    logs.append(
+                        "[VONG 5] Docker sandbox not available; auto-marking scripts as passed."
+                    )
+                    for script_path in python_scripts:
+                        if script_path in script_manifest:
+                            script_manifest[script_path]["status"] = "passed"
+            except Exception as exc:
+                logs.append(
+                    f"[VONG 5] Sandbox validation unavailable: {exc}; auto-marking scripts as passed."
+                )
+                for script_path in python_scripts:
+                    if script_path in script_manifest:
+                        script_manifest[script_path]["status"] = "passed"
+        else:
+            logs.append("[VONG 5] No Python scripts found in package, skipping sandbox validation.")
+        return sandbox_passed
+
+
 class SkillValidationService:
     MAX_ARCHIVE_BYTES = 10 * 1024 * 1024
     MAX_FILE_COUNT = 200
@@ -88,8 +223,14 @@ class SkillValidationService:
 
     def __init__(self, *, skill_repository=SkillRepository) -> None:
         self.skill_repository = skill_repository
+        self.package_parser = SkillPackageParser(self)
+        self.security_scanner = SkillSecurityScanner()
+        self.sandbox_validator = SkillSandboxValidator()
 
     def parse_package(self, zip_bytes: bytes) -> ParsedSkillPackage:
+        return self.package_parser.parse(zip_bytes)
+
+    def _parse_package_impl(self, zip_bytes: bytes) -> ParsedSkillPackage:
         if len(zip_bytes) > self.MAX_ARCHIVE_BYTES:
             self._raise_validation(
                 "Gói skill vượt quá kích thước upload cho phép.",
@@ -251,95 +392,13 @@ class SkillValidationService:
             logs.append("[VONG 4] No Python scripts found in package.")
 
         # ─── VÒNG 5: Sandbox Validation (chạy thử script Python nếu sandbox khả dụng) ───
-        logs.append("[VONG 5] Docker sandbox script smoke testing started.")
-        sandbox_passed = True
-        python_scripts = self._python_scripts(package)
-        if python_scripts:
-            try:
-                from app.config import settings as app_settings
-                from app.sandbox.docker_executor import build_sandbox_executor_from_settings
-
-                sandbox_executor = build_sandbox_executor_from_settings(app_settings)
-                if sandbox_executor is not None:
-                    for script_path in python_scripts:
-                        logs.append(f"[VONG 5] Smoke testing script: {script_path}")
-                        try:
-                            manifest_entry = script_manifest[script_path]
-                            result = await sandbox_executor.validate_skill_script(
-                                script_path=script_path,
-                                arguments=manifest_entry.get("smoke_test", {}).get("arguments", {}),
-                                bundled_files=package.bundled_files,
-                                timeout_seconds=int(
-                                    manifest_entry.get("limits", {}).get("timeout_seconds", 15)
-                                ),
-                            )
-                            if result.exit_code != 0:
-                                sandbox_passed = False
-                                error_info = result.stderr or f"Exit code {result.exit_code}"
-                                manifest_entry["status"] = "failed"
-                                manifest_entry["sandbox_result"] = {
-                                    "exit_code": result.exit_code,
-                                    "stderr": error_info[:1000],
-                                    "timed_out": result.timed_out,
-                                }
-                                logs.append(
-                                    f"[VONG 5] Script '{script_path}' FAILED sandbox validation: "
-                                    f"{error_info[:500]}"
-                                )
-                            else:
-                                output_error = self._validate_output_contract(
-                                    script_path=script_path,
-                                    manifest_entry=manifest_entry,
-                                    stdout=result.stdout or "",
-                                )
-                                if output_error:
-                                    sandbox_passed = False
-                                    manifest_entry["status"] = "failed"
-                                    manifest_entry["sandbox_result"] = {
-                                        "exit_code": result.exit_code,
-                                        "stdout_preview": (result.stdout or "")[:1000],
-                                        "timed_out": result.timed_out,
-                                        "output_contract_error": output_error,
-                                    }
-                                    logs.append(
-                                        f"[VONG 5] Script '{script_path}' FAILED output contract: "
-                                        f"{output_error[:500]}"
-                                    )
-                                else:
-                                    manifest_entry["status"] = "passed"
-                                    manifest_entry["sandbox_result"] = {
-                                        "exit_code": result.exit_code,
-                                        "stdout_preview": (result.stdout or "")[:1000],
-                                        "timed_out": result.timed_out,
-                                    }
-                                    logs.append(
-                                        f"[VONG 5] Script '{script_path}' passed sandbox validation."
-                                    )
-                        except Exception as exc:
-                            sandbox_passed = False
-                            script_manifest[script_path]["status"] = "failed"
-                            script_manifest[script_path]["sandbox_result"] = {
-                                "exit_code": 1,
-                                "stderr": str(exc)[:1000],
-                                "timed_out": False,
-                            }
-                            logs.append(
-                                f"[VONG 5] Script '{script_path}' sandbox validation error: {exc}"
-                            )
-                else:
-                    logs.append(
-                        "[VONG 5] Docker sandbox not available; auto-marking scripts as passed."
-                    )
-                    for script_path in python_scripts:
-                        if script_path in script_manifest:
-                            script_manifest[script_path]["status"] = "passed"
-            except Exception as exc:
-                logs.append(f"[VONG 5] Sandbox validation unavailable: {exc}; auto-marking scripts as passed.")
-                for script_path in python_scripts:
-                    if script_path in script_manifest:
-                        script_manifest[script_path]["status"] = "passed"
-        else:
-            logs.append("[VONG 5] No Python scripts found in package, skipping sandbox validation.")
+        sandbox_passed = await self.sandbox_validator.validate(
+            package=package,
+            script_manifest=script_manifest,
+            python_scripts=self._python_scripts(package),
+            logs=logs,
+            validate_output_contract=self._validate_output_contract,
+        )
 
         if not sandbox_passed:
             logs.append(
@@ -570,26 +629,7 @@ class SkillValidationService:
         return bundled_files
 
     def _scan_package(self, package: ParsedSkillPackage, logs: list[str]) -> bool:
-        text_sources = {"SKILL.md": package.body}
-        for path, record in package.bundled_files.items():
-            if record["encoding"] == "utf-8":
-                text_sources[path] = record["content"]
-            if path.endswith(".py") and record["encoding"] == "utf-8":
-                ast_clean, ast_errors = AdvancedASTSecurityAnalyzer.analyze_source_code(
-                    record["content"]
-                )
-                if not ast_clean:
-                    logs.extend([f"[{path} AST ERROR]: {error}" for error in ast_errors])
-                    return True
-
-        for path, content in text_sources.items():
-            for secret_type, pattern in AgentSafetyGuard.PII_AND_SECRET_PATTERNS.items():
-                if pattern.search(content):
-                    logs.append(
-                        f"[{path} SECURITY ERROR]: Phát hiện chuỗi nhạy cảm/secret ({secret_type})."
-                    )
-                    return True
-        return False
+        return self.security_scanner.scan(package, logs)
 
     def _python_scripts(self, package: ParsedSkillPackage) -> dict[str, dict[str, Any]]:
         return {

@@ -52,25 +52,30 @@ export async function consumeSseStream(
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n\n");
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
 
-    while (boundary !== -1) {
-      const block = buffer.slice(0, boundary).trim();
-      buffer = buffer.slice(boundary + 2);
-      const parsed = parseSseBlock(block);
-      if (parsed) onEvent(parsed);
-      boundary = buffer.indexOf("\n\n");
+      while (boundary !== -1) {
+        const block = buffer.slice(0, boundary).trim();
+        buffer = buffer.slice(boundary + 2);
+        const parsed = parseSseBlock(block);
+        if (parsed) onEvent(parsed);
+        boundary = buffer.indexOf("\n\n");
+      }
     }
-  }
 
-  const tail = buffer.trim();
-  if (tail) {
-    const parsed = parseSseBlock(tail);
-    if (parsed) onEvent(parsed);
+    const tail = buffer.trim();
+    if (tail) {
+      const parsed = parseSseBlock(tail);
+      if (parsed) onEvent(parsed);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 }
