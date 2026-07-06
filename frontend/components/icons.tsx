@@ -1,8 +1,12 @@
-import type { SVGProps } from "react";
+import Image from "next/image";
+import type { ComponentProps, ReactNode, SVGProps } from "react";
 
 type IconProps = SVGProps<SVGSVGElement>;
+type LogoProps = Omit<ComponentProps<typeof Image>, "src" | "alt" | "width" | "height"> & {
+  alt?: string;
+};
 
-function Icon({ children, ...props }: IconProps & { children: React.ReactNode }) {
+function Icon({ children, ...props }: IconProps & { children: ReactNode }) {
   return (
     <svg
       viewBox="0 0 24 24"
@@ -27,11 +31,13 @@ export function PlusIcon(props: IconProps) {
   );
 }
 
-export function TelecomLogo({ className, ...props }: any) {
+export function TelecomLogo({ alt = "Telecom Logo", className, ...props }: LogoProps) {
   return (
-    <img
+    <Image
       src="/logo.png"
-      alt="Telecom Logo"
+      alt={alt}
+      width={48}
+      height={48}
       className={`object-contain ${className || ""}`}
       {...props}
     />
