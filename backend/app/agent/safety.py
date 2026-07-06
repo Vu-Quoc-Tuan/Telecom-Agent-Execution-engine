@@ -87,13 +87,14 @@ class AgentSafetyGuard:
             re.IGNORECASE,
         ),
         re.compile(
-            r"\bas\s*\(\s*"
+            r"\bas\s*\(+[\s(]*"
             r"(?:alter|attach|create|delete|detach|drop|grant|insert|kill|optimize|"
             r"rename|replace|revoke|truncate|update)\b",
             re.IGNORECASE,
         ),
         re.compile(
-            r"\)\s*(?:alter|attach|create|delete|detach|drop|grant|insert|kill|"
+            r"\)[\s()]*"
+            r"(?:alter|attach|create|delete|detach|drop|grant|insert|kill|"
             r"optimize|rename|replace|revoke|truncate|update)\b",
             re.IGNORECASE,
         ),

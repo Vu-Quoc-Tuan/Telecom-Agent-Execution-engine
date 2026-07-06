@@ -412,6 +412,10 @@ class SafetyGuardTests(unittest.TestCase):
             "EXPLAIN INSERT INTO station VALUES (1)",
             "WITH removed AS (DELETE FROM station RETURNING *) SELECT * FROM removed",
             "WITH data AS (SELECT 1) DELETE FROM station",
+            "WITH removed AS ((DELETE FROM station RETURNING *)) SELECT * FROM removed",
+            "WITH name AS (SELECT 1) (INSERT INTO station)",
+            "WITH name AS (SELECT 1) ((DELETE FROM station))",
+            "WITH removed AS( ( ( DELETE FROM station RETURNING * ) ) ) SELECT * FROM removed",
         ]
         for sql in prohibited_queries:
             is_safe, err = AgentSafetyGuard.verify_read_only_sql(sql)

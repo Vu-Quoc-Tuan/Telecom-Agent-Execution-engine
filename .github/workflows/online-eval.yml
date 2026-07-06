@@ -12,8 +12,6 @@ on:
         required: false
         default: false
         type: boolean
-  schedule:
-    - cron: "0 19 * * *"
 
 concurrency:
   group: online-eval-${{ github.ref }}
