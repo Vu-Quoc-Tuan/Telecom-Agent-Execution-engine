@@ -53,7 +53,7 @@ function groupSessions(sessions: ChatSession[]) {
 function stepTone(status: string) {
   if (["completed", "success", "done"].includes(status)) return "bg-status-sage text-white";
   if (["failed", "error"].includes(status)) return "bg-status-crimson text-white";
-  if (["running", "pending"].includes(status)) return "border-accent-active bg-main-background";
+  if (["running", "pending", "waiting_approval"].includes(status)) return "border-accent-active bg-main-background";
   return "border-warm-border bg-surface-card";
 }
 
@@ -66,6 +66,7 @@ function isFailedStatus(status: string) {
 }
 
 function statusLabel(status: string) {
+  if (status === "rejected") return "Từ chối";
   if (isCompletedStatus(status)) return "Xong";
   if (isFailedStatus(status)) return "Lỗi";
   if (status === "running") return "Đang chạy";
@@ -148,6 +149,153 @@ function getStepTitle(step: TimelineStep) {
   return step.display_title || step.name || step.tool_name || "Agent step";
 }
 
+type RunTimelineResponse = {
+  run_id: string;
+  status: string;
+  model?: string | null;
+  steps: TimelineStep[];
+};
+
+type PendingApprovalDetail = {
+  approval_id: string;
+  run_id: string;
+  status: string;
+  skill_details?: {
+    skill_name?: string | null;
+    arguments?: Record<string, unknown> | null;
+    risk_level?: string | null;
+  } | null;
+};
+
+const ACTIVE_RUN_STATUSES = new Set(["pending", "running", "waiting_approval"]);
+const TERMINAL_ERROR_RUN_STATUSES = new Set(["failed", "cancelled", "timed_out"]);
+
+function chatMessageFromPersisted(
+  message: PersistedChatMessage & { role: "user" | "assistant" },
+): ChatMessage {
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    status: message.status === "failed" ? "error" : "done",
+    run_id: message.run_id,
+  };
+}
+
+function findRunMissingAssistant(messages: ChatMessage[]) {
+  const assistantRunIds = new Set(
+    messages
+      .filter((message) => message.role === "assistant" && message.run_id)
+      .map((message) => message.run_id as string),
+  );
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "user" && message.run_id && !assistantRunIds.has(message.run_id)) {
+      return message.run_id;
+    }
+  }
+
+  return null;
+}
+
+function latestStepSummary(
+  steps: TimelineStep[],
+  predicate: (step: TimelineStep) => boolean,
+) {
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    const step = steps[index];
+    if (predicate(step) && step.summary?.trim()) return step.summary.trim();
+  }
+  return null;
+}
+
+function timelineHasOpenStep(steps: TimelineStep[]) {
+  return steps.some((step) => ACTIVE_RUN_STATUSES.has(step.status));
+}
+
+function recoveredAssistantFromTimeline(runId: string, timeline: RunTimelineResponse): ChatMessage {
+  const finalSummary = latestStepSummary(
+    timeline.steps,
+    (step) => step.step_type === "llm_call" && isCompletedStatus(step.status),
+  );
+  const errorSummary = latestStepSummary(
+    timeline.steps,
+    (step) => isFailedStatus(step.status) || Boolean(step.is_error),
+  );
+  const lastSummary = latestStepSummary(timeline.steps, () => true);
+
+  if (TERMINAL_ERROR_RUN_STATUSES.has(timeline.status)) {
+    const recoveredContent = finalSummary
+      ? `${finalSummary}
+
+---
+
+Run gặp lỗi sau khi sinh phản hồi: ${
+          errorSummary || "không lưu được trạng thái hoàn tất."
+        }`
+      : errorSummary || lastSummary || "Run đã dừng trước khi lưu được phản hồi cuối.";
+
+    return {
+      id: `recovered-${runId}`,
+      role: "assistant",
+      content: recoveredContent,
+      status: "error",
+      run_id: runId,
+    };
+  }
+
+  if (timeline.status === "waiting_approval") {
+    return {
+      id: `recovered-${runId}`,
+      role: "assistant",
+      content: "Run đang chờ phê duyệt trước khi tiếp tục.",
+      status: "done",
+      run_id: runId,
+    };
+  }
+
+  if (ACTIVE_RUN_STATUSES.has(timeline.status) && timelineHasOpenStep(timeline.steps)) {
+    return {
+      id: `recovered-${runId}`,
+      role: "assistant",
+      content: finalSummary || "Run đang xử lý. Timeline đã được khôi phục sau khi tải lại trang.",
+      status: "streaming",
+      run_id: runId,
+    };
+  }
+
+  return {
+    id: `recovered-${runId}`,
+    role: "assistant",
+    content: finalSummary || lastSummary || "Run đã hoàn tất nhưng phản hồi cuối chưa được lưu vào lịch sử chat.",
+    status: "done",
+    run_id: runId,
+  };
+}
+
+function approvalFromPendingDetail(detail: PendingApprovalDetail): PendingApproval {
+  return {
+    approval_request_id: detail.approval_id,
+    run_id: detail.run_id,
+    tool_name: detail.skill_details?.skill_name ?? null,
+    tool_input: detail.skill_details?.arguments ?? null,
+    risk_level: detail.skill_details?.risk_level ?? null,
+    status: "pending",
+  };
+}
+
+function getApprovalToolName(step: TimelineStep) {
+  return step.tool_name || step.name.replace(/^Chờ phê duyệt:\s*/i, "") || "tool";
+}
+
+function getApprovalTitle(step: TimelineStep) {
+  const toolName = getApprovalToolName(step);
+  if (step.status === "waiting_approval") return `Chờ phê duyệt: ${toolName}`;
+  if (step.tool_status === "rejected" || isFailedStatus(step.status)) return `Đã từ chối: ${toolName}`;
+  return `Đã duyệt: ${toolName}`;
+}
+
 function getStepSummary(step: TimelineStep) {
   if (step.step_type === "llm_call") {
     return step.summary || (step.status === "running" ? "Agent đang đọc ngữ cảnh và chọn hành động tiếp theo." : "Agent đã hoàn tất lượt suy luận.");
@@ -207,6 +355,64 @@ function formatToolOutput(step: TimelineStep) {
 function isSkillLoaderStep(step: TimelineStep) {
   if (isFailedStatus(step.status) || step.is_error) return false;
   return step.tool_name === "load_skill" || step.tool_name === "read_skill_file";
+}
+
+function ApprovalDecisionProgress({ step }: { step: TimelineStep }) {
+  const waiting = step.status === "waiting_approval";
+  const rejected = step.tool_status === "rejected" || isFailedStatus(step.status);
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <PhaseChip label="Chờ duyệt" active={waiting} done={!waiting} />
+      <PhaseChip label={rejected ? "Từ chối" : "Duyệt"} active={false} done={!waiting} />
+    </div>
+  );
+}
+
+function ApprovalStepBody({
+  step,
+  input,
+}: {
+  step: TimelineStep;
+  input: string | null;
+}) {
+  const waiting = step.status === "waiting_approval";
+  const rejected = step.tool_status === "rejected" || isFailedStatus(step.status);
+  const showPayload = Boolean(input) && (waiting || rejected);
+  const message = waiting
+    ? "Đang chờ người vận hành quyết định."
+    : rejected
+      ? "Người vận hành đã từ chối, tool không được thực thi."
+      : "Người vận hành đã duyệt. Tool đã chuyển sang bước thực thi.";
+
+  return (
+    <div className="mt-3 grid gap-3">
+      <ApprovalDecisionProgress step={step} />
+
+      {showPayload ? (
+        <section className="rounded-md border border-warm-border bg-code-block/55 px-3 py-2">
+          <p className="mb-1 text-[10px] font-semibold uppercase text-secondary-text">
+            Payload cần duyệt
+          </p>
+          <pre className="max-h-36 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-5 text-primary-text">
+            {input}
+          </pre>
+        </section>
+      ) : null}
+
+      <p
+        className={`rounded-md border px-3 py-2 text-xs font-medium ${
+          waiting
+            ? "border-accent-active/20 bg-accent-active/5 text-accent-active"
+            : rejected
+              ? "border-status-crimson/25 bg-status-crimson/5 text-status-crimson"
+              : "border-status-sage/25 bg-status-sage/5 text-status-sage"
+        }`}
+      >
+        {message}
+      </p>
+    </div>
+  );
 }
 
 function currentThinkingStatus(steps: TimelineStep[], loading: boolean, streaming: boolean) {
@@ -422,6 +628,8 @@ function TimelinePanel({ steps }: { steps: TimelineStep[] }) {
         const input = formatStepValue(step.tool_input, 420);
         const output = formatToolOutput(step);
         const isTool = step.step_type === "tool_call";
+        const isApproval = step.step_type === "approval";
+        const displayStatus = isApproval && step.tool_status === "rejected" ? "rejected" : step.status;
         const outputIsSummary = isSkillLoaderStep(step);
 
         return (
@@ -460,7 +668,7 @@ function TimelinePanel({ steps }: { steps: TimelineStep[] }) {
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="rounded-md bg-code-block px-2 py-0.5 text-[10px] font-semibold uppercase text-secondary-text">
-                      {isTool ? "Tool" : stepTypeLabel(step)}
+                      {isApproval ? "Approval" : isTool ? "Tool" : stepTypeLabel(step)}
                     </span>
                     {outputIsSummary ? (
                       <span className="rounded-md border border-warm-border px-2 py-0.5 text-[10px] font-medium text-secondary-text">
@@ -469,15 +677,17 @@ function TimelinePanel({ steps }: { steps: TimelineStep[] }) {
                     ) : null}
                   </div>
                   <h3 className="mt-2 truncate text-sm font-semibold text-primary-text">
-                    {getStepTitle(step)}
+                    {isApproval ? getApprovalTitle(step) : getStepTitle(step)}
                   </h3>
                 </div>
-                <span className={`shrink-0 rounded-full border px-2 py-1 text-[11px] font-semibold ${statusBadgeClass(step.status)}`}>
-                  {statusLabel(step.status)}
+                <span className={`shrink-0 rounded-full border px-2 py-1 text-[11px] font-semibold ${statusBadgeClass(displayStatus)}`}>
+                  {statusLabel(displayStatus)}
                 </span>
               </div>
 
-              {isTool ? (
+              {isApproval ? (
+                <ApprovalStepBody step={step} input={input} />
+              ) : isTool ? (
                 <div className="mt-3 grid gap-2">
                   {input ? (
                     <section className="rounded-md bg-code-block/70 px-3 py-2">
@@ -878,6 +1088,7 @@ export default function ChatPage() {
     setApproval(null);
     clearTimeline();
     setExpandedThinking({});
+    setStreaming(false);
     setActiveRunId(null);
     activeRunIdRef.current = null;
     activeAssistantIdRef.current = null;
@@ -893,22 +1104,68 @@ export default function ChatPage() {
     try {
       const history = await apiFetch<PersistedChatMessage[]>(`/sessions/${sessionId}/messages`);
       if (historyRequestRef.current !== requestId) return;
-      setMessages(
-        history
-          .filter(
-            (
-              message,
-            ): message is PersistedChatMessage & { role: "user" | "assistant" } =>
-              message.role === "user" || message.role === "assistant",
-          )
-          .map((message) => ({
-            id: message.id,
-            role: message.role,
-            content: message.content,
-            status: message.status === "failed" ? "error" : "done",
-            run_id: message.run_id,
-          })),
-      );
+
+      const restoredMessages = history
+        .filter(
+          (
+            message,
+          ): message is PersistedChatMessage & { role: "user" | "assistant" } =>
+            message.role === "user" || message.role === "assistant",
+        )
+        .map(chatMessageFromPersisted);
+      let nextMessages = restoredMessages;
+
+      const missingRunId = findRunMissingAssistant(restoredMessages);
+      if (missingRunId) {
+        try {
+          const timeline = await apiFetch<RunTimelineResponse>(`/runs/${missingRunId}/timeline`);
+          if (historyRequestRef.current !== requestId) return;
+
+          const recoveredAssistant = recoveredAssistantFromTimeline(missingRunId, timeline);
+          nextMessages = [...restoredMessages, recoveredAssistant];
+          selectTimelineRunId(missingRunId);
+          applyTimelineUpdate(missingRunId, timeline.steps);
+          setActiveTab("timeline");
+          setExpandedThinking((current) => ({
+            ...current,
+            [missingRunId]: recoveredAssistant.status === "streaming",
+          }));
+
+          if (recoveredAssistant.status === "streaming") {
+            setStreaming(true);
+            setActiveRunId(missingRunId);
+            activeRunIdRef.current = missingRunId;
+            activeAssistantIdRef.current = recoveredAssistant.id;
+          }
+
+          if (timeline.status === "waiting_approval") {
+            try {
+              const pendingApprovals = await apiFetch<PendingApprovalDetail[]>("/approvals/pending");
+              if (historyRequestRef.current !== requestId) return;
+              const pendingApproval = pendingApprovals.find(
+                (item) => item.run_id === missingRunId && item.status === "pending",
+              );
+              if (pendingApproval) setApproval(approvalFromPendingDetail(pendingApproval));
+            } catch {
+              // Timeline recovery still works even if the approval list is temporarily unavailable.
+            }
+          }
+        } catch {
+          if (historyRequestRef.current !== requestId) return;
+          nextMessages = [
+            ...restoredMessages,
+            {
+              id: `recovered-${missingRunId}`,
+              role: "assistant",
+              content: "Không khôi phục được trạng thái run sau khi tải lại trang.",
+              status: "error",
+              run_id: missingRunId,
+            },
+          ];
+        }
+      }
+
+      setMessages(nextMessages);
     } catch (exc) {
       if (historyRequestRef.current !== requestId) return;
       setMessages([]);
@@ -916,7 +1173,7 @@ export default function ChatPage() {
     } finally {
       if (historyRequestRef.current === requestId) setLoadingMessages(false);
     }
-  }, [clearTimeline]);
+  }, [applyTimelineUpdate, clearTimeline, selectTimelineRunId]);
 
   useEffect(() => {
     apiFetch<ChatSession[]>("/sessions")
@@ -942,6 +1199,65 @@ export default function ChatPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, approval]);
+
+  useEffect(() => {
+    if (!activeRunId || abortRef.current) return;
+
+    let cancelled = false;
+    const pollingRunId = activeRunId;
+    const recoveredAssistantId = activeAssistantIdRef.current;
+
+    async function pollRecoveredRun() {
+      try {
+        const timeline = await apiFetch<RunTimelineResponse>(`/runs/${pollingRunId}/timeline`);
+        if (cancelled || activeRunIdRef.current !== pollingRunId) return;
+
+        applyTimelineUpdate(pollingRunId, timeline.steps);
+
+        if (timeline.status === "waiting_approval") {
+          try {
+            const pendingApprovals = await apiFetch<PendingApprovalDetail[]>("/approvals/pending");
+            if (cancelled || activeRunIdRef.current !== pollingRunId) return;
+            const pendingApproval = pendingApprovals.find(
+              (item) => item.run_id === pollingRunId && item.status === "pending",
+            );
+            if (pendingApproval) setApproval(approvalFromPendingDetail(pendingApproval));
+          } catch {
+            // Keep polling the timeline even if approval metadata is temporarily unavailable.
+          }
+        }
+
+        if (!ACTIVE_RUN_STATUSES.has(timeline.status) && !timelineHasOpenStep(timeline.steps)) {
+          const recoveredAssistant = recoveredAssistantFromTimeline(pollingRunId, timeline);
+          if (recoveredAssistantId) {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === recoveredAssistantId ? recoveredAssistant : message,
+              ),
+            );
+          }
+          if (recoveredAssistant.status !== "streaming") {
+            setStreaming(false);
+            setActiveRunId(null);
+            activeRunIdRef.current = null;
+            activeAssistantIdRef.current = null;
+            setApproval(null);
+            setExpandedThinking((current) => ({ ...current, [pollingRunId]: false }));
+            apiFetch<ChatSession[]>("/sessions").then(setSessions).catch(() => undefined);
+          }
+        }
+      } catch {
+        // A transient poll failure should not erase the recovered conversation state.
+      }
+    }
+
+    void pollRecoveredRun();
+    const intervalId = window.setInterval(() => void pollRecoveredRun(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeRunId, applyTimelineUpdate]);
 
   useEffect(() => {
     isMountedRef.current = true;
