@@ -24,7 +24,7 @@ class TimelineSerializationTests(unittest.TestCase):
             run_step_id=step_id,
             skill_name="restart_service",
             connector_name="ssh",
-            risk_level="dangerous_action",
+            risk_level="require_approval",
             status="waiting_approval",
             arguments_json={"service": "mme"},
             result_json=None,

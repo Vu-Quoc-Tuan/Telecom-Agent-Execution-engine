@@ -386,13 +386,14 @@ if __name__ == "__main__":
             "Skill execution must suspend for per-run human approval.",
         )
         approval_id = uuid.UUID(suspension_events[0][1]["approval_request_id"])
-        async for event_type, payload in (
-            AgentExecutionService.resolve_approval_and_resume_lifecycle(
-                db=self.db,
-                llm_gateway=gateway,
-                approval_id=approval_id,
-                action="approved",
-            )
+        async for (
+            event_type,
+            payload,
+        ) in AgentExecutionService.resolve_approval_and_resume_lifecycle(
+            db=self.db,
+            llm_gateway=gateway,
+            approval_id=approval_id,
+            action="approved",
         ):
             events.append((event_type, payload))
             print(f"[APPROVAL EVENT] {event_type}: {payload}")

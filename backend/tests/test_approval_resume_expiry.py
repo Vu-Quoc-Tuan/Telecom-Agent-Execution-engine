@@ -18,6 +18,12 @@ class FakeDb:
     def rollback(self) -> None:
         pass
 
+    def add(self, instance) -> None:
+        pass
+
+    def scalar(self, statement):
+        return None
+
     def scalars(self, statement):
         return types.SimpleNamespace(all=lambda: [])
 
@@ -149,10 +155,31 @@ class ApprovalResumeExpiryTests(unittest.IsolatedAsyncioTestCase):
                     return_value=current_tool,
                 )
             )
-            stack.enter_context(patch("app.services.agent_execution.ToolCallRepository.start_execution"))
-            stack.enter_context(patch("app.services.agent_execution.ToolCallRepository.save_result"))
-            stack.enter_context(patch("app.services.agent_execution.RunStepRepository.complete_step"))
-            stack.enter_context(patch("app.services.agent_execution.MessageRepository.save_message"))
+            stack.enter_context(
+                patch("app.services.agent_execution.ToolCallRepository.start_execution")
+            )
+            stack.enter_context(
+                patch("app.services.agent_execution.ToolCallRepository.save_result")
+            )
+            stack.enter_context(
+                patch("app.services.agent_execution.RunStepRepository.complete_step")
+            )
+            stack.enter_context(
+                patch(
+                    "app.services.agent_execution.RunStepRepository.append_step",
+                    return_value=types.SimpleNamespace(id=uuid.uuid4()),
+                )
+            )
+            stack.enter_context(patch("app.services.agent_execution.RunStepRepository.start_step"))
+            stack.enter_context(
+                patch(
+                    "app.services.agent_execution.ToolCallRepository.attach_to_step",
+                    return_value=current_tool,
+                )
+            )
+            stack.enter_context(
+                patch("app.services.agent_execution.MessageRepository.save_message")
+            )
             stack.enter_context(
                 patch(
                     "app.services.agent_execution.execute_builtin_tool",
@@ -184,10 +211,17 @@ class ApprovalResumeExpiryTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             stack.enter_context(
-                patch("app.services.agent_execution.RunRepository.increment_step_count", return_value=run)
+                patch(
+                    "app.services.agent_execution.RunRepository.increment_step_count",
+                    return_value=run,
+                )
             )
-            stack.enter_context(patch.object(AgentExecutionService, "_serialize_steps", return_value=[]))
-            stack.enter_context(patch.object(AgentExecutionService, "_agent_app", BatchResumeAgentApp()))
+            stack.enter_context(
+                patch.object(AgentExecutionService, "_serialize_steps", return_value=[])
+            )
+            stack.enter_context(
+                patch.object(AgentExecutionService, "_agent_app", BatchResumeAgentApp())
+            )
             mark_failed = stack.enter_context(
                 patch.object(
                     AgentExecutionService,

@@ -131,7 +131,8 @@ class ApplicationImportTests(unittest.TestCase):
 
     def test_checkpoint_serializer_allows_llm_schema_types(self) -> None:
         from app.agent.checkpointer import build_checkpoint_serializer
-        from app.llm.schemas import LLMMessage, MessageRole
+        from app.agent.tool_batch_planner import ToolBatchPlan, ToolPlanItem
+        from app.llm.schemas import LLMMessage, LLMToolDefinition, MessageRole, NormalizedToolCall
 
         serializer = build_checkpoint_serializer()
         payload = LLMMessage(role=MessageRole.USER, content="check node")
@@ -139,6 +140,43 @@ class ApplicationImportTests(unittest.TestCase):
         restored = serializer.loads_typed(serializer.dumps_typed(payload))
 
         self.assertEqual(payload, restored)
+
+        # New-style plan (without deprecated tool_catalog / ready_skill_names).
+        plan = ToolBatchPlan(
+            route="execute_tools",
+            items=[
+                ToolPlanItem(
+                    index=0,
+                    tool_call=NormalizedToolCall(id="call-1", name="ping_node", arguments={}),
+                    risk_level="auto_execute",
+                )
+            ],
+        )
+        restored_plan = serializer.loads_typed(serializer.dumps_typed(plan))
+        self.assertEqual(plan, restored_plan)
+        self.assertIsInstance(restored_plan, ToolBatchPlan)
+
+        # Backward-compat: old checkpoints that include tool_catalog / ready_skill_names
+        # must still deserialize without error.
+        legacy_plan = ToolBatchPlan(
+            route="execute_tools",
+            items=[
+                ToolPlanItem(
+                    index=0,
+                    tool_call=NormalizedToolCall(id="call-1", name="ping_node", arguments={}),
+                    risk_level="auto_execute",
+                )
+            ],
+            tool_catalog=[
+                LLMToolDefinition(
+                    name="ping_node", description="ping a node", input_schema={"type": "object"}
+                )
+            ],
+            ready_skill_names=["ping_node"],
+        )
+        restored_legacy = serializer.loads_typed(serializer.dumps_typed(legacy_plan))
+        self.assertEqual(legacy_plan, restored_legacy)
+        self.assertIsInstance(restored_legacy, ToolBatchPlan)
 
     def test_timeout_sweeper_uses_lifecycle_service(self) -> None:
         from app import main

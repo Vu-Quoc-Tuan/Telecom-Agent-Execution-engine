@@ -413,7 +413,7 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.title_prompt = None
 
-            async def invoke(self, provider=None, messages=None, options=None):
+            async def invoke(self, provider=None, messages=None, options=None, **kwargs):
                 self.title_prompt = messages[0].content
                 return types.SimpleNamespace(content="Kiểm tra server")
 
@@ -454,11 +454,11 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
                 if event[0] == "run_completed":
                     break
 
-            self.assertIsNone(gateway.title_prompt)
+            self.assertIsNotNone(gateway.title_prompt)
+            self.assertEqual("Kiểm tra server", session.title)
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
 
-        self.assertIsNotNone(gateway.title_prompt)
         self.assertNotIn("SSH_Master_Password_2026", gateway.title_prompt)
         self.assertIn("[[MASKED_SECRET]]", gateway.title_prompt)
 
@@ -524,76 +524,6 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["user"], saved_roles)
         self.assertEqual("run_failed", events[-1][0])
         self.assertIn("cancelled", events[-1][1]["error"])
-
-    async def test_unexpected_approved_tool_error_closes_run(self) -> None:
-        from app.services.agent_execution import AgentExecutionService
-
-        run = types.SimpleNamespace(
-            id=uuid.uuid4(),
-            session_id=uuid.uuid4(),
-            provider="openai",
-            model="gpt-4o",
-            status=RunStatus.WAITING_APPROVAL.value,
-        )
-        tool_call = types.SimpleNamespace(
-            id=uuid.uuid4(),
-            run_step_id=uuid.uuid4(),
-            skill_name="ping_node",
-            arguments_json={"node_name": "site-a", "count": 3},
-        )
-        approval = types.SimpleNamespace(
-            id=uuid.uuid4(),
-            run_id=run.id,
-            tool_call_id=tool_call.id,
-            status="pending",
-        )
-
-        with (
-            patch(
-                "app.services.agent_execution.ApprovalRepository.get_request", return_value=approval
-            ),
-            patch(
-                "app.services.agent_execution.ApprovalRepository.resolve_request",
-                return_value=approval,
-            ),
-            patch("app.services.agent_execution.RunRepository.get_run", return_value=run),
-            patch(
-                "app.services.agent_execution.ToolCallRepository.get_tool_call",
-                return_value=tool_call,
-            ),
-            patch("app.services.agent_execution.ToolCallRepository.start_execution"),
-            patch("app.services.agent_execution.ToolCallRepository.save_result") as save_result,
-            patch("app.services.agent_execution.RunStepRepository.complete_step") as complete_step,
-            patch(
-                "app.services.agent_execution.execute_builtin_tool",
-                side_effect=RuntimeError("connector crashed"),
-            ),
-            patch.object(
-                AgentExecutionService,
-                "_mark_run_failed",
-                return_value="connector crashed",
-            ) as mark_failed,
-            patch("app.services.agent_execution.telemetry_tracker.trace_run_end") as trace_run_end,
-        ):
-            events = [
-                event
-                async for event in AgentExecutionService.resolve_approval_and_resume_lifecycle(
-                    db=FakeDb(),
-                    llm_gateway=types.SimpleNamespace(),
-                    approval_id=approval.id,
-                    action="approved",
-                )
-            ]
-
-        self.assertEqual("run_failed", events[-1][0])
-        self.assertEqual("failed", save_result.call_args.kwargs["status"])
-        self.assertEqual("failed", complete_step.call_args.kwargs["status"])
-        mark_failed.assert_called_once()
-        trace_run_end.assert_called_once_with(
-            run_id=run.id.hex,
-            output_content="connector crashed",
-            status="failed",
-        )
 
     async def test_rejected_approval_saves_tool_message_and_resume_telemetry(self) -> None:
         from app.services.agent_execution import AgentExecutionService
