@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import inspect
-import json
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -15,8 +13,8 @@ from app.agent.builtin_runners import execute_builtin_tool
 from app.agent.graph import build_telecom_agent
 from app.agent.prompts import TELECOM_AGENT_PROMPT_VERSION
 from app.agent.safety import AgentSafetyGuard
-from app.common.enums import RunStatus
-from app.common.exceptions import TelecomAgentException
+from app.agent.tool_execution import execute_and_persist_tool_call, persist_rejected_tool_call
+from app.common.enums import InterventionStatus, RunStatus, StepType
 from app.config import settings as app_settings
 from app.database.repositories.approvals import ApprovalRepository
 from app.database.repositories.messages import MessageRepository
@@ -187,7 +185,6 @@ class AgentExecutionService:
             yield "error", {"message": "Approval action must be 'approved' or 'rejected'."}
             return
 
-        started_at = datetime.now(UTC)
         pending_approval = ApprovalRepository.get_request(db, approval_id)
         if not pending_approval or pending_approval.status != "pending":
             yield "error", {"message": "Approval request is invalid or already resolved."}
@@ -215,98 +212,53 @@ class AgentExecutionService:
             return
 
         session_id = run_record.session_id
+        approval_step_id = tool_call.run_step_id
         if action == "rejected":
-            output = json.dumps(
-                {
-                    "status": "rejected",
-                    "code": "HUMAN_REJECTED",
-                    "message": "The human operator rejected this tool call. It was not executed.",
-                    "reason": "Rejected by operator.",
-                },
-                ensure_ascii=False,
-            )
-            RunStepRepository.complete_step(
-                db=db, step_id=tool_call.run_step_id, status="failed", summary=output
-            )
-            ToolCallRepository.save_result(
+            persist_rejected_tool_call(
                 db=db,
-                tool_call_id=tool_call.id,
-                status="rejected",
-                result={"output": output},
-                latency_ms=0,
-                error_msg=output,
-            )
-            MessageRepository.save_message(
-                db=db,
-                session_id=session_id,
                 run_id=run_record.id,
-                role="tool",
-                content=output,
-                metadata={
-                    "tool_name": tool_call.skill_name,
-                    "tool_call_id": tool_call.provider_tool_call_id,
-                    "approval_status": "rejected",
-                },
+                session_id=session_id,
+                tool_call=tool_call,
+                tool_call_repository=ToolCallRepository,
+                run_step_repository=RunStepRepository,
+                message_repository=MessageRepository,
             )
         else:
-            ToolCallRepository.start_execution(db, tool_call.id)
-            started_at = datetime.now(UTC)
-            try:
-                output, was_truncated = await execute_builtin_tool(
-                    tool_name=tool_call.skill_name,
-                    arguments=tool_call.arguments_json,
-                    db=db,
-                    settings=app_settings,
-                    approval_confirmations=1,
-                )
-                status = "completed"
-                error_message = None
-            except TelecomAgentException as exc:
-                output = exc.message
-                was_truncated = False
-                status = "failed"
-                error_message = exc.message
-            except Exception as exc:
-                output = str(exc) or type(exc).__name__
-                latency_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
-                ToolCallRepository.save_result(
-                    db=db,
-                    tool_call_id=tool_call.id,
-                    status="failed",
-                    result={"output": output},
-                    latency_ms=latency_ms,
-                    error_msg=output,
-                )
-                RunStepRepository.complete_step(
-                    db=db,
-                    step_id=tool_call.run_step_id,
-                    status="failed",
-                    summary=output,
-                )
-                error_message = cls._mark_run_failed_and_close_trace(
-                    db,
-                    run_record,
-                    error_message=output,
-                    source="approved_tool_execution",
-                )
-                yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
-                return
-
-            latency_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
-            ToolCallRepository.save_result(
-                db=db,
-                tool_call_id=tool_call.id,
-                status=status,
-                result={"output": output},
-                latency_ms=latency_ms,
-                error_msg=error_message,
-                output_truncated=was_truncated,
-            )
             RunStepRepository.complete_step(
-                db=db, step_id=tool_call.run_step_id, status=status, summary=output
+                db=db,
+                step_id=approval_step_id,
+                status="completed",
+                summary=f"Operator approved tool call '{tool_call.skill_name}'.",
             )
-            MessageRepository.save_message(
-                db=db, session_id=session_id, run_id=run_record.id, role="tool", content=output
+            tool_step = RunStepRepository.append_step(
+                db=db,
+                run_id=run_record.id,
+                step_type=StepType.TOOL_CALL.value,
+                name=f"Skill Runtime: {tool_call.skill_name}",
+            )
+            RunStepRepository.start_step(db, tool_step.id)
+            attached = ToolCallRepository.attach_to_step(db, tool_call.id, tool_step.id)
+            if attached is None:
+                yield "error", {"message": "Failed to attach tool call to execution step."}
+                return
+            tool_call = attached
+            await execute_and_persist_tool_call(
+                db=db,
+                run_id=run_record.id,
+                session_id=session_id,
+                step_id=tool_step.id,
+                tool_name=tool_call.skill_name,
+                arguments=tool_call.arguments_json,
+                provider_tool_call_id=tool_call.provider_tool_call_id,
+                risk_level=getattr(tool_call, "risk_level", None) or "require_approval",
+                settings=app_settings,
+                executor=execute_builtin_tool,
+                existing_tool_call=tool_call,
+                approval_confirmations=1,
+                tool_call_repository=ToolCallRepository,
+                run_step_repository=RunStepRepository,
+                message_repository=MessageRepository,
+                telemetry=telemetry_tracker,
             )
         run_config = cls._run_config(run_record)
         graph_config = cls._graph_config(
@@ -456,109 +408,20 @@ class AgentExecutionService:
                         },
                     )
 
-                final_graph_state = await cls._get_graph_state(agent_app, config=graph_config)
-                latest_response = final_graph_state.values.get("latest_response")
-                execution_error = final_graph_state.values.get("execution_error")
-
-                if execution_error:
-                    error_message = cls._mark_run_failed(
-                        db,
-                        run_record.id,
-                        error_message=str(execution_error),
-                        source=execution_error_source,
-                    )
-                    telemetry_tracker.trace_run_end(
-                        run_id=trace_id,
-                        output_content=error_message,
-                        status="failed",
-                    )
-                    yield (
-                        "run_failed",
-                        {
-                            "run_id": str(run_record.id),
-                            "error": error_message,
-                        },
-                    )
-                    return
-
-                ApprovalRepository.expire_pending_requests(db, run_id=run_record.id)
-                pending_approvals = [
-                    approval
-                    for approval in ApprovalRepository.get_pending_requests(db)
-                    if approval.run_id == run_record.id
-                ]
-                if pending_approvals:
-                    RunRepository.update_run_status(
-                        db,
-                        run_record.id,
-                        status=RunStatus.WAITING_APPROVAL.value,
-                    )
-                    approval = pending_approvals[0]
-                    tool_call = ToolCallRepository.get_tool_call(db, approval.tool_call_id)
-                    yield (
-                        "run_suspended",
-                        cls._build_run_suspended_event(run_record.id, approval, tool_call),
-                    )
-                    return
-
-                if latest_response is None and missing_response_error is not None:
-                    error_message = cls._mark_run_failed(
-                        db,
-                        run_record.id,
-                        error_message=missing_response_error,
-                        source=execution_error_source,
-                    )
-                    telemetry_tracker.trace_run_end(
-                        run_id=trace_id,
-                        output_content=error_message,
-                        status="failed",
-                    )
-                    yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
-                    return
-
-                assistant_text = completion_default_text
-                if latest_response and latest_response.content is not None:
-                    assistant_text = latest_response.content
-                    if empty_content_uses_default and not assistant_text:
-                        assistant_text = completion_default_text
-
-                updated_run = RunRepository.update_run_status(
-                    db,
-                    run_record.id,
-                    status=RunStatus.COMPLETED.value,
-                )
-                terminal_error = cls._terminal_error_message(updated_run)
-                if terminal_error:
-                    telemetry_tracker.trace_run_end(
-                        run_id=trace_id,
-                        output_content=terminal_error,
-                        status="failed",
-                    )
-                    yield (
-                        "run_failed",
-                        {"run_id": str(run_record.id), "error": terminal_error},
-                    )
-                    return
-                MessageRepository.save_message(
+                event = await cls._finalize_graph_run(
                     db=db,
+                    agent_app=agent_app,
+                    graph_config=graph_config,
+                    run_record=run_record,
                     session_id=session_id,
-                    run_id=run_record.id,
-                    role="assistant",
-                    content=assistant_text,
+                    trace_id=trace_id,
+                    execution_error_source=execution_error_source,
+                    completion_default_text=completion_default_text,
+                    missing_response_error=missing_response_error,
+                    empty_content_uses_default=empty_content_uses_default,
+                    on_completed=on_completed,
                 )
-                telemetry_tracker.trace_run_end(
-                    run_id=trace_id,
-                    output_content=assistant_text,
-                    status="completed",
-                )
-                yield (
-                    "run_completed",
-                    {"run_id": str(run_record.id), "final_answer": assistant_text},
-                )
-                if on_completed is not None:
-                    maybe_awaitable = on_completed(assistant_text)
-                    if inspect.isawaitable(maybe_awaitable):
-                        await maybe_awaitable
+                yield event
         except Exception as exc:
             error_message = cls._mark_run_failed(
                 db,
@@ -572,6 +435,116 @@ class AgentExecutionService:
                 status="failed",
             )
             yield "run_failed", {"run_id": str(run_record.id), "error": error_message}
+
+    @classmethod
+    async def _finalize_graph_run(
+        cls,
+        *,
+        db: Session,
+        agent_app: Any,
+        graph_config: RunnableConfig,
+        run_record: Any,
+        session_id: uuid.UUID,
+        trace_id: str,
+        execution_error_source: str,
+        completion_default_text: str,
+        missing_response_error: str | None = None,
+        empty_content_uses_default: bool = False,
+        on_completed: Any | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Inspect final graph state and produce the terminal SSE event.
+
+        Returns exactly one ``(event_type, event_data)`` tuple —
+        ``run_failed``, ``run_suspended``, or ``run_completed``.
+        """
+        final_graph_state = await cls._get_graph_state(agent_app, config=graph_config)
+        latest_response = final_graph_state.values.get("latest_response")
+        execution_error = final_graph_state.values.get("execution_error")
+
+        if execution_error:
+            error_message = cls._mark_run_failed(
+                db,
+                run_record.id,
+                error_message=str(execution_error),
+                source=execution_error_source,
+            )
+            telemetry_tracker.trace_run_end(
+                run_id=trace_id,
+                output_content=error_message,
+                status="failed",
+            )
+            return "run_failed", {"run_id": str(run_record.id), "error": error_message}
+
+        ApprovalRepository.expire_pending_requests(db, run_id=run_record.id)
+        pending_approvals = [
+            approval
+            for approval in ApprovalRepository.get_pending_requests(db)
+            if approval.run_id == run_record.id
+        ]
+        if pending_approvals:
+            RunRepository.update_run_status(
+                db,
+                run_record.id,
+                status=RunStatus.WAITING_APPROVAL.value,
+            )
+            approval = pending_approvals[0]
+            tool_call = ToolCallRepository.get_tool_call(db, approval.tool_call_id)
+            return (
+                "run_suspended",
+                cls._build_run_suspended_event(run_record.id, approval, tool_call),
+            )
+
+        if latest_response is None and missing_response_error is not None:
+            error_message = cls._mark_run_failed(
+                db,
+                run_record.id,
+                error_message=missing_response_error,
+                source=execution_error_source,
+            )
+            telemetry_tracker.trace_run_end(
+                run_id=trace_id,
+                output_content=error_message,
+                status="failed",
+            )
+            return "run_failed", {"run_id": str(run_record.id), "error": error_message}
+
+        assistant_text = completion_default_text
+        if latest_response and latest_response.content is not None:
+            assistant_text = latest_response.content
+            if empty_content_uses_default and not assistant_text:
+                assistant_text = completion_default_text
+
+        updated_run = RunRepository.update_run_status(
+            db,
+            run_record.id,
+            status=RunStatus.COMPLETED.value,
+        )
+        terminal_error = cls._terminal_error_message(updated_run)
+        if terminal_error:
+            telemetry_tracker.trace_run_end(
+                run_id=trace_id,
+                output_content=terminal_error,
+                status="failed",
+            )
+            return "run_failed", {"run_id": str(run_record.id), "error": terminal_error}
+
+        MessageRepository.save_message(
+            db=db,
+            session_id=session_id,
+            run_id=run_record.id,
+            role="assistant",
+            content=assistant_text,
+        )
+        telemetry_tracker.trace_run_end(
+            run_id=trace_id,
+            output_content=assistant_text,
+            status="completed",
+        )
+        if on_completed is not None:
+            maybe_awaitable = on_completed(assistant_text)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+        return "run_completed", {"run_id": str(run_record.id), "final_answer": assistant_text}
 
     @classmethod
     def _graph_config(
@@ -607,7 +580,8 @@ class AgentExecutionService:
             if (
                 isinstance(metadata, dict)
                 and metadata.get("kind") == "operator_intervention"
-                and metadata.get("intervention_status") in {"pending", "undelivered"}
+                and metadata.get("intervention_status")
+                in {InterventionStatus.PENDING, InterventionStatus.UNDELIVERED}
             ):
                 continue
             messages.append(
