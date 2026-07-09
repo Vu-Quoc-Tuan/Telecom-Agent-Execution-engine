@@ -7,7 +7,7 @@ from evals.providers.backend_policy import call_api
 
 
 class LocalBackendProviderTests(unittest.TestCase):
-    def test_dangerous_risk_uses_real_backend_routing_policy(self) -> None:
+    def test_require_approval_risk_uses_real_backend_routing_policy(self) -> None:
         result = call_api(
             "routing",
             {},
@@ -15,7 +15,7 @@ class LocalBackendProviderTests(unittest.TestCase):
                 "vars": {
                     "case_type": "routing",
                     "tool_name": "restart_service",
-                    "risk_level": "dangerous_action",
+                    "risk_level": "require_approval",
                 }
             },
         )

@@ -11,7 +11,6 @@ if str(BACKEND_DIR) not in sys.path:
 
 
 def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> dict[str, str]:
-    from app.agent.routing import decide_tool_route
     from app.agent.builtin_tools import classify_builtin_risk
     from app.agent.safety import AgentSafetyGuard
     from app.sandbox.domain_validator import TelecomDomainValidator
@@ -33,15 +32,15 @@ def call_api(prompt: str, options: dict[str, Any], context: dict[str, Any]) -> d
         }
     elif case_type == "routing":
         from app.common.exceptions import TelecomAgentException
+        from app.agent.tool_batch_planner import _plan_route, ToolPlanItem
+        from app.llm.schemas import NormalizedToolCall
 
         tool_name = variables["tool_name"]
         arguments = variables.get("arguments", {})
         try:
-            risk_level = variables.get("risk_level") or classify_builtin_risk(
-                tool_name,
-                arguments,
-            )
-            action = decide_tool_route(risk_levels=[risk_level])
+            risk_level = variables.get("risk_level") or classify_builtin_risk(tool_name, arguments)
+            tool_call = NormalizedToolCall(id="eval-0", name=tool_name, arguments=arguments)
+            action = _plan_route([ToolPlanItem(index=0, tool_call=tool_call, risk_level=risk_level)])
         except TelecomAgentException:
             # Bộ quét an toàn ném lỗi (đa câu lệnh, đọc file nhạy cảm...) → từ chối.
             action, risk_level = "fail", "prohibited"
