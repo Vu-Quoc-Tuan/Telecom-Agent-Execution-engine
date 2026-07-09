@@ -83,11 +83,18 @@ up:
 	done; \
 	echo "Starting postgres + frontend containers"; \
 	echo "BACKEND_PORT=$$bport FRONTEND_PORT=$$fport"; \
-	local_cors_origins="http://localhost:$$fport,http://127.0.0.1:$$fport"; \
+	eport=$${EDGE_PORT:-8080}; \
+	local_cors_origins="http://localhost:$$fport,http://127.0.0.1:$$fport,http://localhost:$$eport,http://127.0.0.1:$$eport"; \
 	public_url=$${PUBLIC_URL:-}; \
 	public_url=$${public_url%/}; \
 	if [[ -n "$$public_url" ]]; then \
 		local_cors_origins="$$public_url,$$local_cors_origins"; \
+	fi; \
+	if [[ -f .env ]]; then \
+		env_cors=$$(grep -E '^CORS_ORIGINS=' .env | cut -d= -f2- || true); \
+		if [[ -n "$$env_cors" ]]; then \
+			local_cors_origins="$$local_cors_origins,$$env_cors"; \
+		fi; \
 	fi; \
 	BACKEND_PORT=$$bport FRONTEND_PORT=$$fport \
 	NEXT_PUBLIC_API_BASE_URL=$${NEXT_PUBLIC_API_BASE_URL:-http://127.0.0.1:$$bport/api/v1} \
