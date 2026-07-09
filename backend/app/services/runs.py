@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from app.common.enums import RunStatus
+from app.common.enums import InterventionStatus, RunStatus
 from app.database.models.agent_runs import AgentRun
 from app.database.models.chat_messages import ChatMessage
 from app.database.repositories.approvals import ApprovalRepository
@@ -45,7 +45,7 @@ class RunLifecycleService:
             content=content,
             metadata={
                 "kind": "operator_intervention",
-                "intervention_status": "pending",
+                "intervention_status": InterventionStatus.PENDING,
                 "requested_by": requested_by,
             },
         )

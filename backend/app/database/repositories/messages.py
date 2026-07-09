@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
+from app.common.enums import InterventionStatus
 from app.database.models.chat_messages import ChatMessage
 
 
@@ -72,7 +73,8 @@ class MessageRepository:
             .where(
                 ChatMessage.run_id == run_id,
                 ChatMessage.role == "user",
-                ChatMessage.metadata_json["intervention_status"].as_string() == "pending",
+                ChatMessage.metadata_json["intervention_status"].as_string()
+                == InterventionStatus.PENDING,
             )
             .order_by(ChatMessage.sequence_no.asc())
         )
@@ -117,7 +119,7 @@ class MessageRepository:
         for message in messages:
             message.metadata_json = {
                 **(message.metadata_json or {}),
-                "intervention_status": "undelivered",
+                "intervention_status": InterventionStatus.UNDELIVERED,
                 "delivery_error": reason,
             }
         if not messages:
@@ -138,7 +140,8 @@ class MessageRepository:
             .where(
                 ChatMessage.session_id == session_id,
                 ChatMessage.role == "user",
-                ChatMessage.metadata_json["intervention_status"].as_string() == "undelivered",
+                ChatMessage.metadata_json["intervention_status"].as_string()
+                == InterventionStatus.UNDELIVERED,
             )
             .order_by(ChatMessage.sequence_no.asc())
         )
@@ -157,7 +160,7 @@ class MessageRepository:
             message.run_id = run_id
             message.metadata_json = {
                 **(message.metadata_json or {}),
-                "intervention_status": "pending",
+                "intervention_status": InterventionStatus.PENDING,
                 "requeued_from_run_id": (
                     str(previous_run_id) if previous_run_id is not None else None
                 ),

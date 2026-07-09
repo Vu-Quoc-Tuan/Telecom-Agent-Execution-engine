@@ -23,6 +23,20 @@ class RunStatus(StrEnum):
     TIMED_OUT = "timed_out"
 
 
+class InterventionStatus(StrEnum):
+    """Lifecycle of an operator intervention message.
+
+    Transitions:
+        pending → injected      (LLM node consumed the message)
+        pending → undelivered   (run failed/cancelled before injection)
+        undelivered → pending   (requeued at the start of the next run)
+    """
+
+    PENDING = "pending"
+    INJECTED = "injected"
+    UNDELIVERED = "undelivered"
+
+
 class StepType(StrEnum):
     LLM_CALL = "llm_call"
     TOOL_CALL = "tool_call"
