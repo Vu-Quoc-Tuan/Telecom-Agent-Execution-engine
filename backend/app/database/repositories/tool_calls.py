@@ -74,6 +74,20 @@ class ToolCallRepository:
         return db.get(ToolCall, tool_call_id)
 
     @staticmethod
+    def attach_to_step(
+        db: Session,
+        tool_call_id: uuid.UUID,
+        run_step_id: uuid.UUID,
+    ) -> ToolCall | None:
+        tool_call = db.get(ToolCall, tool_call_id)
+        if tool_call is None:
+            return None
+        tool_call.run_step_id = run_step_id
+        db.commit()
+        db.refresh(tool_call)
+        return tool_call
+
+    @staticmethod
     def get_tool_calls_by_run(db: Session, run_id: uuid.UUID) -> list[ToolCall]:
         statement = (
             select(ToolCall).where(ToolCall.run_id == run_id).order_by(ToolCall.created_at.asc())

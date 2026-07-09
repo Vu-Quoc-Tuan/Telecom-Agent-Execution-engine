@@ -25,6 +25,19 @@ class RunStepRepository:
         metadata: dict[str, Any] | None = None,
         status: str = "pending",
     ) -> RunStep:
+        # Idempotent: nếu (run_id, step_index) đã tồn tại (replay/retry scenario),
+        # trả về step cũ thay vì tạo step mới với index bị reassign.
+        existing_exists = db.scalar(
+            select(RunStep.id).where(
+                RunStep.run_id == run_id,
+                RunStep.step_index == step_index
+            )
+        )
+        if existing_exists is not None:
+            existing = db.get(RunStep, existing_exists)
+            if existing is not None:
+                return existing
+
         step = RunStep(
             id=uuid.uuid4(),
             run_id=run_id,
@@ -39,6 +52,29 @@ class RunStepRepository:
         db.commit()
         db.refresh(step)
         return step
+
+
+    @staticmethod
+    def append_step(
+        db: Session,
+        run_id: uuid.UUID,
+        step_type: str,
+        name: str,
+        summary: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        status: str = "pending",
+    ) -> RunStep:
+        max_index = db.scalar(select(func.max(RunStep.step_index)).where(RunStep.run_id == run_id))
+        return RunStepRepository.create_step(
+            db=db,
+            run_id=run_id,
+            step_index=0 if max_index is None else max_index + 1,
+            step_type=step_type,
+            name=name,
+            summary=summary,
+            metadata=metadata,
+            status=status,
+        )
 
     @staticmethod
     def create_error_step(
