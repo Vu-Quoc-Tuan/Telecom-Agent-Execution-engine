@@ -165,9 +165,7 @@ def _fit_compacted_messages(
     while low <= high:
         midpoint = (low + high) // 2
         suffix = (
-            "\n... [SUMMARY TRUNCATED TO FIT CONTEXT BUDGET] ..."
-            if midpoint < len(summary)
-            else ""
+            "\n... [SUMMARY TRUNCATED TO FIT CONTEXT BUDGET] ..." if midpoint < len(summary) else ""
         )
         candidate_messages = build(summary[:midpoint] + suffix)
         candidate_tokens = estimate_context_tokens(

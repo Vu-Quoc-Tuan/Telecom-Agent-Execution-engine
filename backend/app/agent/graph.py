@@ -27,7 +27,11 @@ def build_telecom_agent(*, checkpointer=None):
         route_after_tool_execution,
         {"call_llm_gateway": "call_llm_gateway", "end": END},
     )
-    workflow.add_edge("suspend_for_human", "call_llm_gateway")
+    workflow.add_conditional_edges(
+        "suspend_for_human",
+        route_after_tool_execution,
+        {"call_llm_gateway": "call_llm_gateway", "end": END},
+    )
     workflow.add_edge("fail", END)
 
     # 3. Thiết lập chốt chặn rẽ nhánh thông minh tự động (Conditional Edges)

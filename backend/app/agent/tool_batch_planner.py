@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent.builtin_tools import (
     BUILTIN_TOOL_NAMES,
@@ -17,8 +18,9 @@ from app.llm.schemas import LLMToolDefinition, NormalizedToolCall
 ToolRoute = Literal["execute_tools", "suspend_for_human", "fail"]
 
 
-@dataclass(frozen=True)
-class ToolPlanItem:
+class ToolPlanItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     index: int
     tool_call: NormalizedToolCall
     risk_level: str | None = None
@@ -34,12 +36,14 @@ class ToolPlanItem:
         return self.risk_level == ExecutionMode.REQUIRE_APPROVAL.value
 
 
-@dataclass(frozen=True)
-class ToolBatchPlan:
+class ToolBatchPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     route: ToolRoute
     items: list[ToolPlanItem]
-    tool_catalog: Sequence[LLMToolDefinition]
-    ready_skill_names: set[str]
+    # Kept for backward-compat with serialized checkpoints; no longer populated.
+    tool_catalog: list[LLMToolDefinition] = Field(default_factory=list)
+    ready_skill_names: list[str] = Field(default_factory=list)
 
     @property
     def risk_levels(self) -> list[str]:
@@ -52,6 +56,19 @@ class ToolBatchPlan:
     @property
     def all_tools_available(self) -> bool:
         return not any(item.unavailable for item in self.items)
+
+
+def tool_batch_plan_matches(
+    plan: ToolBatchPlan,
+    tool_calls: Sequence[NormalizedToolCall],
+) -> bool:
+    planned_calls = [
+        (item.tool_call.id, item.tool_call.name, item.tool_call.arguments) for item in plan.items
+    ]
+    requested_calls = [
+        (tool_call.id, tool_call.name, tool_call.arguments) for tool_call in tool_calls
+    ]
+    return planned_calls == requested_calls
 
 
 def _sandbox_available(settings: Any, *, tolerate_errors: bool) -> bool:
@@ -87,13 +104,15 @@ def _skill_name_error(tool_name: str) -> str:
 def _plan_route(items: list[ToolPlanItem]) -> ToolRoute:
     all_tools_available = not any(item.unavailable for item in items)
     risk_levels = [item.risk_level for item in items if item.risk_level is not None]
-    has_invalid_call = any(item.error_message is not None and not item.unavailable for item in items)
+    has_invalid_call = any(
+        item.error_message is not None and not item.unavailable for item in items
+    )
 
     if not all_tools_available or "prohibited" in risk_levels:
         return "fail"
     if has_invalid_call:
         return "execute_tools"
-    if "dangerous_action" in risk_levels or ExecutionMode.REQUIRE_APPROVAL.value in risk_levels:
+    if ExecutionMode.REQUIRE_APPROVAL.value in risk_levels:
         return "suspend_for_human"
     return "execute_tools"
 
@@ -150,8 +169,6 @@ def plan_tool_batch(
     return ToolBatchPlan(
         route=_plan_route(items),
         items=items,
-        tool_catalog=tool_catalog,
-        ready_skill_names=ready_skill_names,
     )
 
 
@@ -161,8 +178,11 @@ def build_tool_batch_plan(
     tool_calls: Sequence[NormalizedToolCall],
     settings: Any,
     tolerate_environment_errors: bool = False,
+    selected_skill: str | None = None,
 ) -> ToolBatchPlan:
     ready_skills = _ready_skills(db, tolerate_errors=tolerate_environment_errors)
+    if selected_skill:
+        ready_skills = [s for s in ready_skills if s.name == selected_skill]
     return plan_tool_batch(
         tool_calls=tool_calls,
         ready_skills=ready_skills,

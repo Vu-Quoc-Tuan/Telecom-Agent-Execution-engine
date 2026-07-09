@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -19,9 +18,14 @@ from app.agent.context_window import compact_messages_if_needed
 from app.agent.prompts import build_context_compaction_prompt, build_system_prompt
 from app.agent.safety import AgentSafetyGuard
 from app.agent.state import AgentState
-from app.agent.tool_batch_planner import build_tool_batch_plan
+from app.agent.tool_batch_planner import (
+    ToolBatchPlan,
+    build_tool_batch_plan,
+    plan_tool_batch,
+    tool_batch_plan_matches,
+)
+from app.agent.tool_execution import execute_and_persist_tool_call
 from app.common.enums import StepType
-from app.common.exceptions import TelecomAgentException
 from app.database.repositories.approvals import ApprovalRepository
 from app.database.repositories.messages import MessageRepository
 from app.database.repositories.run_steps import RunStepRepository
@@ -98,6 +102,14 @@ def _skill_was_loaded(messages: list[LLMMessage], skill_name: str) -> bool:
     )
 
 
+def _selected_skill_from_config(config: RunnableConfig) -> str | None:
+    run_config = config["configurable"].get("run_config") or {}
+    selected_skill = run_config.get("selected_skill")
+    if not isinstance(selected_skill, str) or not selected_skill.strip():
+        return None
+    return selected_skill.strip()
+
+
 def _sandbox_available(settings: Any) -> bool:
     from app.sandbox.docker_executor import sandbox_available
 
@@ -168,6 +180,37 @@ class AgentNodes:
         )
 
     @staticmethod
+    def _tool_batch_plan(
+        state: AgentState,
+        config: RunnableConfig,
+    ) -> ToolBatchPlan:
+        tool_calls = state.latest_response.tool_calls if state.latest_response else []
+        if state.tool_batch_plan is not None and tool_batch_plan_matches(
+            state.tool_batch_plan, tool_calls
+        ):
+            return state.tool_batch_plan
+
+        selected_skill = _selected_skill_from_config(config)
+
+        return build_tool_batch_plan(
+            db=config["configurable"]["db"],
+            tool_calls=tool_calls,
+            settings=config["configurable"].get("settings"),
+            tolerate_environment_errors=True,
+            selected_skill=selected_skill,
+        )
+
+    @staticmethod
+    def _create_tool_execution_step(*, db, run_uuid: uuid.UUID, state: AgentState, item) -> Any:
+        return RunStepRepository.create_step(
+            db=db,
+            run_id=run_uuid,
+            step_index=state.current_step_index + item.index,
+            step_type=StepType.TOOL_CALL.value,
+            name=f"Skill Runtime: {item.tool_call.name}",
+        )
+
+    @staticmethod
     async def _execute_and_log_single_tool(
         *,
         db,
@@ -180,82 +223,23 @@ class AgentNodes:
         idempotency_key: str | None = None,
         step_index: int = 0,
     ) -> LLMMessage:
-        db_tool_call = ToolCallRepository.create_tool_call(
+        return await execute_and_persist_tool_call(
             db=db,
             run_id=run_uuid,
-            run_step_id=step_id,
-            skill_name=tool_call.name,
-            connector_name=connector_name_for(tool_call.name),
-            arguments=tool_call.arguments,
-            risk_level=risk_level,
-            requires_approval=False,
-            provider_tool_call_id=tool_call.id,
-            idempotency_key=idempotency_key,
-        )
-        ToolCallRepository.start_execution(db, db_tool_call.id)
-        started_at = datetime.now(UTC)
-        try:
-            if settings is not None:
-                output, was_truncated = await execute_builtin_tool(
-                    tool_name=tool_call.name,
-                    arguments=tool_call.arguments,
-                    db=db,
-                    settings=settings,
-                )
-            else:
-                output, was_truncated = await execute_builtin_tool(
-                    tool_name=tool_call.name,
-                    arguments=tool_call.arguments,
-                    db=db,
-                )
-            status = "completed"
-            error_message = None
-        except TelecomAgentException as exc:
-            output = exc.message
-            was_truncated = False
-            status = "failed"
-            error_message = exc.message
-
-        latency_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
-        ToolCallRepository.save_result(
-            db=db,
-            tool_call_id=db_tool_call.id,
-            status=status,
-            result={"output": output},
-            latency_ms=latency_ms,
-            error_msg=error_message,
-            output_truncated=was_truncated,
-        )
-        RunStepRepository.complete_step(db=db, step_id=step_id, status=status, summary=output)
-
-        # Ghi tool span con vào Langfuse dưới root span của lượt chạy hiện tại.
-        try:
-            turn_index = telemetry_tracker.get_turn_index(run_uuid.hex)
-            telemetry_tracker.trace_span(
-                run_id=run_uuid.hex,
-                span_name=f"tool: {tool_call.name} #{turn_index}.{step_index}",
-                input_data=tool_call.arguments,
-                output_data=output,
-                start_time=started_at,
-                end_time=datetime.now(UTC),
-                status=status,
-            )
-        except Exception:
-            pass
-
-        MessageRepository.save_message(
-            db=db,
             session_id=session_uuid,
-            run_id=run_uuid,
-            role="tool",
-            content=output,
-            metadata={"tool_name": tool_call.name, "tool_call_id": tool_call.id},
-        )
-        return LLMMessage(
-            role=MessageRole.TOOL,
-            content=output,
-            tool_call_id=tool_call.id,
-            tool_is_error=status == "failed",
+            step_id=step_id,
+            tool_name=tool_call.name,
+            arguments=tool_call.arguments,
+            provider_tool_call_id=tool_call.id,
+            risk_level=risk_level,
+            settings=settings,
+            executor=execute_builtin_tool,
+            idempotency_key=idempotency_key,
+            step_index=step_index,
+            tool_call_repository=ToolCallRepository,
+            run_step_repository=RunStepRepository,
+            message_repository=MessageRepository,
+            telemetry=telemetry_tracker,
         )
 
     @staticmethod
@@ -344,11 +328,7 @@ class AgentNodes:
         tool_calls = state.latest_response.tool_calls if state.latest_response else []
         executed_tool_messages: dict[str, LLMMessage] = {}
         settings = config["configurable"].get("settings")
-        plan = build_tool_batch_plan(
-            db=db,
-            tool_calls=tool_calls,
-            settings=settings,
-        )
+        plan = AgentNodes._tool_batch_plan(state, config)
 
         for item in plan.items:
             index = item.index
@@ -398,12 +378,11 @@ class AgentNodes:
                 )
                 continue
 
-            step = RunStepRepository.create_step(
+            step = AgentNodes._create_tool_execution_step(
                 db=db,
-                run_id=run_uuid,
-                step_index=state.current_step_index + index,
-                step_type=StepType.TOOL_CALL.value,
-                name=f"Skill Runtime: {tool_call.name}",
+                run_uuid=run_uuid,
+                state=state,
+                item=item,
             )
             RunStepRepository.start_step(db, step.id)
             executed_tool_messages[tool_call.id] = await AgentNodes._execute_and_log_single_tool(
@@ -443,6 +422,7 @@ class AgentNodes:
             ],
             "current_step_index": state.current_step_index + len(tool_calls),
             "approval_rejected": bool(resume_payload.get("approval_rejected", False)),
+            "tool_batch_plan": None,
         }
 
     @staticmethod
@@ -471,11 +451,7 @@ class AgentNodes:
 
         # Catalog skill 'ready' chỉ chèn METADATA (name+description) vào system prompt
         run_config = config["configurable"].get("run_config") or {}
-        selected_skill = run_config.get("selected_skill")
-        if not isinstance(selected_skill, str) or not selected_skill.strip():
-            selected_skill = None
-        else:
-            selected_skill = selected_skill.strip()
+        selected_skill = _selected_skill_from_config(config)
 
         ready_skills = SkillRepository.list_ready_skills(db)
         if selected_skill:
@@ -657,9 +633,19 @@ class AgentNodes:
             # Nối assistant message (kèm tool_calls) vào lịch sử hội thoại.
             # Bắt buộc: provider yêu cầu mỗi tool message phải đứng SAU một assistant
             # message chứa tool_calls tương ứng; nếu thiếu, lượt gọi LLM kế tiếp sẽ lỗi 400.
+            tool_batch_plan = None
+            if response.tool_calls:
+                tool_batch_plan = plan_tool_batch(
+                    tool_calls=response.tool_calls,
+                    ready_skills=ready_skills,
+                    sandbox_available=sandbox_available,
+                    settings=settings,
+                )
+
             return {
                 "messages": [*intervention_messages, assistant_message],
                 "latest_response": response,
+                "tool_batch_plan": tool_batch_plan,
                 "current_step_index": state.current_step_index + 1,
             }
         except Exception as exc:
@@ -675,21 +661,16 @@ class AgentNodes:
         tool_calls_to_run = state.latest_response.tool_calls if state.latest_response else []
         new_tool_messages: list[LLMMessage] = []
         settings = config["configurable"].get("settings")
-        plan = build_tool_batch_plan(
-            db=db,
-            tool_calls=tool_calls_to_run,
-            settings=settings,
-        )
+        plan = AgentNodes._tool_batch_plan(state, config)
 
         for item in plan.items:
             index = item.index
             tool_call = item.tool_call
-            step = RunStepRepository.create_step(
+            step = AgentNodes._create_tool_execution_step(
                 db=db,
-                run_id=run_uuid,
-                step_index=state.current_step_index + index,
-                step_type=StepType.TOOL_CALL.value,
-                name=f"Skill Runtime: {tool_call.name}",
+                run_uuid=run_uuid,
+                state=state,
+                item=item,
             )
             RunStepRepository.start_step(db, step.id)
 
@@ -741,4 +722,5 @@ class AgentNodes:
         return {
             "messages": new_tool_messages,
             "current_step_index": state.current_step_index + len(tool_calls_to_run),
+            "tool_batch_plan": None,
         }

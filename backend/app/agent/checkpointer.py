@@ -7,11 +7,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
+from app.agent.tool_batch_planner import ToolBatchPlan, ToolPlanItem
 from app.config import settings as default_settings
 from app.llm.schemas import (
     FinishReason,
     LLMMessage,
     LLMResponse,
+    LLMToolDefinition,
     MessageRole,
     NormalizedToolCall,
     TokenUsage,
@@ -20,7 +22,17 @@ from app.llm.schemas import (
 
 def build_checkpoint_serializer() -> JsonPlusSerializer:
     return JsonPlusSerializer(allowed_msgpack_modules=()).with_msgpack_allowlist(
-        [FinishReason, LLMMessage, LLMResponse, MessageRole, NormalizedToolCall, TokenUsage]
+        [
+            FinishReason,
+            LLMMessage,
+            LLMResponse,
+            MessageRole,
+            NormalizedToolCall,
+            TokenUsage,
+            ToolBatchPlan,
+            ToolPlanItem,
+            LLMToolDefinition,
+        ]
     )
 
 

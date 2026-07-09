@@ -5,6 +5,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field
 
+from app.agent.tool_batch_planner import ToolBatchPlan
 from app.llm.schemas import LLMMessage, LLMResponse
 
 MAX_CHECKPOINT_MESSAGES = 40
@@ -46,6 +47,9 @@ class AgentState(BaseModel):
 
     # Bộ nhớ tạm giữ gói tin phản hồi gần nhất của LLM Gateway để làm căn cứ rẽ nhánh
     latest_response: LLMResponse | None = None
+
+    # Kế hoạch tool đã tính cho latest_response để router/node không truy vấn lại.
+    tool_batch_plan: ToolBatchPlan | None = None
 
     # Lưu vết lỗi hệ thống nếu tiến trình gõ trạm hoặc chạy code bị crash
     execution_error: str | None = None
