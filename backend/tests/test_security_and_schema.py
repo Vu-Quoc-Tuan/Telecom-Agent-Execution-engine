@@ -45,11 +45,7 @@ class SecurityAnalyzerTests(unittest.TestCase):
         self.assertTrue(is_clean, findings)
 
     def test_blocks_sys_modules_dynamic_import_bypass(self) -> None:
-        code = (
-            "import sys\n"
-            "def run():\n"
-            "    return sys.modules['subprocess'].run(['id'])\n"
-        )
+        code = "import sys\ndef run():\n    return sys.modules['subprocess'].run(['id'])\n"
 
         is_clean, findings = AdvancedASTSecurityAnalyzer.analyze_source_code(code)
 

@@ -27,7 +27,6 @@ class Session(Base):
         nullable=False,
     )
 
-
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

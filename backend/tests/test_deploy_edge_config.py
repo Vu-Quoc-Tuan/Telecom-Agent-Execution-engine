@@ -20,15 +20,10 @@ def test_compose_defines_single_origin_edge_proxy_for_ngrok() -> None:
     assert any(mapping == "host.docker.internal:host-gateway" for mapping in edge["extra_hosts"])
     assert edge["environment"]["BACKEND_PORT"] == "${BACKEND_PORT:-8000}"
     assert any(
-        "${BIND_ADDRESS:-127.0.0.1}:${EDGE_PORT:-8080}:8080" == port
-        for port in edge["ports"]
+        "${BIND_ADDRESS:-127.0.0.1}:${EDGE_PORT:-8080}:8080" == port for port in edge["ports"]
     )
     assert any(
-        (
-            "./deploy/nginx/ngrok-edge.conf:"
-            "/etc/nginx/templates/default.conf.template:ro"
-        )
-        == volume
+        ("./deploy/nginx/ngrok-edge.conf:/etc/nginx/templates/default.conf.template:ro") == volume
         for volume in edge["volumes"]
     )
     assert edge["healthcheck"]["test"] == [

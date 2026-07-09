@@ -66,7 +66,9 @@ class ApprovalRepository:
             )
             .order_by(ApprovalRequest.requested_at.asc())
         )
-        return [(request, tool_call, step) for request, tool_call, step in db.execute(statement).all()]
+        return [
+            (request, tool_call, step) for request, tool_call, step in db.execute(statement).all()
+        ]
 
     @staticmethod
     def expire_pending_requests(
