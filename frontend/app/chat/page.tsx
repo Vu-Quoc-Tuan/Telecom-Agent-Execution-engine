@@ -19,6 +19,10 @@ import {
 } from "@/components/icons";
 import { MarkdownMessage } from "@/components/markdown-message";
 import { apiFetch, apiUrl } from "@/lib/api";
+import {
+  isTerminalStreamEvent,
+  shouldReplaceAssistantWithStreamError,
+} from "@/lib/run-status";
 import { consumeSseStream, ParsedSseEvent } from "@/lib/sse";
 import { useRunTimeline } from "./use-run-timeline";
 import type {
@@ -415,25 +419,6 @@ function ApprovalStepBody({
   );
 }
 
-function currentThinkingStatus(steps: TimelineStep[], loading: boolean, streaming: boolean) {
-  if (loading) return "Đang tải timeline của run";
-  const runningStep = steps.find((step) => step.status === "running");
-  const failedStep = steps.find((step) => isFailedStatus(step.status) || step.is_error);
-  if (runningStep?.step_type === "llm_call") {
-    const hasToolResult = steps.some(
-      (step) => step.step_type === "tool_call" && isCompletedStatus(step.status),
-    );
-    return hasToolResult
-      ? "AI đang tổng hợp kết quả từ các tool"
-      : "AI đang đọc ngữ cảnh và chọn bước tiếp theo";
-  }
-  if (runningStep?.step_type === "tool_call") return `AI đang gọi ${runningStep.tool_name ?? runningStep.name}`;
-  if (runningStep?.step_type === "approval") return "Đang chờ bạn xác nhận tác vụ";
-  if (failedStep) return "Luồng xử lý gặp lỗi ở một node";
-  if (streaming) return "AI đang tổng hợp câu trả lời";
-  if (steps.length) return "Các node đã chạy xong, đang hiển thị kết quả";
-  return "Timeline sẽ xuất hiện khi backend bắt đầu chạy";
-}
 
 function ResourceIcon({ kind }: { kind: ResourceItem["kind"] }) {
   if (kind === "ssh") return <TerminalIcon className="h-4 w-4" />;
@@ -761,114 +746,16 @@ function PhaseChip({
   );
 }
 
-function ThinkingPanel({
-  steps,
-  open,
-  loading,
-  streaming,
-  onToggle,
-}: {
-  steps: TimelineStep[];
-  open: boolean;
-  loading: boolean;
-  streaming: boolean;
-  onToggle: () => void;
-}) {
-  const completed = steps.filter((step) => isCompletedStatus(step.status)).length;
-  const failed = steps.filter((step) => isFailedStatus(step.status) || step.is_error).length;
-  const runningStep = steps.find((step) => step.status === "running");
-  const statusText = failed
-    ? `${failed} lỗi`
-    : steps.length
-      ? `${completed}/${steps.length} node xong`
-      : loading
-        ? "Đang tải"
-        : "Chưa có node";
-  const progress = steps.length ? Math.round((completed / steps.length) * 100) : 0;
-  const thinkingStatus = currentThinkingStatus(steps, loading, streaming);
-  const hasReason = steps.some((step) => step.step_type === "llm_call");
-  const hasTool = steps.some((step) => step.step_type === "tool_call");
-  const hasApproval = steps.some((step) => step.step_type === "approval");
-
-  return (
-    <section className="rounded-lg border border-warm-border/80 bg-code-block/45">
-      <button
-        type="button"
-        onClick={(event) => {
-          event.stopPropagation();
-          onToggle();
-        }}
-        className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left"
-        aria-expanded={open}
-      >
-        <span className="flex min-w-0 items-center gap-2">
-          <span
-            className={`h-2 w-2 shrink-0 rounded-full ${
-              failed
-                ? "bg-status-crimson"
-                : streaming || runningStep || loading
-                  ? "animate-pulse bg-accent-active"
-                  : "bg-status-sage"
-            }`}
-          />
-          <span className="truncate text-xs font-semibold text-primary-text">AI đang xử lý</span>
-          <span className="truncate text-[11px] text-secondary-text">{statusText}</span>
-        </span>
-        <span className="shrink-0 font-mono text-xs text-secondary-text">{open ? "−" : "+"}</span>
-      </button>
-      {open ? (
-        <div className="border-t border-warm-border px-3 pb-3 pt-2.5">
-          <p className="text-xs leading-5 text-primary-text">{thinkingStatus}</p>
-          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface-card">
-            <span
-              className={`block h-full rounded-full ${
-                failed ? "bg-status-crimson" : "bg-accent-active"
-              }`}
-              style={{ width: steps.length ? `${Math.max(progress, runningStep ? 8 : 0)}%` : "0%" }}
-            />
-          </div>
-          <div className="mt-3 grid grid-cols-3 gap-1.5">
-            <PhaseChip
-              label="Reason"
-              active={runningStep?.step_type === "llm_call"}
-              done={hasReason && !steps.some((step) => step.step_type === "llm_call" && step.status === "running")}
-            />
-            <PhaseChip
-              label="Tool"
-              active={runningStep?.step_type === "tool_call"}
-              done={hasTool && !steps.some((step) => step.step_type === "tool_call" && step.status === "running")}
-            />
-            <PhaseChip
-              label="Duyệt"
-              active={runningStep?.step_type === "approval"}
-              done={hasApproval && !steps.some((step) => step.step_type === "approval" && step.status === "running")}
-            />
-          </div>
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
 function AssistantMessageBubble({
   message,
   isSelected,
-  steps,
-  timelineLoading,
-  thinkingOpen,
-  onToggleThinking,
   onSelectTimeline,
 }: {
   message: ChatMessage;
   isSelected: boolean;
-  steps: TimelineStep[];
-  timelineLoading: boolean;
-  thinkingOpen: boolean;
-  onToggleThinking: () => void;
   onSelectTimeline: () => void;
 }) {
   const hasTimeline = Boolean(message.run_id);
-  const showThinking = hasTimeline && message.status === "streaming";
   const handleTimelineKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (!hasTimeline || (event.key !== "Enter" && event.key !== " ")) return;
     event.preventDefault();
@@ -899,16 +786,6 @@ function AssistantMessageBubble({
             : "border-warm-border bg-surface-card hover:border-accent-active/50"
       }`}
     >
-      {showThinking ? (
-        <ThinkingPanel
-          steps={steps}
-          open={thinkingOpen || message.status === "streaming"}
-          loading={timelineLoading}
-          streaming={message.status === "streaming"}
-          onToggle={onToggleThinking}
-        />
-      ) : null}
-
       <div className="min-w-0">
         <div className="mb-2 flex items-center justify-between gap-3">
           <span className="text-[11px] font-semibold uppercase text-secondary-text">
@@ -1022,7 +899,6 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [prompt, setPrompt] = useState("");
-  const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [resources, setResources] = useState<ResourceItem[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -1032,7 +908,6 @@ export default function ChatPage() {
   const {
     steps,
     selectedTimelineRunId,
-    timelineLoading,
     clearTimeline,
     selectTimelineRunId,
     getSelectedTimelineRunId,
@@ -1087,7 +962,6 @@ export default function ChatPage() {
     setError(null);
     setApproval(null);
     clearTimeline();
-    setExpandedThinking({});
     setStreaming(false);
     setActiveRunId(null);
     activeRunIdRef.current = null;
@@ -1126,10 +1000,6 @@ export default function ChatPage() {
           selectTimelineRunId(missingRunId);
           applyTimelineUpdate(missingRunId, timeline.steps);
           setActiveTab("timeline");
-          setExpandedThinking((current) => ({
-            ...current,
-            [missingRunId]: recoveredAssistant.status === "streaming",
-          }));
 
           if (recoveredAssistant.status === "streaming") {
             setStreaming(true);
@@ -1242,7 +1112,6 @@ export default function ChatPage() {
             activeRunIdRef.current = null;
             activeAssistantIdRef.current = null;
             setApproval(null);
-            setExpandedThinking((current) => ({ ...current, [pollingRunId]: false }));
             apiFetch<ChatSession[]>("/sessions").then(setSessions).catch(() => undefined);
           }
         }
@@ -1273,6 +1142,23 @@ export default function ChatPage() {
     );
   }
 
+  async function refreshSessionTitle(sessionId: string) {
+    const retryDelaysMs = [0, 1000, 3000, 7000, 15000, 30000];
+    for (const delayMs of retryDelaysMs) {
+      if (delayMs > 0) await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+      if (!isMountedRef.current) return;
+      try {
+        const refreshedSessions = await apiFetch<ChatSession[]>("/sessions");
+        if (!isMountedRef.current) return;
+        setSessions(refreshedSessions);
+        const refreshedSession = refreshedSessions.find((session) => session.id === sessionId);
+        if (refreshedSession && refreshedSession.title !== "New Session") return;
+      } catch {
+        // Title refresh is best-effort; the next retry or page reload can recover it.
+      }
+    }
+  }
+
   async function createSession() {
     historyRequestRef.current += 1;
     const optimisticId = id("session");
@@ -1287,7 +1173,6 @@ export default function ChatPage() {
     setMessages([]);
     setLoadingMessages(false);
     clearTimeline();
-    setExpandedThinking({});
     setActiveRunId(null);
     activeRunIdRef.current = null;
     activeAssistantIdRef.current = null;
@@ -1327,7 +1212,6 @@ export default function ChatPage() {
       setActiveSessionId(null);
       setMessages([]);
       clearTimeline();
-      setExpandedThinking({});
       setActiveRunId(null);
       activeRunIdRef.current = null;
       activeAssistantIdRef.current = null;
@@ -1354,7 +1238,6 @@ export default function ChatPage() {
         selectTimelineRunId(runId);
         setActiveRunId(runId);
         activeRunIdRef.current = runId;
-        setExpandedThinking((current) => ({ ...current, [runId]: true }));
         updateAssistant(assistantId, (message) => ({ ...message, run_id: runId }));
       }
       setActiveTab("timeline");
@@ -1400,7 +1283,6 @@ export default function ChatPage() {
         run_id: typeof payload.run_id === "string" ? payload.run_id : message.run_id,
       }));
       if (typeof payload.run_id === "string") {
-        setExpandedThinking((current) => ({ ...current, [payload.run_id as string]: false }));
         if (activeRunIdRef.current === payload.run_id) {
           activeRunIdRef.current = null;
           setActiveRunId(null);
@@ -1491,6 +1373,7 @@ export default function ChatPage() {
 
     const controller = new AbortController();
     abortRef.current = controller;
+    let terminalEventReceived = false;
 
     try {
       const response = await fetch(apiUrl("/chat/stream"), {
@@ -1506,9 +1389,11 @@ export default function ChatPage() {
         }),
         signal: controller.signal,
       });
-      await consumeSseStream(response, (sseEvent) =>
-        handleSseEvent(sseEvent, assistantMessage.id, streamGeneration),
-      );
+      await consumeSseStream(response, (sseEvent) => {
+        if (isTerminalStreamEvent(sseEvent.event)) terminalEventReceived = true;
+        handleSseEvent(sseEvent, assistantMessage.id, streamGeneration);
+        if (sseEvent.event === "run_completed") void refreshSessionTitle(sessionId);
+      });
     } catch (exc) {
       if (controller.signal.aborted) {
         if (isMountedRef.current) {
@@ -1518,7 +1403,11 @@ export default function ChatPage() {
             status: "done",
           }));
         }
-      } else if (isMountedRef.current && streamGenerationRef.current === streamGeneration) {
+      } else if (
+        isMountedRef.current &&
+        streamGenerationRef.current === streamGeneration &&
+        shouldReplaceAssistantWithStreamError(terminalEventReceived)
+      ) {
         const message = exc instanceof Error ? exc.message : "Không mở được SSE stream.";
         setError(message);
         updateAssistant(assistantMessage.id, (current) => ({
@@ -1679,7 +1568,6 @@ export default function ChatPage() {
             {messages.map((message) => {
               const isSelected =
                 Boolean(message.run_id) && selectedTimelineRunId === message.run_id;
-              const runSteps = isSelected ? steps : [];
 
               return (
                 <article
@@ -1694,19 +1582,6 @@ export default function ChatPage() {
                     <AssistantMessageBubble
                       message={message}
                       isSelected={isSelected}
-                      steps={runSteps}
-                      timelineLoading={timelineLoading}
-                      thinkingOpen={
-                        message.run_id ? Boolean(expandedThinking[message.run_id]) : false
-                      }
-                      onToggleThinking={() => {
-                        if (!message.run_id) return;
-                        setExpandedThinking((current) => ({
-                          ...current,
-                          [message.run_id as string]: !current[message.run_id as string],
-                        }));
-                        if (!isSelected) void loadRunTimeline(message.run_id);
-                      }}
                       onSelectTimeline={() => {
                         if (!message.run_id) return;
                         if (isSelected) {

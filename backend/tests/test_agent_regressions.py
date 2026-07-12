@@ -454,10 +454,15 @@ class AgentLifecycleRegressionTests(unittest.IsolatedAsyncioTestCase):
                 if event[0] == "run_completed":
                     break
 
-            self.assertIsNotNone(gateway.title_prompt)
-            self.assertEqual("Kiểm tra server", session.title)
+            # Câu trả lời chính phải được phát ngay; sinh title là hậu xử lý và
+            # không được giữ run_completed chờ thêm một lượt gọi model.
+            self.assertIsNone(gateway.title_prompt)
+            self.assertEqual("New Session", session.title)
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
+
+            self.assertIsNotNone(gateway.title_prompt)
+            self.assertEqual("Kiểm tra server", session.title)
 
         self.assertNotIn("SSH_Master_Password_2026", gateway.title_prompt)
         self.assertIn("[[MASKED_SECRET]]", gateway.title_prompt)
@@ -1515,6 +1520,10 @@ class ApprovalNodeRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Xin chào", result["latest_response"].content)
         self.assertEqual(
             [
+                {
+                    "event_type": "timeline_updated",
+                    "last_executed_node": "call_llm_gateway",
+                },
                 {"event_type": "text_delta", "delta": "Xin "},
                 {"event_type": "text_delta", "delta": "chào"},
             ],

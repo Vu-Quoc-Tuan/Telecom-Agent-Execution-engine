@@ -13,6 +13,7 @@ from app.config import get_llm_gateway, settings
 from app.database.connection import SessionLocal, get_db
 from app.database.repositories.skills import SkillRepository
 from app.services.agent_execution import AgentExecutionService
+from app.streaming.background import shielded_stream
 from app.streaming.event_mapper import TelecomStreamEventMapper
 from app.streaming.sse import format_sse_event
 
@@ -102,13 +103,13 @@ async def stream_agent_conversation(
     else:
         model = llm_gateway.get_adapter(provider).model
 
-    # DB session phải sống xuyên suốt vòng đời của stream, không lấy từ Depends(get_db):
-    # FastAPI đóng dependency-session ngay khi endpoint trả về StreamingResponse, trong khi
-    # generator dưới đây mới truy vấn DB sau đó -> dùng SessionLocal() bên trong generator.
-    async def sse_pipeline_transport():
+    # DB session phải sống xuyên suốt vòng đời của agent execution.
+    # Đặt bên trong _agent_generator (chạy trong background task) thay vì bên
+    # ngoài SSE consumer — khi browser ngắt kết nối, chỉ vòng lặp SSE bị huỷ,
+    # còn background task (cùng DB session) vẫn tiếp tục cho đến khi agent kết thúc.
+    async def _agent_generator():
         with SessionLocal() as db:
-            # 1. Generator Tuple thô từ AgentExecutionService
-            raw_generator = AgentExecutionService.run_agent_lifecycle(
+            async for event in AgentExecutionService.run_agent_lifecycle(
                 db=db,
                 llm_gateway=llm_gateway,
                 session_id=body.session_id,
@@ -116,14 +117,14 @@ async def stream_agent_conversation(
                 provider=provider,
                 model=model,
                 selected_skill=body.skill_name if body.skill_mode == "specific" else None,
+            ):
+                yield event
+
+    async def sse_pipeline_transport():
+        async for event_type, payload_dict in shielded_stream(_agent_generator()):
+            envelope = TelecomStreamEventMapper.map_raw_payload_to_envelope(
+                event_type, payload_dict
             )
-            # 2. Mapper, format SSE
-            async for event_type, payload_dict in raw_generator:
-                # Map và validate cấu trúc bằng Pydantic
-                envelope = TelecomStreamEventMapper.map_raw_payload_to_envelope(
-                    event_type, payload_dict
-                )
-                # Biến thành chuỗi text sse
-                yield format_sse_event(envelope.event_type.value, envelope.payload.model_dump())
+            yield format_sse_event(envelope.event_type.value, envelope.payload.model_dump())
 
     return StreamingResponse(sse_pipeline_transport(), media_type="text/event-stream")

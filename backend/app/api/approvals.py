@@ -11,6 +11,7 @@ from app.config import get_llm_gateway
 from app.database.connection import SessionLocal, get_db
 from app.services.agent_execution import AgentExecutionService
 from app.services.approval import ApprovalService
+from app.streaming.background import shielded_stream
 from app.streaming.event_mapper import TelecomStreamEventMapper
 from app.streaming.sse import format_sse_event
 
@@ -41,18 +42,21 @@ async def resolve_and_resume(
     approval_id: uuid.UUID,
     body: ResolveApprovalBody,
 ):
-    # DB session sống xuyên suốt stream resume: mở trong generator thay vì Depends(get_db),
-    # vì session từ Depends bị FastAPI đóng ngay khi trả về StreamingResponse.
-    async def sse_pipeline_transport():
+    # DB session sống xuyên suốt agent resume: đặt bên trong _agent_generator
+    # (chạy trong background task) để browser disconnect không huỷ execution.
+    async def _agent_generator():
         with SessionLocal() as db:
-            raw_generator = AgentExecutionService.resolve_approval_and_resume_lifecycle(
+            async for event in AgentExecutionService.resolve_approval_and_resume_lifecycle(
                 db=db,
                 llm_gateway=get_llm_gateway(),
                 approval_id=approval_id,
                 action=body.action,
-            )
-            async for event_type, payload in raw_generator:
-                envelope = TelecomStreamEventMapper.map_raw_payload_to_envelope(event_type, payload)
-                yield format_sse_event(envelope.event_type.value, envelope.payload.model_dump())
+            ):
+                yield event
+
+    async def sse_pipeline_transport():
+        async for event_type, payload in shielded_stream(_agent_generator()):
+            envelope = TelecomStreamEventMapper.map_raw_payload_to_envelope(event_type, payload)
+            yield format_sse_event(envelope.event_type.value, envelope.payload.model_dump())
 
     return StreamingResponse(sse_pipeline_transport(), media_type="text/event-stream")

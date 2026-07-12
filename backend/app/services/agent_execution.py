@@ -14,6 +14,7 @@ from app.agent.graph import build_telecom_agent
 from app.agent.prompts import TELECOM_AGENT_PROMPT_VERSION
 from app.agent.safety import AgentSafetyGuard
 from app.agent.tool_execution import execute_and_persist_tool_call, persist_rejected_tool_call
+from app.common.config_parsing import parse_positive_int
 from app.common.enums import InterventionStatus, RunStatus, StepType
 from app.config import settings as app_settings
 from app.database.repositories.approvals import ApprovalRepository
@@ -27,7 +28,6 @@ from app.llm.gateway import LLMGateway
 from app.llm.schemas import LLMMessage, LLMRequestOptions, MessageRole
 from app.observability.langfuse import telemetry_tracker
 from app.observability.logging import app_logger
-from app.observability.tracing import TelecomTaskTracer
 from app.services.timeline import serialize_timeline_steps
 
 
@@ -137,7 +137,7 @@ class AgentExecutionService:
             "session_id": str(session_id),
             "run_id": str(run_record.id),
             "current_step_index": 0,
-            "max_steps": cls._int_config(run_config, "max_steps", app_settings.AGENT_MAX_STEPS),
+            "max_steps": parse_positive_int(run_config, "max_steps", app_settings.AGENT_MAX_STEPS),
             "execution_error": None,
             "latest_response": None,
         }
@@ -161,8 +161,6 @@ class AgentExecutionService:
             run_record=run_record,
             session_id=session_id,
             stream_input=initial_state,
-            tracer_name="agent_run",
-            tracer_run_id=trace_id,
             trace_id=trace_id,
             execution_error_source="agent_graph",
             exception_source="agent_lifecycle",
@@ -242,6 +240,14 @@ class AgentExecutionService:
                 yield "error", {"message": "Failed to attach tool call to execution step."}
                 return
             tool_call = attached
+            yield (
+                "timeline_updated",
+                {
+                    "run_id": str(run_record.id),
+                    "last_executed_node": "approved_tool_execution",
+                    "steps": cls._serialize_steps(db, run_record.id),
+                },
+            )
             await execute_and_persist_tool_call(
                 db=db,
                 run_id=run_record.id,
@@ -351,8 +357,6 @@ class AgentExecutionService:
             run_record=run_record,
             session_id=session_id,
             stream_input=resume_command,
-            tracer_name="agent_resume",
-            tracer_run_id=str(run_record.id),
             trace_id=run_record.id.hex,
             execution_error_source="agent_resume",
             exception_source="agent_resume",
@@ -370,8 +374,6 @@ class AgentExecutionService:
         run_record: Any,
         session_id: uuid.UUID,
         stream_input: Any,
-        tracer_name: str,
-        tracer_run_id: str,
         trace_id: str,
         execution_error_source: str,
         exception_source: str,
@@ -381,47 +383,64 @@ class AgentExecutionService:
         on_completed: Any | None = None,
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         try:
-            with TelecomTaskTracer(tracer_name, session_id=str(session_id), run_id=tracer_run_id):
-                async for chunk in agent_app.astream(
-                    stream_input,
-                    config=graph_config,
-                    stream_mode=["updates", "custom"],
-                ):
-                    stream_mode, stream_payload = cls._normalize_graph_stream_chunk(chunk)
-                    if stream_mode == "custom":
-                        text_delta = cls._text_delta_payload(
-                            stream_payload,
-                            run_id=str(run_record.id),
-                        )
-                        if text_delta is not None:
-                            yield "text_delta", text_delta
-                        continue
-
-                    node_name = next(iter(stream_payload.keys()))
-                    RunRepository.increment_step_count(db, run_record.id)
-                    yield (
-                        "timeline_updated",
-                        {
-                            "run_id": str(run_record.id),
-                            "last_executed_node": node_name,
-                            "steps": cls._serialize_steps(db, run_record.id),
-                        },
+            async for chunk in agent_app.astream(
+                stream_input,
+                config=graph_config,
+                stream_mode=["updates", "custom"],
+            ):
+                stream_mode, stream_payload = cls._normalize_graph_stream_chunk(chunk)
+                if stream_mode == "custom":
+                    text_delta = cls._text_delta_payload(
+                        stream_payload,
+                        run_id=str(run_record.id),
                     )
+                    if text_delta is not None:
+                        yield "text_delta", text_delta
+                        continue
+                    if (
+                        isinstance(stream_payload, dict)
+                        and stream_payload.get("event_type") == "timeline_updated"
+                    ):
+                        yield (
+                            "timeline_updated",
+                            {
+                                "run_id": str(run_record.id),
+                                "last_executed_node": str(
+                                    stream_payload.get("last_executed_node") or "agent"
+                                ),
+                                "steps": cls._serialize_steps(db, run_record.id),
+                            },
+                        )
+                    continue
 
-                event = await cls._finalize_graph_run(
-                    db=db,
-                    agent_app=agent_app,
-                    graph_config=graph_config,
-                    run_record=run_record,
-                    session_id=session_id,
-                    trace_id=trace_id,
-                    execution_error_source=execution_error_source,
-                    completion_default_text=completion_default_text,
-                    missing_response_error=missing_response_error,
-                    empty_content_uses_default=empty_content_uses_default,
-                    on_completed=on_completed,
+                node_name = next(iter(stream_payload.keys()))
+                RunRepository.increment_step_count(db, run_record.id)
+                yield (
+                    "timeline_updated",
+                    {
+                        "run_id": str(run_record.id),
+                        "last_executed_node": node_name,
+                        "steps": cls._serialize_steps(db, run_record.id),
+                    },
                 )
-                yield event
+
+            event = await cls._finalize_graph_run(
+                db=db,
+                agent_app=agent_app,
+                graph_config=graph_config,
+                run_record=run_record,
+                session_id=session_id,
+                trace_id=trace_id,
+                execution_error_source=execution_error_source,
+                completion_default_text=completion_default_text,
+                missing_response_error=missing_response_error,
+                empty_content_uses_default=empty_content_uses_default,
+            )
+            yield event
+            if event[0] == "run_completed" and on_completed is not None:
+                maybe_awaitable = on_completed(event[1]["final_answer"])
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
         except Exception as exc:
             error_message = cls._mark_run_failed(
                 db,
@@ -450,7 +469,6 @@ class AgentExecutionService:
         completion_default_text: str,
         missing_response_error: str | None = None,
         empty_content_uses_default: bool = False,
-        on_completed: Any | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Inspect final graph state and produce the terminal SSE event.
 
@@ -508,11 +526,23 @@ class AgentExecutionService:
             )
             return "run_failed", {"run_id": str(run_record.id), "error": error_message}
 
+        if latest_response is not None and not (latest_response.content or "").strip():
+            error_message = cls._mark_run_failed(
+                db,
+                run_record.id,
+                error_message="Model returned an empty response.",
+                source=execution_error_source,
+            )
+            telemetry_tracker.trace_run_end(
+                run_id=trace_id,
+                output_content=error_message,
+                status="failed",
+            )
+            return "run_failed", {"run_id": str(run_record.id), "error": error_message}
+
         assistant_text = completion_default_text
         if latest_response and latest_response.content is not None:
             assistant_text = latest_response.content
-            if empty_content_uses_default and not assistant_text:
-                assistant_text = completion_default_text
 
         updated_run = RunRepository.update_run_status(
             db,
@@ -540,10 +570,6 @@ class AgentExecutionService:
             output_content=assistant_text,
             status="completed",
         )
-        if on_completed is not None:
-            maybe_awaitable = on_completed(assistant_text)
-            if inspect.isawaitable(maybe_awaitable):
-                await maybe_awaitable
         return "run_completed", {"run_id": str(run_record.id), "final_answer": assistant_text}
 
     @classmethod
@@ -634,14 +660,6 @@ class AgentExecutionService:
         if not isinstance(raw, dict):
             raw = {}
         return {**cls._default_run_config(), **raw}
-
-    @staticmethod
-    def _int_config(config: dict[str, Any], key: str, default: int) -> int:
-        try:
-            value = int(config.get(key, default))
-        except (TypeError, ValueError):
-            return default
-        return value if value > 0 else default
 
     @staticmethod
     def _terminal_error_message(run_record) -> str | None:

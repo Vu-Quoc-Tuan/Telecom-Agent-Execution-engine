@@ -74,6 +74,42 @@ class FakeAgentApp:
 
 
 class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
+    @patch("app.services.agent_execution.AgentExecutionService._mark_run_failed")
+    @patch("app.services.agent_execution.MessageRepository.save_message")
+    async def test_empty_model_response_fails_instead_of_using_completion_fallback(
+        self,
+        mock_save_message,
+        mock_mark_run_failed,
+    ):
+        fake_run = FakeRunRecord()
+        fake_response = MagicMock()
+        fake_response.content = ""
+        fake_app = FakeAgentApp(
+            stream_chunks=[],
+            final_state_values={"latest_response": fake_response, "execution_error": None},
+        )
+        mock_mark_run_failed.return_value = "Model returned an empty response."
+
+        event = await AgentExecutionService._finalize_graph_run(
+            db=FakeDb(),
+            agent_app=fake_app,
+            graph_config={},
+            run_record=fake_run,
+            session_id=fake_run.session_id,
+            trace_id=fake_run.id.hex,
+            execution_error_source="agent_graph",
+            completion_default_text="Tác vụ hoàn thành.",
+            missing_response_error="Agent graph ended without a final response.",
+            empty_content_uses_default=True,
+        )
+
+        self.assertEqual(
+            ("run_failed", {"run_id": str(fake_run.id), "error": "Model returned an empty response."}),
+            event,
+        )
+        mock_mark_run_failed.assert_called_once()
+        mock_save_message.assert_not_called()
+
     @patch("app.services.agent_execution.SessionRepository.get_session_by_id")
     @patch("app.services.agent_execution.MessageRepository.save_message")
     @patch("app.services.agent_execution.RunRepository.create_run")
@@ -176,6 +212,73 @@ class AgentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(("text_delta", {"run_id": str(fake_run.id), "delta": "chào"}), events[2])
         self.assertEqual("timeline_updated", events[3][0])
         self.assertEqual("run_completed", events[4][0])
+
+    @patch("app.services.agent_execution.SessionRepository.get_session_by_id")
+    @patch("app.services.agent_execution.MessageRepository.save_message")
+    @patch("app.services.agent_execution.RunRepository.create_run")
+    @patch("app.services.agent_execution.RunRepository.increment_step_count")
+    @patch("app.services.agent_execution.RunRepository.update_run_status")
+    @patch("app.services.agent_execution.AgentExecutionService.get_agent_app")
+    @patch("app.services.agent_execution.AgentExecutionService._serialize_steps")
+    @patch("app.services.agent_execution.RunStepRepository.create_error_step")
+    async def test_run_agent_lifecycle_emits_running_tool_timeline_from_custom_event(
+        self,
+        mock_err_step,
+        mock_serialize,
+        mock_get_app,
+        mock_update_run,
+        mock_inc_step,
+        mock_create_run,
+        mock_save_msg,
+        mock_get_session,
+    ):
+        mock_get_session.return_value = True
+        fake_run = FakeRunRecord()
+        mock_create_run.return_value = fake_run
+        mock_save_msg.return_value = FakeMessage()
+        running_steps = [
+            {
+                "id": "tool-step",
+                "step_index": 1,
+                "step_type": "tool_call",
+                "name": "Skill Runtime: lookup",
+                "status": "running",
+                "tool_input": {"site": "HNI"},
+                "tool_output": None,
+            }
+        ]
+        mock_serialize.return_value = running_steps
+
+        fake_response = MagicMock()
+        fake_response.content = "Done"
+        fake_app = FakeAgentApp(
+            stream_chunks=[
+                (
+                    "custom",
+                    {
+                        "event_type": "timeline_updated",
+                        "last_executed_node": "execute_tools",
+                    },
+                ),
+                ("updates", {"execute_tools": {}}),
+            ],
+            final_state_values={"latest_response": fake_response, "execution_error": None},
+        )
+        mock_get_app.return_value = fake_app
+
+        events = []
+        async for event in AgentExecutionService.run_agent_lifecycle(
+            db=FakeDb(),
+            llm_gateway=FakeLLMGateway(),
+            session_id=fake_run.session_id,
+            user_content="Run lookup",
+        ):
+            events.append(event)
+
+        timeline_events = [event for event in events if event[0] == "timeline_updated"]
+        self.assertEqual(2, len(timeline_events))
+        self.assertEqual(running_steps, timeline_events[0][1]["steps"])
+        self.assertEqual("execute_tools", timeline_events[0][1]["last_executed_node"])
 
     @patch("app.services.agent_execution.MessageRepository.mark_pending_interventions_undelivered")
     @patch("app.services.agent_execution.SessionRepository.get_session_by_id")
