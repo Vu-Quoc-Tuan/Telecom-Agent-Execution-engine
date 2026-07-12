@@ -4,7 +4,7 @@ import types
 import unittest
 import uuid
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent.state import AgentState
 from app.common.enums import RunStatus
@@ -104,6 +104,7 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
             SSH_NODE_HOST_MAP="site-a=10.0.0.11",
             SSH_HOST="",
         )
+        stream_writer = MagicMock()
 
         with ExitStack() as stack:
             build_plan = stack.enter_context(patch("app.agent.nodes.build_tool_batch_plan"))
@@ -134,6 +135,9 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             stack.enter_context(patch("app.agent.nodes.telemetry_tracker.trace_span"))
+            stack.enter_context(
+                patch("app.agent.nodes.AgentNodes._custom_stream_writer", return_value=stream_writer)
+            )
 
             result = await AgentNodes.execute_tools(
                 state,
@@ -147,6 +151,12 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", save_result.call_args.kwargs["status"])
         self.assertEqual("failed", complete_step.call_args.kwargs["status"])
         self.assertEqual("tool", save_message.call_args.kwargs["role"])
+        stream_writer.assert_called_once_with(
+            {
+                "event_type": "timeline_updated",
+                "last_executed_node": "execute_tools",
+            }
+        )
         build_plan.assert_not_called()
 
     def test_reliability_router_uses_cached_tool_batch_plan(self) -> None:
@@ -338,6 +348,8 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         self.assertEqual("run_completed", events[-1][0])
+        self.assertEqual("timeline_updated", events[0][0])
+        self.assertEqual("approved_tool_execution", events[0][1]["last_executed_node"])
         self.assertEqual(approval_step_id, complete_step.call_args_list[0].kwargs["step_id"])
         self.assertEqual("completed", complete_step.call_args_list[0].kwargs["status"])
         append_step.assert_called_once()

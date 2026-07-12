@@ -3,26 +3,41 @@
 FastAPI and LangGraph backend for telecom operations with dynamic skills, human approval,
 PostgreSQL persistence, SSE events, and offline policy evaluations.
 
-Authentication is intentionally not enabled in the current development phase. Do not expose
-the API to an untrusted network until an authentication and authorization layer is added.
+## Documentation
+
+- [Hướng dẫn cài đặt, cấu hình và vận hành](docs/running-guide.md)
+- [Kiến trúc hệ thống và LLM gateway](docs/architecture.md)
 
 ## Local Setup
 
+1. Copy and configure environment files:
 ```bash
 cp .env.example .env
+# Optional: connector overrides (ClickHouse / external Postgres / SSH)
+cp .env.external.example .env.external
+```
+
+2. Install dependencies and run database migrations:
+```bash
 make setup
 docker compose up -d postgres
 make migrate
 ```
 
-Run the backend:
+You can start the entire stack together using `make up`, or run the services separately:
 
 ```bash
-cd backend
-.venv/bin/uvicorn app.main:app --reload
+# Run separately:
+make dev-backend
+make dev-frontend
 ```
 
-The health endpoint is available at `http://localhost:8000/health`.
+Alternatively, running `make up` starts PostgreSQL, frontend, and edge proxy in Docker, and launches the reloadable backend on the host (so approved skill scripts can use the host Docker daemon for the sandbox).
+
+By default, the backend runs on `http://localhost:8000`, the frontend on `http://localhost:3000/chat`, and the edge proxy on `http://localhost:8080/chat`.
+
+> [!NOTE]
+> If any of these default ports are already occupied, the startup script will automatically scan and bind to the next available ports. Always check the console output of `make up` to see the exact ports assigned to the running services.
 
 ## Verification
 
@@ -32,46 +47,41 @@ make lint
 make eval
 ```
 
-`make eval` runs six local Promptfoo scenarios against backend policy code. It does not require
-OpenAI, Anthropic, or any other external account or API key.
+`make eval` runs eight local Promptfoo scenarios in `evals/scenarios.yaml` against backend policy
+code. It does not require OpenAI, Anthropic, or any other external account or API key.
 
 ## Agent Skills
 
 Skills follow the [Agent Skills specification](https://agentskills.io/specification). Upload a ZIP
 containing one skill folder with a required `SKILL.md` and optional `scripts/`, `references/`, and
-`assets/` directories:
+`assets/`.
 
-```bash
-curl -X POST http://localhost:8000/api/v1/skills/upload \
-  -F 'file=@check-kpis.zip;type=application/zip'
-```
+- **Sandbox Validation:** Uploaded skills are untrusted until they pass validation, Docker sandbox execution (when available), and manual review.
+- **Strict Execution:** Free-form code execution (SSH, shell, Python, SQL) is disabled. The model must call approved skill scripts or backend-owned capabilities with structured JSON arguments.
+- **Human-in-the-Loop:** All skill script executions and safety-critical operations (e.g., `restart_service`) suspend and require per-run manual approval.
+- **SSH & Service Controls:** Remote nodes can be mapped logically (`SSH_NODE_HOST_MAP`). Service restarts are restricted to an explicit whitelist (`SSH_RESTART_ALLOWED_SERVICES`).
 
-Uploaded scripts are untrusted until the upload pipeline validates them. The pipeline may use an LLM
-analyzer to propose how each script should be invoked and smoke-tested, but that proposal only
-becomes trusted after backend validation, Cube Sandbox execution, and human review. A script that
-passes those gates can be executed later by path as an approved skill script. The model should call
-the backend with `skill_name`, `script_path`, and JSON arguments; it should not copy script source
-into a free-form code execution tool.
+## Built-in Capabilities
 
-Backend-owned read-only capabilities may auto-execute. Every invocation of an approved skill
-script requires per-run human approval before the sandbox starts. Model-generated Python, shell,
-SQL, SSH commands, wrappers, or script bodies are not pre-approved. They are rejected unless
-implemented as a reviewed skill script or backend-owned capability, even when a static scanner says
-they look safe. Infrastructure credentials, connector access, risk routing, and human approval stay
-under backend control.
+The backend exposes several pre-built tools (Capabilities) that the LLM agent can invoke directly:
 
-Backend-owned capabilities are fixed runners/templates with JSON arguments, for example
-`get_site_alarm_summary`, `get_site_kpi_snapshot`, `get_site_inventory`,
-`get_node_health_snapshot`, `ping_node`, and `restart_service`. Free-form `query_*` and
-`run_ssh_command` calls are intentionally not exposed; model-generated SQL, shell, SSH, Python, or
-wrapper payloads are rejected unless they are implemented as a reviewed skill script or a
-backend-owned capability.
+### 1. Monitoring & Alarms (ClickHouse)
+- `get_site_alarm_summary`: Summarize alarm counts by severity level for a site.
+- `get_active_alarms`: List recent active/unresolved alarms with optional severity filtering.
+- `get_site_kpi_snapshot`: Fetch the most recent KPI values for a site.
 
-For SSH, `node_name` should normally be a resolvable host. If operators use logical node names,
-set `SSH_NODE_HOST_MAP` as comma-separated `node=host` pairs, for example
-`site-a=10.0.0.11,site-b=node-b.internal`. `restart_service` is exposed only when
-`SSH_RESTART_ALLOWED_SERVICES` contains at least one safe service/unit name such as `nginx` or
-`node-exporter.service`, and it always suspends for human approval before execution.
+### 2. Inventory (PostgreSQL)
+- `get_site_inventory`: Retrieve hardware configuration and inventory data for a site.
+
+### 3. Diagnostics & Control (SSH)
+- `get_node_health_snapshot`: Run a fixed set of read-only diagnostic command templates on a remote node.
+- `ping_node`: Perform ICMP ping to measure latency and connectivity.
+- `restart_service`: Safely restart allowed systemd services (requires manual operator approval).
+
+### 4. Dynamic Skills
+- `load_skill`: Load approved skill metadata.
+- `read_skill_file`: View contents of skill source files.
+- `run_skill_script`: Run verified/approved skill python scripts inside the Docker sandbox.
 
 ## Chat Stream
 
@@ -84,99 +94,55 @@ Chat uses `POST /api/v1/chat/stream` so prompt text is not placed in the URL:
   "provider": "openai",
   "model": "gpt-4o",
   "skill_mode": "specific",
-  "skill_name": "check-kpis"
+  "skill_name": "noc-alarm-enrichment"
 }
 ```
 
+`skill_name` is only an example of a ready catalog skill; use a name that exists in your registry.
 The chat model picker reads `GET /api/v1/chat/options` and exposes the configured OpenAI and
 Claude adapters. Use `skill_mode: "auto"` without `skill_name` to let the agent choose a ready
 skill.
 
 ## Ngrok Deploy
 
-ngrok free accounts include one automatically assigned Dev Domain. Use that stable domain with the
-local edge proxy so the browser sees a single public origin for both the frontend and `/api/v1`.
+Expose the local one-origin edge proxy (port 8080) to the public web via ngrok:
 
-Start the app stack in one-origin mode, then expose the edge port:
-
+1. **Start the app stack in one-origin mode:**
 ```bash
 NEXT_PUBLIC_API_BASE_URL=/api/v1 \
-PUBLIC_URL=https://karlene-thermostable-tabatha.ngrok-free.dev \
+PUBLIC_URL=https://<your-ngrok-domain>.ngrok-free.dev \
 make up
 ```
 
-If your ngrok Cloud Endpoint traffic policy uses `forward-internal` to `https://default.internal`,
-run the agent against that internal URL:
-
+2. **Expose the edge proxy:**
 ```bash
+# Direct exposure:
+ngrok http 8080 --url https://<your-ngrok-domain>.ngrok-free.dev
+
+# Or if using a forward-internal ngrok traffic policy:
 ngrok http 8080 --url https://default.internal
 ```
 
-The public URL remains the Cloud Endpoint URL shown in the ngrok dashboard, for example
-`https://karlene-thermostable-tabatha.ngrok-free.dev`.
-
-The `Deploy` workflow recreates the managed Docker ngrok agent whenever `public_url` is supplied.
-It forwards the Cloud Endpoint's internal URL to the local edge proxy with host networking:
-
+3. **Deploy as a background Docker container (Optional):**
 ```bash
-docker run -d \
-  --name telecom_agent_ngrok \
-  --restart unless-stopped \
-  --network host \
+docker run -d --name telecom_agent_ngrok --restart unless-stopped --network host \
   -v "$HOME/.config/ngrok/ngrok.yml:/etc/ngrok.yml:ro" \
-  ngrok/ngrok:latest \
-  http http://127.0.0.1:8080 \
-  --url https://default.internal \
-  --config /etc/ngrok.yml \
-  --log stdout
+  ngrok/ngrok:latest http http://127.0.0.1:8080 --url https://default.internal --config /etc/ngrok.yml
 ```
-
-Do not use Docker's default bridge with `host.docker.internal:8080` while the edge port is bound to
-`127.0.0.1`; the bridge gateway cannot reach that loopback-only listener.
-
-If your ngrok config is not at `$HOME/.config/ngrok/ngrok.yml`, set `NGROK_CONFIG_PATH` on the
-deploy host. `NGROK_AGENT_URL` defaults to `https://default.internal`, and `NGROK_IMAGE` defaults
-to `ngrok/ngrok:latest`; override them only for a non-standard ngrok setup. The workflow polls
-`public_url` and fails the deployment if the agent is not forwarding to the edge.
-
-When dispatching the `Deploy` workflow, set:
-
-```bash
-public_url=https://karlene-thermostable-tabatha.ngrok-free.dev
-```
-
-The workflow writes:
-
-```bash
-NEXT_PUBLIC_API_BASE_URL=/api/v1
-CORS_ORIGINS=<public_url>,http://localhost:8080,http://127.0.0.1:8080,...
-```
-
-The `edge` service routes `/api/v1/*` to the FastAPI backend with buffering disabled, and routes
-everything else to the Next.js frontend. That keeps SSE streaming on one stable URL without needing
-two ngrok domains.
-
-The current application has no authentication. A public ngrok URL is suitable only for a trusted
-development/demo audience until authentication and authorization are implemented.
 
 ## Run Operations
 
-Cancel an active run:
-
+- **Cancel an active run:**
 ```bash
 curl -X POST http://localhost:8000/api/v1/runs/{run_id}/cancel \
   -H 'Content-Type: application/json' \
   -d '{"reason":"Operator stopped this run."}'
 ```
 
-Mark stale active runs as timed out. The default threshold is `RUN_TIMEOUT_SECONDS`:
-
+- **Clean up stale runs (timeouts):**
 ```bash
 curl -X POST http://localhost:8000/api/v1/runs/mark-timeouts \
   -H 'Content-Type: application/json' \
   -d '{"timeout_seconds":3600,"limit":100}'
 ```
-
-The backend also starts an internal timeout sweeper during FastAPI lifespan when
-`RUN_TIMEOUT_SWEEPER_ENABLED=true`. It runs every `RUN_TIMEOUT_SWEEPER_INTERVAL_SECONDS`
-seconds and marks up to `RUN_TIMEOUT_SWEEPER_LIMIT` stale active runs as `timed_out`.
+*(Note: If `RUN_TIMEOUT_SWEEPER_ENABLED=true` is set, the backend sweeps for timeouts automatically).*

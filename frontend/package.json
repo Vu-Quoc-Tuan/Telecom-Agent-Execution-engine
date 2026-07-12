@@ -7,7 +7,7 @@
     "dev": "next dev",
     "build": "next build --webpack",
     "start": "next start",
-    "test": "node --test --experimental-strip-types lib/api.test.ts lib/sse.test.ts",
+    "test": "node --test --experimental-strip-types lib/api.test.ts lib/run-status.test.ts lib/sse.test.ts",
     "lint": "eslint"
   },
   "dependencies": {

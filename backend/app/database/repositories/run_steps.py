@@ -108,13 +108,19 @@ class RunStepRepository:
 
     @staticmethod
     def start_step(db: Session, step_id: uuid.UUID) -> RunStep | None:
-        step = db.get(RunStep, step_id)
-        if step is None:
-            return None
-        step.status = "running"
-        step.started_at = datetime.now(UTC)
+        statement = (
+            update(RunStep)
+            .where(RunStep.id == step_id, RunStep.status == "pending")
+            .values(status="running", started_at=datetime.now(UTC))
+            .returning(RunStep)
+            .execution_options(populate_existing=True)
+        )
+        step = db.scalar(statement)
         db.commit()
-        db.refresh(step)
+        if step is None:
+            step = db.get(RunStep, step_id)
+        if step is not None:
+            db.refresh(step)
         return step
 
     @staticmethod
@@ -126,19 +132,30 @@ class RunStepRepository:
         metadata: dict[str, Any] | None = None,
         commit: bool = True,
     ) -> RunStep | None:
-        step = db.get(RunStep, step_id)
-        if step is None:
-            return None
-        step.status = status
-        step.summary = summary
+        values: dict[str, Any] = {
+            "status": status,
+            "summary": summary,
+            "completed_at": datetime.now(UTC),
+        }
         if metadata is not None:
-            step.metadata_json = {**(step.metadata_json or {}), **metadata}
-        step.completed_at = datetime.now(UTC)
+            values["metadata_json"] = RunStep.metadata_json.op("||")(metadata)
+        statement = (
+            update(RunStep)
+            .where(
+                RunStep.id == step_id,
+                RunStep.status.in_(_OPEN_STEP_STATUSES),
+            )
+            .values(**values)
+            .returning(RunStep)
+            .execution_options(populate_existing=True)
+        )
+        step = db.scalar(statement)
         if commit:
             db.commit()
+        if step is None:
+            step = db.get(RunStep, step_id)
+        if step is not None:
             db.refresh(step)
-        else:
-            db.flush()
         return step
 
     @staticmethod

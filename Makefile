@@ -19,7 +19,7 @@ PROMPTFOO_ENV := PROMPTFOO_CONFIG_DIR=/tmp/telecom-promptfoo \
 
 .PHONY: help setup setup-backend setup-frontend \
 	up down stop-backend restart build rebuild logs ps \
-	frontend-shell db-shell migrate init-db \
+	frontend-shell db-shell migrate \
 	dev-backend dev-frontend test test-backend test-evals test-frontend \
 	lint lint-backend lint-frontend format eval eval-online redteam \
 	clean
@@ -184,7 +184,7 @@ logs:
 ps:
 	$(COMPOSE) ps
 
-migrate init-db:
+migrate:
 	cd $(BACKEND_DIR) && UV_CACHE_DIR=/tmp/uv-cache uv run alembic upgrade head
 
 frontend-shell:

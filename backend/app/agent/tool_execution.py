@@ -44,6 +44,7 @@ async def execute_and_persist_tool_call(
     message_repository=MessageRepository,
     telemetry=telemetry_tracker,
     message_metadata: dict[str, Any] | None = None,
+    on_started: Callable[[], None] | None = None,
 ) -> LLMMessage:
     """Execute one tool and persist the same lifecycle records for graph and resume paths."""
     if existing_tool_call is None:
@@ -63,6 +64,8 @@ async def execute_and_persist_tool_call(
         db_tool_call = existing_tool_call
 
     tool_call_repository.start_execution(db, db_tool_call.id)
+    if on_started is not None:
+        on_started()
     started_at = datetime.now(UTC)
     try:
         executor_kwargs: dict[str, Any] = {
@@ -141,6 +144,9 @@ def persist_rejected_tool_call(
     run_step_repository=RunStepRepository,
     message_repository=MessageRepository,
 ) -> LLMMessage:
+    """
+    Lưu kết quả từ chối tool call.
+    """
     output = json.dumps(
         {
             "status": "rejected",

@@ -106,7 +106,8 @@ def _build_skill_section(ready_skills, selected_skill_name: str | None = None) -
         "Tên skill KHÔNG PHẢI là tên tool khả dụng để gọi trực tiếp.\n"
         "Để sử dụng hoặc chạy bất kỳ skill nào, bạn PHẢI tuân thủ quy trình sau:\n"
         "1. Trước tiên, gọi tool `load_skill` với tham số `skill_name` để tải tài liệu hướng dẫn (SKILL.md) và danh sách tài nguyên/script của skill đó.\n"
-        "2. Sau khi đã đọc hướng dẫn từ kết quả trả về của `load_skill`, nếu cần chạy script, hãy sử dụng tool `run_skill_script` với các đối số tương ứng (như `skill_name`, `script_path`, và `arguments`)."
+        "2. Sau khi đã đọc hướng dẫn từ kết quả trả về của `load_skill`, nếu cần chạy script, hãy sử dụng tool `run_skill_script` với các đối số tương ứng (như `skill_name`, `script_path`, và `arguments`).\n"
+        "3. Khi chạy script bằng `run_skill_script`, luôn sử dụng giới hạn số lượng dòng kết quả (`limit`) ở mức tối thiểu cần thiết (tối đa khuyên dùng là 10-20 bản ghi). Không chạy với limit quá lớn (tránh vượt 50,000 ký tự đầu ra của sandbox dẫn đến lỗi cắt cụt dữ liệu)."
     )
 
     sel = f"\nChỉ định nạp skill: `{selected_skill_name}`." if selected_skill_name else ""

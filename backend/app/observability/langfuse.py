@@ -101,8 +101,7 @@ class LangfuseTelemetryTracker:
         metadata = {"run_id": trace_id}
         if session_id:
             metadata["session_id"] = session_id
-        # Tạo tên Span gốc chứa số thứ tự lượt chạy (ví dụ: "agent_turn #1", "agent_turn #2")
-        # giúp Langfuse vẽ đồ thị tuần tự đẹp mắt thay vì gộp chung các nút trùng tên lại với nhau.
+        # Tạo tên Span gốc chứa số thứ tự lượt chạy
         span_name = f"agent_turn #{turn_index}"
         root = self._client.start_observation(
             trace_context={"trace_id": trace_id},

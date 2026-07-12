@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.database.models.tool_calls import ToolCall
 
 _OPEN_TOOL_CALL_STATUSES = {"pending", "waiting_approval", "running"}
+_STARTABLE_TOOL_CALL_STATUSES = {"pending", "waiting_approval"}
 
 
 class ToolCallRepository:
@@ -171,13 +172,22 @@ class ToolCallRepository:
 
     @staticmethod
     def start_execution(db: Session, tool_call_id: uuid.UUID) -> ToolCall | None:
-        tool_call = db.get(ToolCall, tool_call_id)
-        if tool_call is None:
-            return None
-        tool_call.status = "running"
-        tool_call.started_at = datetime.now(UTC)
+        statement = (
+            update(ToolCall)
+            .where(
+                ToolCall.id == tool_call_id,
+                ToolCall.status.in_(_STARTABLE_TOOL_CALL_STATUSES),
+            )
+            .values(status="running", started_at=datetime.now(UTC))
+            .returning(ToolCall)
+            .execution_options(populate_existing=True)
+        )
+        tool_call = db.scalar(statement)
         db.commit()
-        db.refresh(tool_call)
+        if tool_call is None:
+            tool_call = db.get(ToolCall, tool_call_id)
+        if tool_call is not None:
+            db.refresh(tool_call)
         return tool_call
 
     @staticmethod
@@ -190,15 +200,28 @@ class ToolCallRepository:
         error_msg: str | None = None,
         output_truncated: bool = False,
     ) -> ToolCall | None:
-        tool_call = db.get(ToolCall, tool_call_id)
-        if tool_call is None:
-            return None
-        tool_call.status = status
-        tool_call.result_json = result
-        tool_call.latency_ms = latency_ms
-        tool_call.error_message = error_msg
-        tool_call.output_truncated = output_truncated
-        tool_call.completed_at = datetime.now(UTC)
+        source_statuses = {"waiting_approval"} if status == "rejected" else {"running"}
+        statement = (
+            update(ToolCall)
+            .where(
+                ToolCall.id == tool_call_id,
+                ToolCall.status.in_(source_statuses),
+            )
+            .values(
+                status=status,
+                result_json=result,
+                latency_ms=latency_ms,
+                error_message=error_msg,
+                output_truncated=output_truncated,
+                completed_at=datetime.now(UTC),
+            )
+            .returning(ToolCall)
+            .execution_options(populate_existing=True)
+        )
+        tool_call = db.scalar(statement)
         db.commit()
-        db.refresh(tool_call)
+        if tool_call is None:
+            tool_call = db.get(ToolCall, tool_call_id)
+        if tool_call is not None:
+            db.refresh(tool_call)
         return tool_call

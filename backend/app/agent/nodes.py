@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -25,6 +26,7 @@ from app.agent.tool_batch_planner import (
     tool_batch_plan_matches,
 )
 from app.agent.tool_execution import execute_and_persist_tool_call
+from app.common.config_parsing import parse_positive_int
 from app.common.enums import StepType
 from app.database.repositories.approvals import ApprovalRepository
 from app.database.repositories.messages import MessageRepository
@@ -41,6 +43,7 @@ from app.llm.schemas import (
     ToolChoiceMode,
 )
 from app.observability.langfuse import telemetry_tracker
+from app.sandbox.docker_executor import sandbox_available as is_sandbox_available
 
 
 def _normalize_provider_name(provider: Any) -> str | None:
@@ -48,18 +51,6 @@ def _normalize_provider_name(provider: Any) -> str | None:
         return None
     normalized = provider.strip().lower()
     return normalized or None
-
-
-def _positive_int_config(
-    config: dict[str, Any],
-    key: str,
-    default: int | None = None,
-) -> int | None:
-    try:
-        value = int(config.get(key, default))
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
 
 
 def _positive_float_config(
@@ -108,12 +99,6 @@ def _selected_skill_from_config(config: RunnableConfig) -> str | None:
     if not isinstance(selected_skill, str) or not selected_skill.strip():
         return None
     return selected_skill.strip()
-
-
-def _sandbox_available(settings: Any) -> bool:
-    from app.sandbox.docker_executor import sandbox_available
-
-    return sandbox_available(settings)
 
 
 class AgentNodes:
@@ -222,6 +207,7 @@ class AgentNodes:
         settings,
         idempotency_key: str | None = None,
         step_index: int = 0,
+        on_started: Callable[[], None] | None = None,
     ) -> LLMMessage:
         return await execute_and_persist_tool_call(
             db=db,
@@ -240,6 +226,7 @@ class AgentNodes:
             run_step_repository=RunStepRepository,
             message_repository=MessageRepository,
             telemetry=telemetry_tracker,
+            on_started=on_started,
         )
 
     @staticmethod
@@ -448,6 +435,14 @@ class AgentNodes:
             name="AI Core Reasoner",
         )
         RunStepRepository.start_step(db, step.id)
+        writer = AgentNodes._custom_stream_writer()
+        if writer is not None:
+            writer(
+                {
+                    "event_type": "timeline_updated",
+                    "last_executed_node": "call_llm_gateway",
+                }
+            )
 
         # Catalog skill 'ready' chỉ chèn METADATA (name+description) vào system prompt
         run_config = config["configurable"].get("run_config") or {}
@@ -471,7 +466,7 @@ class AgentNodes:
             settings=settings,
             selected_skill_name=selected_skill,
         )
-        sandbox_available = _sandbox_available(settings)
+        sandbox_available = is_sandbox_available(settings)
         llm_tools = build_builtin_tool_definitions(
             ready_skills,
             sandbox_available=sandbox_available,
@@ -497,7 +492,7 @@ class AgentNodes:
             "temperature": _bounded_float_config(
                 run_config, "temperature", minimum=0.0, maximum=2.0
             ),
-            "max_tokens": _positive_int_config(run_config, "max_tokens"),
+            "max_tokens": parse_positive_int(run_config, "max_tokens"),
             "timeout_seconds": _positive_float_config(run_config, "timeout_seconds"),
         }
         if normalized_provider in set(llm_gateway.providers):
@@ -552,7 +547,7 @@ class AgentNodes:
             maximum=1.0,
         )
 
-        context_window_tokens = _positive_int_config(run_config, "context_window_tokens", 200_000)
+        context_window_tokens = parse_positive_int(run_config, "context_window_tokens", 200_000)
 
         try:
             context_plan = await compact_messages_if_needed(
@@ -629,10 +624,6 @@ class AgentNodes:
                 commit=False,
             )
             db.commit()
-
-            # Nối assistant message (kèm tool_calls) vào lịch sử hội thoại.
-            # Bắt buộc: provider yêu cầu mỗi tool message phải đứng SAU một assistant
-            # message chứa tool_calls tương ứng; nếu thiếu, lượt gọi LLM kế tiếp sẽ lỗi 400.
             tool_batch_plan = None
             if response.tool_calls:
                 tool_batch_plan = plan_tool_batch(
@@ -662,6 +653,7 @@ class AgentNodes:
         new_tool_messages: list[LLMMessage] = []
         settings = config["configurable"].get("settings")
         plan = AgentNodes._tool_batch_plan(state, config)
+        writer = AgentNodes._custom_stream_writer()
 
         for item in plan.items:
             index = item.index
@@ -716,6 +708,18 @@ class AgentNodes:
                 risk_level=risk_level,
                 settings=settings,
                 step_index=state.current_step_index + index,
+                on_started=(
+                    (
+                        lambda: writer(
+                            {
+                                "event_type": "timeline_updated",
+                                "last_executed_node": "execute_tools",
+                            }
+                        )
+                    )
+                    if writer is not None
+                    else None
+                ),
             )
             new_tool_messages.append(msg)
 

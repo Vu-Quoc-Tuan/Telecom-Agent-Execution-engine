@@ -1,4 +1,17 @@
 import json
+from collections.abc import Mapping
+
+
+def parse_positive_int(
+    config: Mapping[str, object],
+    key: str,
+    default: int | None = None,
+) -> int | None:
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 def parse_node_host_map(raw_value: str) -> dict[str, str]:

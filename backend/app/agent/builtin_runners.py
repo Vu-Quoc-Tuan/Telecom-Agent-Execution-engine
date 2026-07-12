@@ -247,8 +247,10 @@ async def _run_get_site_inventory(arguments: dict[str, Any], settings) -> tuple[
         "limit": int(arguments.get("limit", 100)),
     }
     sql = (
-        "SELECT * FROM site_inventory WHERE site_id = %(site_id)s "
-        "ORDER BY updated_at DESC LIMIT %(limit)s"
+        "SELECT * FROM alarm_data.device "
+        "WHERE station_id = :site_id "
+        "OR station_id IN (SELECT station_id FROM alarm_data.station WHERE name = :site_id) "
+        "LIMIT :limit"
     )
     connector = _build_postgres_connector(settings, read_only=True)
     try:

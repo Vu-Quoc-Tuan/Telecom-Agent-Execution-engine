@@ -117,7 +117,7 @@ def queue_run_intervention(
 
 @router.get("/{run_id}/timeline")
 def get_run_timeline_steps(run_id: uuid.UUID, db: Session = Depends(get_db)):
-    """Frontend gọi API này khi kỹ sư bấm f5 lại trang hoặc chuyển session để vẽ lại Timeline cột phải"""
+    """Frontend gọi API này khi bấm f5 lại trang hoặc chuyển session để vẽ lại Timeline cột phải"""
     run_record = RunRepository.get_run(db, run_id)
     if not run_record:
         raise HTTPException(status_code=404, detail="Lượt chạy không tồn tại.")

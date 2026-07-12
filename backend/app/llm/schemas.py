@@ -18,13 +18,10 @@ class FinishReason(StrEnum):
     TOOL = "tool"
     CONTENT_FILTER = "content_filter"
     UNKNOWN = "unknown"
-    ERROR = "error"
 
 
 class StreamEventType(StrEnum):
     TEXT_DELTA = "text_delta"
-    TOOL_CALL_DELTA = "tool_call_delta"
-    USAGE = "usage"
     FINISH = "finish"
 
 
@@ -125,11 +122,6 @@ class TokenUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-
-    cached_input_tokens: int = 0
-    cache_creation_input_tokens: int = 0
-    reasoning_tokens: int = 0
-
     details: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -174,17 +166,6 @@ class LLMResponse(BaseModel):
     finish_reason: FinishReason = FinishReason.UNKNOWN
 
 
-class ToolCallDelta(BaseModel):
-    """Incremental tool-call data emitted while streaming."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    index: int
-    id: str | None = None
-    name: str | None = None
-    arguments_delta: str | None = None
-
-
 class LLMStreamChunk(BaseModel):
     """A normalized streaming event produced by an adapter."""
 
@@ -196,7 +177,6 @@ class LLMStreamChunk(BaseModel):
 
     response_id: str | None = None
     content_delta: str | None = None
-    tool_call_delta: ToolCallDelta | None = None
     usage: TokenUsage | None = None
     finish_reason: FinishReason | None = None
 

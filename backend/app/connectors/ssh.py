@@ -68,10 +68,9 @@ class TelcoSSHConnector(BaseConnector):
     ) -> tuple[str, str]:
         """
         Hàm non-blocking chính thức dành cho Kỹ sư gọi trong kịch bản Skill động.
-        Ví dụ: stdout, stderr = await ssh_client.execute_command("pm2 status")
         """
         command = AgentSafetyGuard.normalize_ssh_command(command)
-        # 1. Kiểm tra lệnh cấm (rm -rf, shutdown,...) trước khi gửi đi
+        # 1. Kiểm tra lệnh cấm
         is_safe, error_msg = AgentSafetyGuard.verify_ssh_command(
             command,
             approval_confirmations=approval_confirmations,
@@ -83,7 +82,7 @@ class TelcoSSHConnector(BaseConnector):
             )
 
         try:
-            # 2. Đẩy tác vụ I/O mạng đồng bộ của Paramiko sang Worker Thread để không làm treo API FastAPI
+            # 2. Đẩy tác vụ I/O mạng đồng bộ
             stdout_str, stderr_str = await asyncio.to_thread(self._sync_execute, command)
         except Exception as e:
             error_text = str(e)
@@ -102,7 +101,7 @@ class TelcoSSHConnector(BaseConnector):
                 },
             ) from e
 
-        # 3. Rào chắn Output Limit: Cắt giảm dữ liệu nếu log trạm trả về dài quá ngưỡng cho phép
+        # 3. Rào chắn Output Limit
         stdout_str, _ = AgentSafetyGuard.truncate_output(stdout_str)
         stderr_str, _ = AgentSafetyGuard.truncate_output(stderr_str)
         return stdout_str, stderr_str

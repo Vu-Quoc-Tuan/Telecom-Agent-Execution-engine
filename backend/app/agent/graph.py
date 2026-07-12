@@ -11,10 +11,9 @@ def build_telecom_agent(*, checkpointer=None):
     """
     Biên dịch và đóng gói sơ đồ thực thể StateGraph cốt lõi cho hệ thống.
     """
-    # Khởi tạo bản đồ dựa trên cấu trúc quản lý trạng thái AgentState
     workflow = StateGraph(AgentState)
 
-    # 1. Đóng đinh các trạm dừng chân (Nodes) xử lý logic vào bản đồ
+    # 1. Nodes xử lý logic vào bản đồ
     workflow.add_node("call_llm_gateway", AgentNodes.call_llm_gateway)
     workflow.add_node("execute_tools", AgentNodes.execute_tools)
     workflow.add_node("suspend_for_human", AgentNodes.suspend_for_human)

@@ -143,7 +143,6 @@ class RunLifecycleServiceTests(unittest.TestCase):
                 "app.services.runs.ApprovalRepository.cancel_pending_by_run",
                 return_value=1,
             ) as cancel_approvals,
-            patch("app.services.runs.AuditLogRepository.log_event") as log_event,
         ):
             db = FakeDb()
             result = RunLifecycleService.cancel_run(
@@ -162,12 +161,10 @@ class RunLifecycleServiceTests(unittest.TestCase):
         close_tools.assert_called_once()
         self.assertEqual(RunStatus.CANCELLED.value, close_tools.call_args.kwargs["status"])
         cancel_approvals.assert_called_once()
-        log_event.assert_called_once()
         self.assertFalse(update_status.call_args.kwargs["commit"])
         self.assertFalse(close_steps.call_args.kwargs["commit"])
         self.assertFalse(close_tools.call_args.kwargs["commit"])
         self.assertFalse(cancel_approvals.call_args.kwargs["commit"])
-        self.assertFalse(log_event.call_args.kwargs["commit"])
         self.assertEqual(1, db.commits)
 
     def test_timeout_sweep_marks_stale_active_runs_timed_out(self) -> None:
@@ -202,7 +199,6 @@ class RunLifecycleServiceTests(unittest.TestCase):
                 "app.services.runs.ToolCallRepository.close_open_tool_calls_by_run"
             ) as close_tools,
             patch("app.services.runs.ApprovalRepository.cancel_pending_by_run") as cancel_approvals,
-            patch("app.services.runs.AuditLogRepository.log_event") as log_event,
         ):
             results = RunLifecycleService.mark_timed_out_runs(
                 db=FakeDb(),
@@ -219,7 +215,87 @@ class RunLifecycleServiceTests(unittest.TestCase):
         close_steps.assert_called_once()
         close_tools.assert_called_once()
         cancel_approvals.assert_called_once()
-        log_event.assert_called_once()
+
+
+class ChildLifecycleRepositoryTests(unittest.TestCase):
+    def test_cancelled_tool_call_cannot_be_started_again(self) -> None:
+        from app.database.repositories.tool_calls import ToolCallRepository
+
+        tool_call = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            status=RunStatus.CANCELLED.value,
+            started_at=None,
+        )
+
+        result = ToolCallRepository.start_execution(FakeDb(tool_call), tool_call.id)
+
+        self.assertIs(result, tool_call)
+        self.assertEqual(RunStatus.CANCELLED.value, tool_call.status)
+        self.assertIsNone(tool_call.started_at)
+
+    def test_late_tool_result_does_not_overwrite_cancelled_status(self) -> None:
+        from app.database.repositories.tool_calls import ToolCallRepository
+
+        tool_call = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            status=RunStatus.CANCELLED.value,
+            result_json={"output": "Run cancelled by operator."},
+            latency_ms=None,
+            error_message="Run cancelled by operator.",
+            output_truncated=False,
+            completed_at=datetime.now(UTC),
+        )
+        db = FakeDb(tool_call)
+
+        result = ToolCallRepository.save_result(
+            db,
+            tool_call.id,
+            status="completed",
+            result={"output": "late success"},
+            latency_ms=500,
+        )
+
+        self.assertIs(result, tool_call)
+        self.assertEqual(RunStatus.CANCELLED.value, tool_call.status)
+        self.assertEqual({"output": "Run cancelled by operator."}, tool_call.result_json)
+
+    def test_late_step_result_does_not_overwrite_timed_out_status(self) -> None:
+        from app.database.repositories.run_steps import RunStepRepository
+
+        step = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            status=RunStatus.TIMED_OUT.value,
+            summary="Run timed out.",
+            metadata_json={},
+            completed_at=datetime.now(UTC),
+        )
+        db = FakeDb(step)
+
+        result = RunStepRepository.complete_step(
+            db,
+            step.id,
+            status="completed",
+            summary="late success",
+        )
+
+        self.assertIs(result, step)
+        self.assertEqual(RunStatus.TIMED_OUT.value, step.status)
+        self.assertEqual("Run timed out.", step.summary)
+
+    def test_timed_out_step_cannot_be_started_again(self) -> None:
+        from app.database.repositories.run_steps import RunStepRepository
+
+        step = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            status=RunStatus.TIMED_OUT.value,
+            started_at=None,
+        )
+
+        result = RunStepRepository.start_step(FakeDb(step), step.id)
+
+        self.assertIs(result, step)
+        self.assertEqual(RunStatus.TIMED_OUT.value, step.status)
+        self.assertIsNone(step.started_at)
 
 
 if __name__ == "__main__":

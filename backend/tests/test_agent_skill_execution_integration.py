@@ -241,11 +241,16 @@ class AgentSkillExecutionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         # Cleanup skills created during the test
+        from app.database.models.skills import Skill
+
         for skill_id in self.created_skill_ids:
             try:
-                SkillRepository.delete_skill(self.db, skill_id)
+                skill = self.db.get(Skill, skill_id)
+                if skill is not None:
+                    self.db.delete(skill)
+                    self.db.commit()
             except Exception:
-                pass
+                self.db.rollback()
 
         # Cleanup sessions
         for session_id in self.created_session_ids:
@@ -276,7 +281,7 @@ This skill is a test skill for verifying the full sandbox execution and agent ro
             zf.writestr(script_name, script_content)
         return buf.getvalue()
 
-    @patch("app.agent.nodes._sandbox_available", return_value=True)
+    @patch("app.agent.nodes.is_sandbox_available", return_value=True)
     @patch("app.sandbox.docker_executor.build_sandbox_executor_from_settings")
     async def test_full_agent_skill_execution_pipeline(
         self, mock_upload_builder, mock_sandbox_available

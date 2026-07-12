@@ -27,14 +27,6 @@ class ToolPlanItem(BaseModel):
     error_message: str | None = None
     unavailable: bool = False
 
-    @property
-    def is_valid(self) -> bool:
-        return self.error_message is None
-
-    @property
-    def requires_approval(self) -> bool:
-        return self.risk_level == ExecutionMode.REQUIRE_APPROVAL.value
-
 
 class ToolBatchPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -44,18 +36,6 @@ class ToolBatchPlan(BaseModel):
     # Kept for backward-compat with serialized checkpoints; no longer populated.
     tool_catalog: list[LLMToolDefinition] = Field(default_factory=list)
     ready_skill_names: list[str] = Field(default_factory=list)
-
-    @property
-    def risk_levels(self) -> list[str]:
-        return [item.risk_level for item in self.items if item.risk_level is not None]
-
-    @property
-    def has_invalid_call(self) -> bool:
-        return any(item.error_message is not None and not item.unavailable for item in self.items)
-
-    @property
-    def all_tools_available(self) -> bool:
-        return not any(item.unavailable for item in self.items)
 
 
 def tool_batch_plan_matches(

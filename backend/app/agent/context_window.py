@@ -89,40 +89,6 @@ def _sanitize_messages(messages: Sequence[LLMMessage]) -> list[LLMMessage]:
     ]
 
 
-def _summarize_messages_deterministically(
-    messages: Sequence[LLMMessage], *, max_characters: int
-) -> str:
-    lines = ["Older conversation/tool outputs were compressed to protect the context window."]
-    for index, message in enumerate(messages, start=1):
-        prefix = f"{index}. {message.role.value}"
-        content = _preview(message.content)
-        if message.role is MessageRole.ASSISTANT and message.tool_calls:
-            tools = ", ".join(
-                f"{tool_call.name}({_preview(str(tool_call.arguments), limit=180)})"
-                for tool_call in message.tool_calls
-            )
-            lines.append(f"{prefix}: requested tool(s): {tools}; said: {content}")
-        elif message.role is MessageRole.TOOL:
-            lines.append(
-                f"{prefix}: tool_call_id={message.tool_call_id}; "
-                f"chars={len(message.content or '')}; output={content}"
-            )
-        else:
-            lines.append(f"{prefix}: {content}")
-
-    summary = "\n".join(lines)
-    if len(summary) <= max_characters:
-        return summary
-    return summary[:max_characters] + "\n... [DETERMINISTIC SUMMARY TRUNCATED] ..."
-
-
-def _preview(value: str | None, *, limit: int = 500) -> str:
-    normalized = " ".join((value or "").split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3] + "..."
-
-
 def _fit_compacted_messages(
     summary: str,
     retained: Sequence[LLMMessage],
@@ -282,12 +248,22 @@ async def compact_messages_if_needed(
         )
     except Exception as exc:
         app_logger.warning(
-            "LLM context compaction failed; using deterministic fallback (%s).",
+            "LLM context compaction failed; dropping older history and retaining recent "
+            "messages (%s).",
             type(exc).__name__,
         )
-        summary = _summarize_messages_deterministically(
-            sanitized_old_messages,
-            max_characters=max(500, summary_max_tokens * 4),
+        compacted_messages = list(retained)
+        compacted_tokens = estimate_context_tokens(
+            compacted_messages,
+            system_prompt=system_prompt,
+            tools=tools,
+        )
+        return ContextWindowPlan(
+            messages=compacted_messages,
+            original_tokens=original_tokens,
+            compacted_tokens=compacted_tokens,
+            threshold_tokens=threshold_tokens,
+            was_compacted=True,
         )
     fitted = _fit_compacted_messages(
         summary,

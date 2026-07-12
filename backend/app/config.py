@@ -67,8 +67,7 @@ class Settings(BaseSettings):
     SSH_AUTO_ADD_HOST_KEYS: bool = False
     SSH_RESTART_ALLOWED_SERVICES: str = ""
 
-    # Sandbox chạy run_skill_script bằng Docker container trên host.
-    # SANDBOX_ENABLED=false để tắt hẳn; image/limits tuỳ chỉnh nếu cần.
+    # Sandbox
     SANDBOX_ENABLED: bool = True
     SANDBOX_IMAGE: str = "telecom-agent-sandbox:latest"
     SANDBOX_TIMEOUT_SECONDS: int = 30
@@ -82,7 +81,7 @@ class Settings(BaseSettings):
     LANGFUSE_PUBLIC_KEY: str = ""
     LANGFUSE_SECRET_KEY: str = Field(default="", repr=False)
     LANGFUSE_HOST: str = "https://cloud.langfuse.com"
-    # Prompt Management: label được fetch và TTL cache (giây) cho prompt từ Langfuse.
+    # Prompt Management
     LANGFUSE_PROMPT_LABEL: str = "production"
     LANGFUSE_PROMPT_CACHE_TTL_SECONDS: int = 300
 

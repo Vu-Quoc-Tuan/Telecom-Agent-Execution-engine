@@ -142,7 +142,7 @@ class ContextWindowCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(len(plan.messages), len(messages) + 1)
         self.assertEqual(1, prompt_calls)
 
-    async def test_empty_llm_summary_falls_back_to_deterministic_compaction(self) -> None:
+    async def test_empty_llm_summary_drops_old_history_and_keeps_recent_messages(self) -> None:
         messages = [
             LLMMessage(role=MessageRole.USER, content="old request " + "x" * 1000),
             LLMMessage(role=MessageRole.ASSISTANT, content="old answer " + "y" * 1000),
@@ -159,11 +159,11 @@ class ContextWindowCompactionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(plan.was_compacted)
-        self.assertIn("[AUTO-COMPACTED CONTEXT]", plan.messages[0].content)
-        self.assertIn("old request", plan.messages[0].content)
-        self.assertEqual("latest request", plan.messages[-1].content)
+        self.assertEqual([MessageRole.USER], [message.role for message in plan.messages])
+        self.assertEqual("latest request", plan.messages[0].content)
+        self.assertNotIn("old request", str(plan.messages))
 
-    async def test_compactor_error_falls_back_without_aborting_the_turn(self) -> None:
+    async def test_compactor_error_drops_old_history_without_aborting_the_turn(self) -> None:
         messages = [
             LLMMessage(role=MessageRole.USER, content="old request " + "x" * 1000),
             LLMMessage(role=MessageRole.ASSISTANT, content="old answer " + "y" * 1000),
@@ -180,8 +180,9 @@ class ContextWindowCompactionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(plan.was_compacted)
-        self.assertIn("old request", plan.messages[0].content)
-        self.assertEqual("latest request", plan.messages[-1].content)
+        self.assertEqual([MessageRole.USER], [message.role for message in plan.messages])
+        self.assertEqual("latest request", plan.messages[0].content)
+        self.assertNotIn("old request", str(plan.messages))
 
     async def test_overlong_llm_summary_never_makes_context_larger(self) -> None:
         messages = [
