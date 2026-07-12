@@ -98,13 +98,17 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         step = types.SimpleNamespace(id=uuid.uuid4())
-        persisted_tool_call = types.SimpleNamespace(id=uuid.uuid4())
+        persisted_tool_call = types.SimpleNamespace(id=uuid.uuid4(), status="pending")
         settings = types.SimpleNamespace(
             SSH_ALLOWED_NODES="site-a",
             SSH_NODE_HOST_MAP="site-a=10.0.0.11",
             SSH_HOST="",
         )
         stream_writer = MagicMock()
+
+        def start_execution(db, tool_call_id):
+            persisted_tool_call.status = "running"
+            return persisted_tool_call
 
         with ExitStack() as stack:
             build_plan = stack.enter_context(patch("app.agent.nodes.build_tool_batch_plan"))
@@ -121,7 +125,12 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
                     return_value=persisted_tool_call,
                 )
             )
-            stack.enter_context(patch("app.agent.nodes.ToolCallRepository.start_execution"))
+            stack.enter_context(
+                patch(
+                    "app.agent.nodes.ToolCallRepository.start_execution",
+                    side_effect=start_execution,
+                )
+            )
             save_result = stack.enter_context(
                 patch("app.agent.nodes.ToolCallRepository.save_result")
             )
@@ -137,6 +146,14 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch("app.agent.nodes.telemetry_tracker.trace_span"))
             stack.enter_context(
                 patch("app.agent.nodes.AgentNodes._custom_stream_writer", return_value=stream_writer)
+            )
+            stack.enter_context(
+                patch(
+                    "app.agent.tool_execution.RunRepository.get_run_fresh",
+                    return_value=types.SimpleNamespace(
+                        id=run_id, status=RunStatus.RUNNING.value
+                    ),
+                )
             )
 
             result = await AgentNodes.execute_tools(
@@ -238,6 +255,10 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
             tool_call.run_step_id = run_step_id
             return tool_call
 
+        def start_execution(db, tool_call_id):
+            tool_call.status = "running"
+            return tool_call
+
         with ExitStack() as stack:
             stack.enter_context(
                 patch(
@@ -255,6 +276,9 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
             )
             stack.enter_context(
                 patch("app.services.agent_execution.RunRepository.get_run", return_value=run)
+            )
+            stack.enter_context(
+                patch("app.agent.tool_execution.RunRepository.get_run_fresh", return_value=run)
             )
             stack.enter_context(
                 patch(
@@ -276,7 +300,10 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             stack.enter_context(
-                patch("app.services.agent_execution.ToolCallRepository.start_execution")
+                patch(
+                    "app.services.agent_execution.ToolCallRepository.start_execution",
+                    side_effect=start_execution,
+                )
             )
             stack.enter_context(
                 patch(
@@ -410,6 +437,10 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
             tool_call.run_step_id = run_step_id
             return tool_call
 
+        def start_execution(db, tool_call_id):
+            tool_call.status = "running"
+            return tool_call
+
         def save_message(db, session_id, run_id, role, content, metadata=None):
             saved_messages.append((role, content))
             return types.SimpleNamespace(id=uuid.uuid4())
@@ -433,6 +464,9 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
                 patch("app.services.agent_execution.RunRepository.get_run", return_value=run)
             )
             stack.enter_context(
+                patch("app.agent.tool_execution.RunRepository.get_run_fresh", return_value=run)
+            )
+            stack.enter_context(
                 patch(
                     "app.services.agent_execution.ToolCallRepository.get_tool_call",
                     return_value=tool_call,
@@ -452,7 +486,10 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             stack.enter_context(
-                patch("app.services.agent_execution.ToolCallRepository.start_execution")
+                patch(
+                    "app.services.agent_execution.ToolCallRepository.start_execution",
+                    side_effect=start_execution,
+                )
             )
             save_result_mock = stack.enter_context(
                 patch(
@@ -533,6 +570,314 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", complete_step.call_args.kwargs["status"])
         self.assertIn(("tool", "connector crashed"), saved_messages)
         mark_failed.assert_not_called()
+
+    async def test_execute_and_persist_skips_executor_when_run_already_cancelled(self) -> None:
+        from app.agent.tool_execution import execute_and_persist_tool_call
+
+        run_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        step_id = uuid.uuid4()
+        executor = AsyncMock(return_value=("should-not-run", False))
+        complete_step = MagicMock()
+        save_result = MagicMock()
+        save_message = MagicMock()
+        create_tool_call = MagicMock()
+        start_execution = MagicMock()
+
+        with patch(
+            "app.agent.tool_execution.RunRepository.get_run_fresh",
+            return_value=types.SimpleNamespace(id=run_id, status=RunStatus.CANCELLED.value),
+        ):
+            result = await execute_and_persist_tool_call(
+                db=FakeDb(),
+                run_id=run_id,
+                session_id=session_id,
+                step_id=step_id,
+                tool_name="ping_node",
+                arguments={"node_name": "site-a", "count": 3},
+                provider_tool_call_id="call-1",
+                risk_level="auto_execute",
+                settings=None,
+                executor=executor,
+                tool_call_repository=types.SimpleNamespace(
+                    create_tool_call=create_tool_call,
+                    start_execution=start_execution,
+                    save_result=save_result,
+                ),
+                run_step_repository=types.SimpleNamespace(complete_step=complete_step),
+                message_repository=types.SimpleNamespace(save_message=save_message),
+            )
+
+        executor.assert_not_awaited()
+        create_tool_call.assert_not_called()
+        start_execution.assert_not_called()
+        save_result.assert_not_called()
+        complete_step.assert_called_once()
+        self.assertEqual(RunStatus.CANCELLED.value, complete_step.call_args.kwargs["status"])
+        self.assertTrue(result.tool_is_error)
+        self.assertIn("cancelled", result.content.lower())
+        save_message.assert_called_once()
+
+    async def test_execute_and_persist_skips_executor_when_start_execution_blocked(
+        self,
+    ) -> None:
+        from app.agent.tool_execution import execute_and_persist_tool_call
+
+        run_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        step_id = uuid.uuid4()
+        tool_call = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            status="waiting_approval",
+        )
+        executor = AsyncMock(return_value=("should-not-run", False))
+        complete_step = MagicMock()
+        save_result = MagicMock()
+        save_message = MagicMock()
+        start_calls: list[uuid.UUID] = []
+
+        def start_execution(db, tool_call_id):
+            start_calls.append(tool_call_id)
+            # Concurrent cancel closed the tool call; start_execution is a no-op.
+            tool_call.status = RunStatus.CANCELLED.value
+            return tool_call
+
+        with patch(
+            "app.agent.tool_execution.RunRepository.get_run_fresh",
+            return_value=types.SimpleNamespace(id=run_id, status=RunStatus.RUNNING.value),
+        ):
+            result = await execute_and_persist_tool_call(
+                db=FakeDb(),
+                run_id=run_id,
+                session_id=session_id,
+                step_id=step_id,
+                tool_name="restart_service",
+                arguments={"node_name": "site-a", "service_name": "nginx"},
+                provider_tool_call_id="call-2",
+                risk_level="require_approval",
+                settings=None,
+                executor=executor,
+                existing_tool_call=tool_call,
+                tool_call_repository=types.SimpleNamespace(
+                    start_execution=start_execution,
+                    save_result=save_result,
+                ),
+                run_step_repository=types.SimpleNamespace(complete_step=complete_step),
+                message_repository=types.SimpleNamespace(save_message=save_message),
+            )
+
+        executor.assert_not_awaited()
+        self.assertEqual([tool_call.id], start_calls)
+        save_result.assert_not_called()
+        complete_step.assert_called_once()
+        self.assertEqual(RunStatus.CANCELLED.value, complete_step.call_args.kwargs["status"])
+        self.assertTrue(result.tool_is_error)
+
+    async def test_execute_and_persist_skips_executor_when_run_times_out_after_start(
+        self,
+    ) -> None:
+        from app.agent.tool_execution import execute_and_persist_tool_call
+
+        run_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        step_id = uuid.uuid4()
+        tool_call = types.SimpleNamespace(id=uuid.uuid4(), status="pending")
+        executor = AsyncMock(return_value=("should-not-run", False))
+        complete_step = MagicMock()
+        save_result = MagicMock()
+        save_message = MagicMock()
+        run_status = {"value": RunStatus.RUNNING.value}
+
+        def get_run(db, run_id_arg):
+            return types.SimpleNamespace(id=run_id_arg, status=run_status["value"])
+
+        def start_execution(db, tool_call_id):
+            tool_call.status = "running"
+            # Timeout lands after start_execution succeeds, before executor.
+            run_status["value"] = RunStatus.TIMED_OUT.value
+            return tool_call
+
+        def save_result_side_effect(**kwargs):
+            tool_call.status = kwargs["status"]
+            return tool_call
+
+        with patch("app.agent.tool_execution.RunRepository.get_run_fresh", side_effect=get_run):
+            result = await execute_and_persist_tool_call(
+                db=FakeDb(),
+                run_id=run_id,
+                session_id=session_id,
+                step_id=step_id,
+                tool_name="ping_node",
+                arguments={"node_name": "site-a", "count": 1},
+                provider_tool_call_id="call-3",
+                risk_level="auto_execute",
+                settings=None,
+                executor=executor,
+                existing_tool_call=tool_call,
+                tool_call_repository=types.SimpleNamespace(
+                    start_execution=start_execution,
+                    save_result=MagicMock(side_effect=save_result_side_effect),
+                ),
+                run_step_repository=types.SimpleNamespace(complete_step=complete_step),
+                message_repository=types.SimpleNamespace(save_message=save_message),
+            )
+
+        executor.assert_not_awaited()
+        complete_step.assert_called_once()
+        self.assertEqual(RunStatus.TIMED_OUT.value, complete_step.call_args.kwargs["status"])
+        self.assertEqual(RunStatus.TIMED_OUT.value, tool_call.status)
+        self.assertTrue(result.tool_is_error)
+        self.assertIn("timed out", result.content.lower())
+
+    async def test_execute_and_persist_skips_when_fresh_tool_status_cancelled_after_start(
+        self,
+    ) -> None:
+        """Concurrent cancel closes tool_call after start; identity map may still say running."""
+        from app.agent.tool_execution import execute_and_persist_tool_call
+
+        run_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        step_id = uuid.uuid4()
+        tool_call = types.SimpleNamespace(id=uuid.uuid4(), status="pending")
+        executor = AsyncMock(return_value=("should-not-run", False))
+        complete_step = MagicMock()
+        save_result = MagicMock()
+        save_message = MagicMock()
+
+        def start_execution(db, tool_call_id):
+            tool_call.status = "running"
+            return tool_call
+
+        def get_tool_call_fresh(db, tool_call_id):
+            # Another session cancelled the open tool call after start.
+            tool_call.status = RunStatus.CANCELLED.value
+            return tool_call
+
+        with patch(
+            "app.agent.tool_execution.RunRepository.get_run_fresh",
+            return_value=types.SimpleNamespace(id=run_id, status=RunStatus.RUNNING.value),
+        ):
+            result = await execute_and_persist_tool_call(
+                db=FakeDb(),
+                run_id=run_id,
+                session_id=session_id,
+                step_id=step_id,
+                tool_name="ping_node",
+                arguments={"node_name": "site-a", "count": 1},
+                provider_tool_call_id="call-4",
+                risk_level="auto_execute",
+                settings=None,
+                executor=executor,
+                existing_tool_call=tool_call,
+                tool_call_repository=types.SimpleNamespace(
+                    start_execution=start_execution,
+                    get_tool_call_fresh=get_tool_call_fresh,
+                    save_result=save_result,
+                ),
+                run_step_repository=types.SimpleNamespace(complete_step=complete_step),
+                message_repository=types.SimpleNamespace(save_message=save_message),
+            )
+
+        executor.assert_not_awaited()
+        save_result.assert_not_called()
+        complete_step.assert_called_once()
+        self.assertEqual(RunStatus.CANCELLED.value, complete_step.call_args.kwargs["status"])
+        self.assertTrue(result.tool_is_error)
+
+    async def test_execute_and_persist_does_not_trust_stale_get_run_identity_map(
+        self,
+    ) -> None:
+        """Gate must use get_run_fresh so concurrent cancel is visible to agent session."""
+        from app.agent.tool_execution import execute_and_persist_tool_call
+
+        run_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        step_id = uuid.uuid4()
+        executor = AsyncMock(return_value=("should-not-run", False))
+        create_tool_call = MagicMock()
+        start_execution = MagicMock()
+        complete_step = MagicMock()
+        save_message = MagicMock()
+
+        with (
+            patch(
+                "app.agent.tool_execution.RunRepository.get_run",
+                return_value=types.SimpleNamespace(
+                    id=run_id, status=RunStatus.RUNNING.value
+                ),
+            ) as stale_get,
+            patch(
+                "app.agent.tool_execution.RunRepository.get_run_fresh",
+                return_value=types.SimpleNamespace(
+                    id=run_id, status=RunStatus.CANCELLED.value
+                ),
+            ) as fresh_get,
+        ):
+            result = await execute_and_persist_tool_call(
+                db=FakeDb(),
+                run_id=run_id,
+                session_id=session_id,
+                step_id=step_id,
+                tool_name="restart_service",
+                arguments={"node_name": "site-a", "service_name": "nginx"},
+                provider_tool_call_id="call-5",
+                risk_level="auto_execute",
+                settings=None,
+                executor=executor,
+                tool_call_repository=types.SimpleNamespace(
+                    create_tool_call=create_tool_call,
+                    start_execution=start_execution,
+                    save_result=MagicMock(),
+                ),
+                run_step_repository=types.SimpleNamespace(complete_step=complete_step),
+                message_repository=types.SimpleNamespace(save_message=save_message),
+            )
+
+        fresh_get.assert_called()
+        stale_get.assert_not_called()
+        executor.assert_not_awaited()
+        create_tool_call.assert_not_called()
+        start_execution.assert_not_called()
+        self.assertTrue(result.tool_is_error)
+        self.assertIn("cancelled", result.content.lower())
+
+
+class RunRepositoryFreshReadTests(unittest.TestCase):
+    def test_get_run_fresh_uses_populate_existing(self) -> None:
+        from app.database.repositories.runs import RunRepository
+
+        run = types.SimpleNamespace(id=uuid.uuid4(), status=RunStatus.RUNNING.value)
+        db = types.SimpleNamespace(statement=None, run=run)
+
+        def scalar(statement):
+            db.statement = statement
+            return run
+
+        db.scalar = scalar  # type: ignore[attr-defined]
+
+        result = RunRepository.get_run_fresh(db, run.id)
+
+        self.assertIs(result, run)
+        options = db.statement.get_execution_options()
+        self.assertTrue(options.get("populate_existing"))
+
+    def test_get_tool_call_fresh_uses_populate_existing(self) -> None:
+        from app.database.repositories.tool_calls import ToolCallRepository
+
+        tool_call = types.SimpleNamespace(id=uuid.uuid4(), status="running")
+        db = types.SimpleNamespace(statement=None)
+
+        def scalar(statement):
+            db.statement = statement
+            return tool_call
+
+        db.scalar = scalar  # type: ignore[attr-defined]
+
+        result = ToolCallRepository.get_tool_call_fresh(db, tool_call.id)
+
+        self.assertIs(result, tool_call)
+        options = db.statement.get_execution_options()
+        self.assertTrue(options.get("populate_existing"))
 
 
 if __name__ == "__main__":

@@ -69,6 +69,22 @@ class RunRepository:
         return db.get(AgentRun, run_id)
 
     @staticmethod
+    def get_run_fresh(db: Session, run_id: uuid.UUID) -> AgentRun | None:
+        """Load a run from the database, updating a stale identity-map entry.
+
+        Agent lifecycle holds a long-lived Session with expire_on_commit=False.
+        Concurrent cancel/timeout commits happen on a different session, so
+        ``db.get`` alone can keep returning status='running'. This SELECT uses
+        ``populate_existing`` to force a DB round-trip into the current session.
+        """
+        statement = (
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .execution_options(populate_existing=True)
+        )
+        return db.scalar(statement)
+
+    @staticmethod
     def update_run_status(
         db: Session,
         run_id: uuid.UUID,

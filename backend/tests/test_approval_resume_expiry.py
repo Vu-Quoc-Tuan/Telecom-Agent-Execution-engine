@@ -150,13 +150,21 @@ class ApprovalResumeExpiryTests(unittest.IsolatedAsyncioTestCase):
                 patch("app.services.agent_execution.RunRepository.get_run", return_value=run)
             )
             stack.enter_context(
+                patch("app.agent.tool_execution.RunRepository.get_run_fresh", return_value=run)
+            )
+            stack.enter_context(
                 patch(
                     "app.services.agent_execution.ToolCallRepository.get_tool_call",
                     return_value=current_tool,
                 )
             )
             stack.enter_context(
-                patch("app.services.agent_execution.ToolCallRepository.start_execution")
+                patch(
+                    "app.services.agent_execution.ToolCallRepository.start_execution",
+                    side_effect=lambda db, tool_call_id: (
+                        setattr(current_tool, "status", "running") or current_tool
+                    ),
+                )
             )
             stack.enter_context(
                 patch("app.services.agent_execution.ToolCallRepository.save_result")

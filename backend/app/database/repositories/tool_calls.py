@@ -75,6 +75,16 @@ class ToolCallRepository:
         return db.get(ToolCall, tool_call_id)
 
     @staticmethod
+    def get_tool_call_fresh(db: Session, tool_call_id: uuid.UUID) -> ToolCall | None:
+        """Load a tool call from DB, bypassing a stale identity-map status."""
+        statement = (
+            select(ToolCall)
+            .where(ToolCall.id == tool_call_id)
+            .execution_options(populate_existing=True)
+        )
+        return db.scalar(statement)
+
+    @staticmethod
     def attach_to_step(
         db: Session,
         tool_call_id: uuid.UUID,
