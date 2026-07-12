@@ -684,7 +684,6 @@ class ToolExecutionRefactorTests(unittest.IsolatedAsyncioTestCase):
         tool_call = types.SimpleNamespace(id=uuid.uuid4(), status="pending")
         executor = AsyncMock(return_value=("should-not-run", False))
         complete_step = MagicMock()
-        save_result = MagicMock()
         save_message = MagicMock()
         run_status = {"value": RunStatus.RUNNING.value}
 
