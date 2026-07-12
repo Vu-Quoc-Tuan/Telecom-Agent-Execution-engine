@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import io
 import json
 import mimetypes
@@ -10,16 +9,20 @@ import stat
 import zipfile
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, NoReturn
 
 import yaml
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agent.safety import AgentSafetyGuard
-from app.agent.tool_validation import validate_json_value_against_schema
+from app.agent.tool_validation import validate_script_output_contract
 from app.common.enums import SkillStatus
-from app.common.utils import extract_json_object
+from app.common.utils import (
+    extract_json_object,
+    normalize_safe_relative_posix_path,
+    sha256_text,
+)
 from app.database.repositories.skills import SkillRepository
 from app.sandbox.domain_validator import TelecomDomainValidator
 from app.sandbox.security_analyzer import AdvancedASTSecurityAnalyzer
@@ -63,14 +66,6 @@ class SkillValidationError(Exception):
         self.logs = logs
         self.skill_id = skill_id
         self.http_status_code = http_status_code
-
-
-class SkillPackageParser:
-    def __init__(self, service: SkillValidationService) -> None:
-        self._service = service
-
-    def parse(self, zip_bytes: bytes) -> ParsedSkillPackage:
-        return self._service._parse_package_impl(zip_bytes)
 
 
 class SkillSecurityScanner:
@@ -223,12 +218,11 @@ class SkillValidationService:
 
     def __init__(self, *, skill_repository=SkillRepository) -> None:
         self.skill_repository = skill_repository
-        self.package_parser = SkillPackageParser(self)
         self.security_scanner = SkillSecurityScanner()
         self.sandbox_validator = SkillSandboxValidator()
 
     def parse_package(self, zip_bytes: bytes) -> ParsedSkillPackage:
-        return self.package_parser.parse(zip_bytes)
+        return self._parse_package_impl(zip_bytes)
 
     def _parse_package_impl(self, zip_bytes: bytes) -> ParsedSkillPackage:
         if len(zip_bytes) > self.MAX_ARCHIVE_BYTES:
@@ -278,7 +272,7 @@ class SkillValidationService:
                 ) from exc
 
             frontmatter, body = self._parse_frontmatter(skill_md)
-            name, description = self._validate_frontmatter(frontmatter, skill_root)
+            name, description = self._validate_frontmatter(frontmatter)
             bundled_files = self._read_bundled_files(
                 archive,
                 relative_files,
@@ -316,22 +310,15 @@ class SkillValidationService:
             )
 
         logs.append("[VONG 1] Static AST security scan and secret scan started.")
-        is_malicious = self._scan_package(package, logs)
+        is_malicious = self.security_scanner.scan(package, logs)
         if is_malicious:
-            logs.append("[KET LUAN] Rejected by static security scan.")
-            skill = self._persist_package_or_conflict(db, package)
-            self.skill_repository.update_sandbox_result(
+            self._persist_rejection(
                 db,
-                skill_id=skill.id,
-                status=SkillStatus.REJECTED.value,
-                review_log="\n".join(logs),
-                is_malicious=True,
-            )
-            raise SkillValidationError(
-                status="REJECTED",
+                package,
+                logs,
+                conclusion="[KET LUAN] Rejected by static security scan.",
                 message="Skill violates static security policy.",
-                logs=logs,
-                skill_id=str(skill.id),
+                is_malicious=True,
             )
 
         logs.append("[VONG 1] Passed static security check.")
@@ -364,20 +351,15 @@ class SkillValidationService:
 
         llm_score = llm_judge.domain_score if llm_judge is not None else 0.0
         if taxonomy_score < 0.25 and llm_score < 0.5:
-            logs.append("[KET LUAN] Rejected because skill is outside telecom operations domain.")
-            skill = self._persist_package_or_conflict(db, package)
-            self.skill_repository.update_sandbox_result(
+            self._persist_rejection(
                 db,
-                skill_id=skill.id,
-                status=SkillStatus.REJECTED.value,
-                review_log="\n".join(logs),
-                is_malicious=False,
-            )
-            raise SkillValidationError(
-                status="REJECTED",
+                package,
+                logs,
+                conclusion=(
+                    "[KET LUAN] Rejected because skill is outside telecom operations domain."
+                ),
                 message="Skill is outside the supported telecom operations domain.",
-                logs=logs,
-                skill_id=str(skill.id),
+                is_malicious=False,
             )
 
         logs.append("[VONG 4] LLM-assisted script run-spec proposal started.")
@@ -401,26 +383,16 @@ class SkillValidationService:
         )
 
         if not sandbox_passed:
-            logs.append(
-                "[KET LUAN] Rejected because one or more scripts failed sandbox validation."
-            )
-            skill = self._persist_package_or_conflict(
+            self._persist_rejection(
                 db,
                 package,
-                script_manifest=script_manifest,
-            )
-            self.skill_repository.update_sandbox_result(
-                db,
-                skill_id=skill.id,
-                status=SkillStatus.REJECTED.value,
-                review_log="\n".join(logs),
-                is_malicious=False,
-            )
-            raise SkillValidationError(
-                status="REJECTED",
+                logs,
+                conclusion=(
+                    "[KET LUAN] Rejected because one or more scripts failed sandbox validation."
+                ),
                 message="Skill script failed sandbox validation.",
-                logs=logs,
-                skill_id=str(skill.id),
+                is_malicious=False,
+                script_manifest=script_manifest,
             )
 
         logs.append("[VONG 6] Pending human review.")
@@ -456,17 +428,14 @@ class SkillValidationService:
                     "Gói skill chứa quá nhiều file.",
                     f"Archive exceeds {self.MAX_FILE_COUNT} files.",
                 )
-            if "\\" in info.filename:
-                self._raise_validation(
-                    "Đường dẫn trong gói skill không hợp lệ.",
-                    f"Backslash is not allowed in archive path: {info.filename}.",
-                )
-            path = PurePosixPath(info.filename)
-            if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            try:
+                normalized_path = normalize_safe_relative_posix_path(info.filename)
+            except ValueError:
                 self._raise_validation(
                     "Đường dẫn trong gói skill không hợp lệ.",
                     f"Unsafe archive path: {info.filename}.",
                 )
+            path = PurePosixPath(normalized_path)
             if path in files:
                 self._raise_validation(
                     "Gói skill chứa đường dẫn file trùng lặp.",
@@ -536,7 +505,6 @@ class SkillValidationService:
     def _validate_frontmatter(
         self,
         frontmatter: dict[str, Any],
-        skill_root: PurePosixPath,
     ) -> tuple[str, str]:
         if any(not isinstance(key, str) for key in frontmatter):
             self._raise_validation(
@@ -628,9 +596,6 @@ class SkillValidationService:
             }
         return bundled_files
 
-    def _scan_package(self, package: ParsedSkillPackage, logs: list[str]) -> bool:
-        return self.security_scanner.scan(package, logs)
-
     def _python_scripts(self, package: ParsedSkillPackage) -> dict[str, dict[str, Any]]:
         return {
             path: record
@@ -683,11 +648,6 @@ class SkillValidationService:
             output_contract = self._sanitize_output_contract(proposed.get("output_contract"))
             if output_contract is not None:
                 entry["output_contract"] = output_contract
-            runtime = proposed.get("runtime")
-            if isinstance(runtime, dict):
-                arguments_mode = runtime.get("arguments_mode")
-                if arguments_mode in {"args_json", "none"}:
-                    entry["runtime"]["arguments_mode"] = arguments_mode
             limits = proposed.get("limits")
             if isinstance(limits, dict):
                 timeout = limits.get("timeout_seconds")
@@ -699,7 +659,7 @@ class SkillValidationService:
     def _default_script_manifest_entry(self, script_path: str, content: str) -> dict[str, Any]:
         return {
             "status": "pending_sandbox",
-            "script_hash": self._sha256_text(content),
+            "script_hash": sha256_text(content),
             "purpose": f"Python script {script_path}",
             "runtime": {
                 "type": "python_script",
@@ -714,7 +674,6 @@ class SkillValidationService:
             "smoke_test": {"arguments": {}},
             "limits": {
                 "timeout_seconds": 15,
-                "max_output_chars": 15000,
             },
         }
 
@@ -731,8 +690,8 @@ class SkillValidationService:
         }
         prompt = (
             "Read this Agent Skill and propose a minimal JSON object keyed by script path. "
-            "Each value may include: purpose, runtime.arguments_mode ('args_json' or 'none'), "
-            "input_schema using a small JSON Schema subset, smoke_test.arguments object, "
+            "Each value may include: purpose, input_schema using a small JSON Schema subset, "
+            "smoke_test.arguments object, "
             "output_contract ({mode:'text'} or {mode:'json', schema:{...}}), "
             "and limits.timeout_seconds. "
             "Do not propose commands that execute anything except the given script path.\n\n"
@@ -767,25 +726,14 @@ class SkillValidationService:
         contract = manifest_entry.get("output_contract")
         if not isinstance(contract, dict):
             return None
-        mode = contract.get("mode", "text")
-        if mode == "text":
-            return None
-        if mode != "json":
-            return f"Unsupported output contract mode: {mode}."
         try:
-            parsed = json.loads(stdout.strip())
+            validate_script_output_contract(
+                stdout=stdout,
+                contract=contract,
+                path=f"{script_path}.stdout",
+            )
         except Exception as exc:
-            return f"stdout is not valid JSON: {exc}"
-        schema = contract.get("schema")
-        if isinstance(schema, dict):
-            try:
-                validate_json_value_against_schema(
-                    value=parsed,
-                    schema=schema,
-                    path=f"{script_path}.stdout",
-                )
-            except Exception as exc:
-                return str(getattr(exc, "message", exc))
+            return str(getattr(exc, "message", exc))
         return None
 
     def _sanitize_output_contract(self, raw_contract: Any) -> dict[str, Any] | None:
@@ -883,25 +831,35 @@ class SkillValidationService:
                 sanitized["items"] = items
         return sanitized
 
-    @staticmethod
-    def _sha256_text(content: str) -> str:
-        return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
-
-    def _persist_package(
+    def _persist_rejection(
         self,
         db: Session,
         package: ParsedSkillPackage,
+        logs: list[str],
         *,
+        conclusion: str,
+        message: str,
+        is_malicious: bool,
         script_manifest: dict[str, Any] | None = None,
-    ):
-        return self.skill_repository.create_uploaded_skill(
-            db=db,
-            name=package.name,
-            description=package.description,
-            skill_md=package.body,
-            frontmatter=package.frontmatter,
-            bundled_files=package.bundled_files,
-            script_manifest=script_manifest or {},
+    ) -> NoReturn:
+        logs.append(conclusion)
+        skill = self._persist_package_or_conflict(
+            db,
+            package,
+            script_manifest=script_manifest,
+        )
+        self.skill_repository.update_sandbox_result(
+            db,
+            skill_id=skill.id,
+            status=SkillStatus.REJECTED.value,
+            review_log="\n".join(logs),
+            is_malicious=is_malicious,
+        )
+        raise SkillValidationError(
+            status="REJECTED",
+            message=message,
+            logs=logs,
+            skill_id=str(skill.id),
         )
 
     def _persist_package_or_conflict(
@@ -912,7 +870,15 @@ class SkillValidationService:
         script_manifest: dict[str, Any] | None = None,
     ):
         try:
-            return self._persist_package(db, package, script_manifest=script_manifest)
+            return self.skill_repository.create_uploaded_skill(
+                db=db,
+                name=package.name,
+                description=package.description,
+                skill_md=package.body,
+                frontmatter=package.frontmatter,
+                bundled_files=package.bundled_files,
+                script_manifest=script_manifest or {},
+            )
         except IntegrityError as exc:
             db.rollback()
             raise SkillValidationError(

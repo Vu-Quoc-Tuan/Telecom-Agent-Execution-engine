@@ -91,16 +91,6 @@ class SkillRepository:
         return skill
 
     @staticmethod
-    def delete_skill(db: Session, skill_id: uuid.UUID, commit: bool = True) -> bool:
-        skill = db.get(Skill, skill_id)
-        if skill is None:
-            return False
-        db.delete(skill)
-        if commit:
-            db.commit()
-        return True
-
-    @staticmethod
     def list_ready_skills(db: Session) -> list[Skill]:
         """Return all approved dynamic skills available to the LLM/tool runtime."""
         stmt = select(Skill).where(Skill.status == "ready").order_by(Skill.name.asc())

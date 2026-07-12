@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from typing import Any
 
@@ -146,3 +147,28 @@ def validate_json_value_against_schema(
     path: str = "value",
 ) -> None:
     _validate_value(value, schema, path)
+
+
+def validate_script_output_contract(
+    *,
+    stdout: str,
+    contract: dict[str, Any],
+    path: str = "output",
+) -> None:
+    mode = contract.get("mode", "text")
+    if mode == "text":
+        return
+    if mode != "json":
+        raise SkillRuntimeError(f"Unsupported output contract mode: {mode}.")
+
+    try:
+        parsed = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise SkillRuntimeError(
+            "Script output is not valid JSON.",
+            details={"path": path, "error": str(exc)},
+        ) from exc
+
+    schema = contract.get("schema")
+    if isinstance(schema, dict):
+        validate_json_value_against_schema(value=parsed, schema=schema, path=path)

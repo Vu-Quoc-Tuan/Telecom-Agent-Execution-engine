@@ -9,10 +9,11 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from app.common.exceptions import SkillRuntimeError
+from app.common.utils import normalize_safe_relative_posix_path
 
 logger = logging.getLogger(__name__)
 
@@ -100,16 +101,10 @@ class DockerSandboxExecutor:
 
     @staticmethod
     def _safe_relative_path(raw: str) -> str:
-        text = str(raw).strip()
-        path = PurePosixPath(text)
-        if (
-            not text
-            or path.is_absolute()
-            or any(part in {"", ".", ".."} for part in path.parts)
-            or "\\" in text
-        ):
-            raise SkillRuntimeError(f"Đường dẫn script không hợp lệ: '{raw}'.")
-        return path.as_posix()
+        try:
+            return normalize_safe_relative_posix_path(raw)
+        except ValueError as exc:
+            raise SkillRuntimeError(f"Đường dẫn script không hợp lệ: '{raw}'.") from exc
 
     def _materialize_workspace(
         self,

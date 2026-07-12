@@ -40,10 +40,11 @@ Trước khi chạy, xác định (hỏi nếu thiếu, nhưng đừng hỏi cá
 
 1. **alarm_type** — loại cảnh báo cần điều tra (vd `LINK_DOWN`, `BGP_SESSION_DOWN`). Bắt buộc.
 2. **window_min** — cửa sổ thời gian tính bằng phút. Mặc định `10` (khớp ngưỡng tương quan 10 phút).
-3. **Bảng/cột thật** — tên bảng cảnh báo (mặc định `core_alarm_history`) và bảng tham chiếu
+3. **limit** — số lượng bản ghi tối đa. Mặc định `10`, tối đa khuyên dùng `20` để tránh vượt quá giới hạn đầu ra 50KB (50,000 ký tự) của sandbox.
+4. **Bảng/cột thật** — tên bảng cảnh báo (mặc định `core_alarm_history`) và bảng tham chiếu
    (mặc định `ne_inventory`), cùng tên cột. Đây là thứ HAY khác nhau giữa các môi trường.
-4. **Khoá lookup** — field nào trong kết quả bước 2 dùng để tra bước 3. Mặc định `ips,ne_names`.
-5. **"Lấy ra cái gì"** ở bước 3 — các cột muốn enrich (site_id, segment, vendor, oncall_team...).
+5. **Khoá lookup** — field nào trong kết quả bước 2 dùng để tra bước 3. Mặc định `ips,ne_names`.
+6. **"Lấy ra cái gì"** ở bước 3 — các cột muốn enrich (site_id, segment, vendor, oncall_team...).
 
 ## Cách chạy
 
@@ -84,7 +85,7 @@ Chạy thật cần đặt biến môi trường và cài driver (chi tiết tro
 export CH_HOST=... CH_PORT=8123 CH_USER=... CH_PASSWORD=... CH_DATABASE=...
 export PG_DSN="postgresql://user:pass@host:5432/dbname"
 pip install clickhouse-connect psycopg2-binary
-python3 scripts/run_enrichment.py --alarm-type LINK_DOWN --window-min 10 --limit 500
+python3 scripts/run_enrichment.py --alarm-type LINK_DOWN --window-min 10 --limit 20
 ```
 
 Câu lệnh SQL của bước 1 và bước 3 nằm trong chính script (`STEP1_SQL`, `STEP3_SQL`) và được

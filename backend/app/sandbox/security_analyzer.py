@@ -62,7 +62,7 @@ class AdvancedASTSecurityAnalyzer:
         "os.spawnvp",
     }
 
-    # ❌ DANH SÁCH ĐEN CÁC HÀM NGUY HIỂM CẤM TỰ KÍCH HOẠT VÌ CÓ NGUY CƠ CHẠY LẬU CODE ẨN
+    # DANH SÁCH ĐEN CÁC HÀM NGUY HIỂM CẤM TỰ KÍCH HOẠT VÌ CÓ NGUY CƠ CHẠY LẬU CODE ẨN
     DANGEROUS_CALLS = {
         "eval",
         "exec",

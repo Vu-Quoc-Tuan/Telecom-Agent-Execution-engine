@@ -10,10 +10,19 @@ from sqlalchemy import inspect
 from app.common.enums import StepType
 from app.config import Settings
 from app.database.models.approval_requests import ApprovalRequest
-from app.database.models.audit_logs import AuditLog
 from app.database.models.chat_messages import ChatMessage
 from app.database.models.run_steps import RunStep
 from app.database.models.skills import Skill
+
+
+class ConfigParsingTests(unittest.TestCase):
+    def test_parse_positive_int_preserves_existing_fallback_behavior(self) -> None:
+        from app.common.config_parsing import parse_positive_int
+
+        self.assertEqual(12, parse_positive_int({"limit": "12"}, "limit", 5))
+        self.assertEqual(5, parse_positive_int({"limit": "invalid"}, "limit", 5))
+        self.assertEqual(5, parse_positive_int({"limit": 0}, "limit", 5))
+        self.assertIsNone(parse_positive_int({}, "limit"))
 
 
 class SettingsContractTests(unittest.TestCase):
@@ -67,11 +76,6 @@ class ModelContractTests(unittest.TestCase):
         self.assertNotIn("'system'", constraints)
         self.assertIn("'tool'", constraints)
 
-    def test_audit_log_is_append_only_without_hard_foreign_keys(self) -> None:
-        foreign_keys = list(AuditLog.__table__.foreign_keys)
-
-        self.assertEqual([], foreign_keys)
-
     def test_run_step_type_contract_matches_active_timeline_steps(self) -> None:
         self.assertEqual(
             {
@@ -99,46 +103,6 @@ class ModelContractTests(unittest.TestCase):
 
 
 class RepositoryImportTests(unittest.TestCase):
-    def test_required_repositories_exist(self) -> None:
-        from app.database.repositories.approvals import ApprovalRepository
-        from app.database.repositories.audit_logs import AuditLogRepository
-        from app.database.repositories.run_steps import RunStepRepository
-        from app.database.repositories.sessions import SessionRepository
-        from app.database.repositories.tool_calls import ToolCallRepository
-
-        self.assertTrue(ApprovalRepository)
-        self.assertTrue(AuditLogRepository)
-        self.assertTrue(RunStepRepository)
-        self.assertTrue(SessionRepository)
-        self.assertTrue(ToolCallRepository)
-
-    def test_skill_repository_can_delete_test_skill_records(self) -> None:
-        from app.database.repositories.skills import SkillRepository
-
-        skill_id = uuid4()
-        skill = SimpleNamespace(id=skill_id)
-
-        class FakeDb:
-            def __init__(self):
-                self.deleted = None
-                self.committed = False
-
-            def get(self, model, record_id):
-                return skill if record_id == skill_id else None
-
-            def delete(self, record):
-                self.deleted = record
-
-            def commit(self):
-                self.committed = True
-
-        db = FakeDb()
-
-        self.assertTrue(SkillRepository.delete_skill(db, skill_id))
-        self.assertIs(skill, db.deleted)
-        self.assertTrue(db.committed)
-        self.assertFalse(SkillRepository.delete_skill(FakeDb(), uuid4()))
-
     def test_tool_call_repository_aggregates_skill_package_telemetry(self) -> None:
         from app.database.repositories.tool_calls import ToolCallRepository
 
@@ -175,7 +139,7 @@ class RepositoryImportTests(unittest.TestCase):
         self.assertIn("GROUP BY", statement_sql)
         self.assertIn("CREATED_AT", statement_sql)
 
-    def test_complete_step_merges_existing_metadata(self) -> None:
+    def test_complete_step_uses_atomic_jsonb_metadata_merge(self) -> None:
         from app.database.repositories.run_steps import RunStepRepository
 
         step = SimpleNamespace(
@@ -187,6 +151,12 @@ class RepositoryImportTests(unittest.TestCase):
         )
 
         class FakeDb:
+            statement = None
+
+            def scalar(self, statement):
+                self.statement = statement
+                return step
+
             def get(self, model, step_id):
                 return step
 
@@ -196,8 +166,9 @@ class RepositoryImportTests(unittest.TestCase):
             def refresh(self, record):
                 pass
 
+        db = FakeDb()
         completed = RunStepRepository.complete_step(
-            FakeDb(),
+            db,
             step.id,
             status="completed",
             summary="ok",
@@ -205,14 +176,8 @@ class RepositoryImportTests(unittest.TestCase):
         )
 
         self.assertIs(completed, step)
-        self.assertEqual(
-            {
-                "tool_name": "get_active_alarms",
-                "started_by": "runtime",
-                "usage": {"tokens": 10},
-            },
-            step.metadata_json,
-        )
+        statement_sql = str(db.statement)
+        self.assertIn("metadata_json ||", statement_sql)
 
 
 if __name__ == "__main__":

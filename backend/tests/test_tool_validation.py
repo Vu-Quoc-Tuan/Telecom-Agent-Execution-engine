@@ -4,6 +4,7 @@ import unittest
 
 from app.agent.tool_validation import (
     validate_json_value_against_schema,
+    validate_script_output_contract,
     validate_tool_call_arguments,
 )
 from app.common.exceptions import SkillRuntimeError
@@ -214,3 +215,13 @@ class ToolValidationTests(unittest.TestCase):
         with self.assertRaises(SkillRuntimeError) as ctx:
             validate_json_value_against_schema(value=[1, 0, 3], schema=schema)
         self.assertIn("must be >= 1", ctx.exception.message)
+
+    def test_script_output_contract_rejects_unsupported_mode(self) -> None:
+        with self.assertRaises(SkillRuntimeError) as ctx:
+            validate_script_output_contract(
+                stdout="anything",
+                contract={"mode": "yaml"},
+                path="scripts/check.py.stdout",
+            )
+
+        self.assertIn("Unsupported output contract mode", ctx.exception.message)

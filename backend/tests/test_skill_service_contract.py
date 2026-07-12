@@ -141,6 +141,7 @@ Instructions here.
             {"type": "object", "additionalProperties": True},
             manifest["scripts/helper.py"]["input_schema"],
         )
+        self.assertNotIn("max_output_chars", manifest["scripts/helper.py"]["limits"])
         self.assertEqual(repository.updated[0].status, "testing")
 
     async def test_sandbox_script_failure_rejects_package_when_sandbox_is_available(self) -> None:
@@ -188,6 +189,37 @@ Run `scripts/check.py`.
         self.assertEqual("REJECTED", ctx.exception.status)
         self.assertIn("sandbox validation", ctx.exception.message)
         self.assertEqual(repository.updated[0].status, "rejected")
+
+    async def test_run_spec_keeps_args_json_when_llm_proposes_unsupported_mode(self) -> None:
+        from app.services.skills import SkillValidationService
+
+        service = SkillValidationService(skill_repository=FakeSkillRepository())
+        package = service.parse_package(
+            self._create_zip(
+                """---
+name: check-kpis
+description: Check telecom KPI alarms for NOC troubleshooting.
+---
+# Check KPIs
+Run the approved script.
+""",
+                {"scripts/check.py": "print('ok')\n"},
+            )
+        )
+        proposal = {
+            "scripts/check.py": {
+                "runtime": {"arguments_mode": "none"},
+            }
+        }
+
+        with unittest.mock.patch.object(
+            service,
+            "_invoke_llm_run_spec_analyzer",
+            new=unittest.mock.AsyncMock(return_value=proposal),
+        ):
+            manifest = await service._build_initial_script_manifest(object(), package, [])
+
+        self.assertEqual("args_json", manifest["scripts/check.py"]["runtime"]["arguments_mode"])
 
     async def test_malicious_skill_is_rejected_and_recorded_once(self) -> None:
         from app.services.skills import (
@@ -357,7 +389,7 @@ Instructions.
         self.assertIn("kích thước", ctx.exception.message)
 
 
-class SkillPackageParserTests(unittest.TestCase):
+class SkillPackageParsingTests(unittest.TestCase):
     @staticmethod
     def _zip(entries: dict[str, str | bytes]) -> bytes:
         buf = io.BytesIO()
@@ -448,6 +480,19 @@ Instructions.
 """
         with self.assertRaises(SkillValidationError):
             SkillValidationService().parse_package(self._zip({"SKILL.md": skill_md}))
+
+    def test_rejects_dot_segment_in_archive_path(self) -> None:
+        from app.services.skills import SkillValidationError, SkillValidationService
+
+        with self.assertRaises(SkillValidationError):
+            SkillValidationService().parse_package(
+                self._zip(
+                    {
+                        "check-kpis/SKILL.md": self._skill_md(),
+                        "check-kpis/scripts/./check.py": "print('ok')\n",
+                    }
+                )
+            )
 
 
 class SkillRepositoryReviewTests(unittest.TestCase):

@@ -97,6 +97,9 @@ def main():
         if not isinstance(custom_patterns, dict):
             parser.error("patterns must resolve to a JSON object")
 
+    if not args.text and not args.input:
+        parser.error("one of --text or --input is required")
+
     if args.text:
         extracted, lookup_keys = extract_entities(args.text, custom_patterns)
         result = {"text": args.text, "extracted": extracted, "lookup_keys": lookup_keys}
