@@ -10,7 +10,6 @@ from app.common.enums import InterventionStatus, RunStatus
 from app.database.models.agent_runs import AgentRun
 from app.database.models.chat_messages import ChatMessage
 from app.database.repositories.approvals import ApprovalRepository
-from app.database.repositories.audit_logs import AuditLogRepository
 from app.database.repositories.messages import MessageRepository
 from app.database.repositories.run_steps import RunStepRepository
 from app.database.repositories.runs import RunRepository
@@ -108,18 +107,6 @@ class RunLifecycleService:
             run_id=run_id,
             commit=False,
         )
-        AuditLogRepository.log_event(
-            db,
-            actor_type="user",
-            actor_id=requested_by,
-            action="run.cancelled",
-            session_id=run.session_id if run else None,
-            run_id=run_id,
-            resource_type="agent_run",
-            resource_id=str(run_id),
-            details={"reason": message},
-            commit=False,
-        )
         db.commit()
         return RunLifecycleTransition(run=run, changed=True, message=message)
 
@@ -166,18 +153,6 @@ class RunLifecycleService:
             ApprovalRepository.cancel_pending_by_run(
                 db,
                 run_id=run.id,
-                commit=False,
-            )
-            AuditLogRepository.log_event(
-                db,
-                actor_type="system",
-                actor_id="timeout_sweeper",
-                action="run.timed_out",
-                session_id=run.session_id,
-                run_id=run.id,
-                resource_type="agent_run",
-                resource_id=str(run.id),
-                details={"timeout_seconds": timeout_seconds, "cutoff": cutoff.isoformat()},
                 commit=False,
             )
             db.commit()

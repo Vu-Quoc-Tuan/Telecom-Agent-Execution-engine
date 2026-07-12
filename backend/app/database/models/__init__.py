@@ -1,6 +1,5 @@
 from app.database.models.agent_runs import AgentRun
 from app.database.models.approval_requests import ApprovalRequest
-from app.database.models.audit_logs import AuditLog
 from app.database.models.chat_messages import ChatMessage
 from app.database.models.run_steps import RunStep
 from app.database.models.session import Session
@@ -14,6 +13,5 @@ __all__ = [
     "RunStep",
     "ToolCall",
     "ApprovalRequest",
-    "AuditLog",
     "Skill",
 ]
