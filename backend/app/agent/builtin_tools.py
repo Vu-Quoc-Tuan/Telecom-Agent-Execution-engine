@@ -130,23 +130,33 @@ _BACKEND_OWNED_TOOL_DEFINITIONS: dict[str, LLMToolDefinition] = {
     GET_SITE_ALARM_SUMMARY: LLMToolDefinition(
         name=GET_SITE_ALARM_SUMMARY,
         description=(
-            "Tổng hợp alarm theo mức độ (severity) cho một site trong N phút gần đây. "
+            "Tổng hợp alarm theo mức độ (severity) cho một site trong N phút gần đây "
+            "(theo timestamp alarm mới nhất trong DB). "
+            "site_id là station_id (vd STN-0001) hoặc tên station (vd HN-Station-001). "
             "Runner cố định do backend sở hữu — auto-run khi tham số hợp lệ."
         ),
         input_schema=_schema(
             {
-                "site_id": {"type": "string", "description": "Định danh site cần tổng hợp alarm."},
+                "site_id": {
+                    "type": "string",
+                    "description": (
+                        "Station id (STN-xxxx) hoặc station name (vd HN-Station-001). "
+                        "Map sang device_id qua inventory Postgres."
+                    ),
+                },
                 "window_minutes": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1440,
-                    "description": "Cửa sổ thời gian (phút) tính tới hiện tại.",
+                    "description": (
+                        "Cửa sổ phút tính lùi từ timestamp alarm mới nhất trong dataset."
+                    ),
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1000,
-                    "description": "Số dòng tối đa trả về.",
+                    "description": "Số dòng severity tối đa trả về.",
                 },
             },
             ["site_id", "window_minutes", "limit"],
@@ -155,8 +165,9 @@ _BACKEND_OWNED_TOOL_DEFINITIONS: dict[str, LLMToolDefinition] = {
     GET_ACTIVE_ALARMS: LLMToolDefinition(
         name=GET_ACTIVE_ALARMS,
         description=(
-            "Liệt kê alarm đang mở (time_solved IS NULL) trong N phút gần đây, có thể lọc theo "
-            "severity. Runner cố định do backend sở hữu — auto-run khi tham số hợp lệ."
+            "Liệt kê alarm đang mở (time_solved IS NULL) trong N phút gần đây "
+            "(theo timestamp alarm mới nhất), có thể lọc severity. "
+            "Runner cố định do backend sở hữu — auto-run khi tham số hợp lệ."
         ),
         input_schema=_schema(
             {
@@ -164,7 +175,9 @@ _BACKEND_OWNED_TOOL_DEFINITIONS: dict[str, LLMToolDefinition] = {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1440,
-                    "description": "Cửa sổ thời gian (phút) tính tới hiện tại.",
+                    "description": (
+                        "Cửa sổ phút tính lùi từ timestamp alarm mới nhất trong dataset."
+                    ),
                 },
                 "limit": {
                     "type": "integer",
@@ -174,7 +187,9 @@ _BACKEND_OWNED_TOOL_DEFINITIONS: dict[str, LLMToolDefinition] = {
                 },
                 "severity": {
                     "type": "string",
-                    "description": "Tuỳ chọn: chỉ lấy alarm có severity này (vd 'critical').",
+                    "description": (
+                        "Tuỳ chọn: lọc severity (critical/major/minor/warning), không phân biệt hoa thường."
+                    ),
                 },
             },
             ["window_minutes", "limit"],
@@ -184,23 +199,32 @@ _BACKEND_OWNED_TOOL_DEFINITIONS: dict[str, LLMToolDefinition] = {
     GET_SITE_KPI_SNAPSHOT: LLMToolDefinition(
         name=GET_SITE_KPI_SNAPSHOT,
         description=(
-            "Snapshot KPI gần nhất của một site trong N phút gần đây. "
+            "Snapshot chỉ số vận hành gần đây của một site (đếm alarm active/total, "
+            "mix severity, top error codes) trong N phút. "
+            "site_id là station_id hoặc tên station. "
             "Runner cố định do backend sở hữu — auto-run khi tham số hợp lệ."
         ),
         input_schema=_schema(
             {
-                "site_id": {"type": "string", "description": "Định danh site cần lấy KPI."},
+                "site_id": {
+                    "type": "string",
+                    "description": (
+                        "Station id (STN-xxxx) hoặc station name (vd HN-Station-001)."
+                    ),
+                },
                 "window_minutes": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1440,
-                    "description": "Cửa sổ thời gian (phút) tính tới hiện tại.",
+                    "description": (
+                        "Cửa sổ phút tính lùi từ timestamp alarm mới nhất trong dataset."
+                    ),
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1000,
-                    "description": "Số dòng tối đa trả về.",
+                    "description": "Số top error codes tối đa.",
                 },
             },
             ["site_id", "window_minutes", "limit"],
@@ -210,11 +234,17 @@ _BACKEND_OWNED_TOOL_DEFINITIONS: dict[str, LLMToolDefinition] = {
         name=GET_SITE_INVENTORY,
         description=(
             "Lấy thông tin inventory/cấu hình của một site từ PostgreSQL nghiệp vụ. "
+            "site_id là station_id (STN-xxxx) hoặc tên station (vd HN-Station-001). "
             "Runner cố định do backend sở hữu — auto-run khi tham số hợp lệ."
         ),
         input_schema=_schema(
             {
-                "site_id": {"type": "string", "description": "Định danh site cần tra inventory."},
+                "site_id": {
+                    "type": "string",
+                    "description": (
+                        "Station id (STN-xxxx) hoặc station name (vd HN-Station-001)."
+                    ),
+                },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,

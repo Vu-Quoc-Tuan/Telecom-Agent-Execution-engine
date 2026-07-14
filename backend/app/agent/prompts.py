@@ -125,11 +125,6 @@ def _compile_prompt_or_fallback(prompt_obj, fallback_text: str, **kwargs) -> str
 
 def build_system_prompt(ready_skills, settings=None, selected_skill_name: str | None = None) -> str:
     """Dựng system prompt: lấy khung tĩnh từ Langfuse rồi compile phần động ở local.
-
-    Khung tĩnh được quản lý trên Langfuse Prompt Management; hai placeholder
-    `{{skill_section}}` và `{{resource_context}}` được thay bằng dữ liệu động tính
-    từ skill catalog (DB) và cấu hình backend (settings). Nếu Langfuse không khả dụng
-    thì rơi về fallback template cứng (TELECOM_AGENT_SYSTEM_PROMPT).
     """
     resource_context = _build_runtime_resource_context(settings)
     skill_section = _build_skill_section(ready_skills, selected_skill_name)

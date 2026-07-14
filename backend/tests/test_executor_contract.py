@@ -262,15 +262,28 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             async def query(self, sql, params=None):
                 FakeClickHouseConnector.sql = sql
                 FakeClickHouseConnector.params = params
-                return [{"severity": "critical", "alarm_count": 2}]
+                return [{"severity": "Critical", "alarm_count": 2}]
 
             def close(self):
                 pass
 
-        with patch("app.agent.builtin_runners.TelcoClickHouseConnector", FakeClickHouseConnector):
+        class FakePostgresConnector:
+            def __init__(self, **kwargs):
+                pass
+
+            async def query(self, sql, params=None):
+                return [{"device_id": "DEV-000001"}, {"device_id": "DEV-000002"}]
+
+            def close(self):
+                pass
+
+        with (
+            patch("app.agent.builtin_runners.TelcoClickHouseConnector", FakeClickHouseConnector),
+            patch("app.agent.builtin_runners.TelcoPostgresConnector", FakePostgresConnector),
+        ):
             output, truncated = await execute_builtin_tool(
                 tool_name="get_site_alarm_summary",
-                arguments={"site_id": "site-a", "window_minutes": 15, "limit": 20},
+                arguments={"site_id": "HN-Station-001", "window_minutes": 15, "limit": 20},
                 db=object(),
                 settings=types.SimpleNamespace(
                     CLICKHOUSE_HOST="clickhouse.example.test",
@@ -278,16 +291,27 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                     CLICKHOUSE_USER="operator",
                     CLICKHOUSE_PASSWORD="secret",
                     CLICKHOUSE_DATABASE="alarm_data",
+                    EXTERNAL_POSTGRES_HOST="pg.example.test",
+                    EXTERNAL_POSTGRES_PORT=5432,
+                    EXTERNAL_POSTGRES_USER="operator",
+                    EXTERNAL_POSTGRES_PASSWORD="secret",
+                    EXTERNAL_POSTGRES_DATABASE="postgres",
                     EXTERNAL_CONNECTOR_TIMEOUT_SECONDS=5,
                     QUERY_MAX_RESULT_ROWS=100,
                 ),
             )
 
         self.assertIn('"alarm_count": 2', output)
+        self.assertIn("HN-Station-001", output)
         self.assertFalse(truncated)
-        self.assertIn("FROM alarms", FakeClickHouseConnector.sql)
+        self.assertIn("FROM alarm", FakeClickHouseConnector.sql)
+        self.assertIn("device_id IN {device_ids:Array(String)}", FakeClickHouseConnector.sql)
         self.assertEqual(
-            {"site_id": "site-a", "window_minutes": 15, "limit": 20},
+            {
+                "device_ids": ["DEV-000001", "DEV-000002"],
+                "window_minutes": 15,
+                "limit": 20,
+            },
             FakeClickHouseConnector.params,
         )
 
@@ -367,7 +391,9 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                 settings=ch_settings,
             )
         self.assertIn('"alarm_id": "a1"', output)
+        self.assertIn("FROM alarm", FakeClickHouseConnector.sql)
         self.assertIn("time_solved IS NULL", FakeClickHouseConnector.sql)
+        self.assertIn("max(time_created)", FakeClickHouseConnector.sql)
         self.assertNotIn("severity =", FakeClickHouseConnector.sql)
         self.assertEqual(
             {"window_minutes": 30, "limit": 50},
@@ -381,7 +407,10 @@ class BuiltinToolExecutorTests(unittest.IsolatedAsyncioTestCase):
                 db=object(),
                 settings=ch_settings,
             )
-        self.assertIn("severity = {severity:String}", FakeClickHouseConnector.sql)
+        self.assertIn(
+            "lowerUTF8(severity) = lowerUTF8({severity:String})",
+            FakeClickHouseConnector.sql,
+        )
         self.assertEqual(
             {"window_minutes": 30, "limit": 50, "severity": "critical"},
             FakeClickHouseConnector.params,

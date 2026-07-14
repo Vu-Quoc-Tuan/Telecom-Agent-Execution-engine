@@ -172,6 +172,23 @@ def _run_read_skill_file(db: Session, arguments: dict[str, Any]) -> tuple[str, b
 
 
 # --- Backend-owned capability runners ---------------------------------------
+#
+# Live ClickHouse schema (alarm_data):
+#   table `alarm` with device_id / severity / time_created / time_solved / ...
+#   no `site_id`, no `alarms`, no `kpi_snapshots`.
+# Site scope is resolved via external Postgres inventory:
+#   alarm_data.station + alarm_data.device (station_id or station name).
+# Time windows are relative to max(time_created) so historical mock datasets
+# (e.g. June-only) still return rows when wall-clock now() is outside the range.
+
+_ALARM_TABLE = "alarm"
+# Window relative to latest available alarm timestamp (works for live + mock history).
+_ALARM_WINDOW_PREDICATE = (
+    "time_created >= (SELECT max(time_created) FROM alarm) "
+    "- INTERVAL {window_minutes:UInt32} MINUTE"
+)
+
+
 async def _run_clickhouse_template(
     settings,
     sql: str,
@@ -185,22 +202,87 @@ async def _run_clickhouse_template(
     return _prepare_tool_output(json.dumps(rows, ensure_ascii=False, default=str))
 
 
+async def _resolve_site_device_ids(settings, site_id: str) -> list[str]:
+    """Map station_id or station name → device_id list via external Postgres inventory."""
+    site_key = str(site_id or "").strip()
+    if not site_key:
+        return []
+    sql = (
+        "SELECT d.device_id "
+        "FROM alarm_data.device d "
+        "WHERE d.station_id = :site_id "
+        "OR d.station_id IN ("
+        "  SELECT s.station_id FROM alarm_data.station s "
+        "  WHERE s.station_id = :site_id OR s.name = :site_id"
+        ") "
+        "LIMIT 1000"
+    )
+    connector = _build_postgres_connector(settings, read_only=True)
+    try:
+        rows = await connector.query(sql, {"site_id": site_key})
+    finally:
+        connector.close()
+    device_ids: list[str] = []
+    for row in rows:
+        device_id = str(row.get("device_id") or "").strip()
+        if device_id:
+            device_ids.append(device_id)
+    return device_ids
+
+
+def _empty_site_payload(site_id: str, *, reason: str) -> tuple[str, bool]:
+    return _prepare_tool_output(
+        json.dumps(
+            {
+                "site_id": site_id,
+                "device_ids": [],
+                "rows": [],
+                "note": reason,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 async def _run_get_site_alarm_summary(arguments: dict[str, Any], settings) -> tuple[str, bool]:
-    params = {
-        "site_id": str(arguments.get("site_id", "")),
-        "window_minutes": int(arguments.get("window_minutes", 60)),
-        "limit": int(arguments.get("limit", 100)),
+    site_id = str(arguments.get("site_id", "")).strip()
+    window_minutes = int(arguments.get("window_minutes", 60))
+    limit = int(arguments.get("limit", 100))
+    device_ids = await _resolve_site_device_ids(settings, site_id)
+    if not device_ids:
+        return _empty_site_payload(
+            site_id,
+            reason=(
+                "No devices found for this site_id in external Postgres inventory "
+                "(use station_id like STN-0001 or station name like HN-Station-001)."
+            ),
+        )
+    params: dict[str, Any] = {
+        "device_ids": device_ids,
+        "window_minutes": window_minutes,
+        "limit": limit,
     }
     sql = (
         "SELECT severity, count() AS alarm_count "
-        "FROM alarms "
-        "WHERE site_id = {site_id:String} "
-        "AND time_created >= now() - INTERVAL {window_minutes:UInt32} MINUTE "
+        f"FROM {_ALARM_TABLE} "
+        "WHERE device_id IN {device_ids:Array(String)} "
+        f"AND {_ALARM_WINDOW_PREDICATE} "
         "GROUP BY severity "
         "ORDER BY alarm_count DESC "
         "LIMIT {limit:UInt32}"
     )
-    return await _run_clickhouse_template(settings, sql, params)
+    connector = _build_clickhouse_connector(settings)
+    try:
+        rows = await connector.query(sql, params=params)
+    finally:
+        connector.close()
+    payload = {
+        "site_id": site_id,
+        "device_count": len(device_ids),
+        "window_minutes": window_minutes,
+        "summary": rows,
+    }
+    return _prepare_tool_output(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 async def _run_get_active_alarms(arguments: dict[str, Any], settings) -> tuple[str, bool]:
@@ -208,16 +290,19 @@ async def _run_get_active_alarms(arguments: dict[str, Any], settings) -> tuple[s
         "window_minutes": int(arguments.get("window_minutes", 60)),
         "limit": int(arguments.get("limit", 100)),
     }
-    severity = arguments.get("severity")
     where_clauses = [
         "time_solved IS NULL",
-        "time_created >= now() - INTERVAL {window_minutes:UInt32} MINUTE",
+        _ALARM_WINDOW_PREDICATE,
     ]
+    severity = arguments.get("severity")
     if severity:
+        # Live data uses Title-case severities (Critical/Major/...); accept any case.
         params["severity"] = str(severity)
-        where_clauses.append("severity = {severity:String}")
+        where_clauses.append("lowerUTF8(severity) = lowerUTF8({severity:String})")
     sql = (
-        "SELECT * FROM alarms "
+        "SELECT alarm_id, error_code, device_id, time_created, time_solved, "
+        "status, severity, raw_log, description "
+        f"FROM {_ALARM_TABLE} "
         f"WHERE {' AND '.join(where_clauses)} "
         "ORDER BY time_created DESC "
         "LIMIT {limit:UInt32}"
@@ -226,19 +311,67 @@ async def _run_get_active_alarms(arguments: dict[str, Any], settings) -> tuple[s
 
 
 async def _run_get_site_kpi_snapshot(arguments: dict[str, Any], settings) -> tuple[str, bool]:
-    params = {
-        "site_id": str(arguments.get("site_id", "")),
-        "window_minutes": int(arguments.get("window_minutes", 60)),
-        "limit": int(arguments.get("limit", 100)),
+    """Operational snapshot for a site derived from alarm table (no kpi_snapshots table)."""
+    site_id = str(arguments.get("site_id", "")).strip()
+    window_minutes = int(arguments.get("window_minutes", 60))
+    limit = int(arguments.get("limit", 100))
+    device_ids = await _resolve_site_device_ids(settings, site_id)
+    if not device_ids:
+        return _empty_site_payload(
+            site_id,
+            reason=(
+                "No devices found for this site_id in external Postgres inventory "
+                "(use station_id like STN-0001 or station name like HN-Station-001)."
+            ),
+        )
+    params: dict[str, Any] = {
+        "device_ids": device_ids,
+        "window_minutes": window_minutes,
+        "limit": limit,
     }
-    sql = (
-        "SELECT * FROM kpi_snapshots "
-        "WHERE site_id = {site_id:String} "
-        "AND time_created >= now() - INTERVAL {window_minutes:UInt32} MINUTE "
-        "ORDER BY time_created DESC "
+    # One compact snapshot row + top error codes (no dedicated KPI table in live CH).
+    summary_sql = (
+        "SELECT "
+        "count() AS alarm_total, "
+        "countIf(time_solved IS NULL) AS alarm_active, "
+        "countIf(lowerUTF8(severity) = 'critical') AS critical_count, "
+        "countIf(lowerUTF8(severity) = 'major') AS major_count, "
+        "countIf(lowerUTF8(severity) = 'minor') AS minor_count, "
+        "countIf(lowerUTF8(severity) = 'warning') AS warning_count, "
+        "uniqExact(device_id) AS devices_with_alarms, "
+        "max(time_created) AS latest_alarm_at "
+        f"FROM {_ALARM_TABLE} "
+        "WHERE device_id IN {device_ids:Array(String)} "
+        f"AND {_ALARM_WINDOW_PREDICATE}"
+    )
+    top_errors_sql = (
+        "SELECT error_code, count() AS alarm_count "
+        f"FROM {_ALARM_TABLE} "
+        "WHERE device_id IN {device_ids:Array(String)} "
+        f"AND {_ALARM_WINDOW_PREDICATE} "
+        "GROUP BY error_code "
+        "ORDER BY alarm_count DESC "
         "LIMIT {limit:UInt32}"
     )
-    return await _run_clickhouse_template(settings, sql, params)
+    connector = _build_clickhouse_connector(settings)
+    try:
+        summary_rows = await connector.query(summary_sql, params=params)
+        top_errors = await connector.query(top_errors_sql, params=params)
+    finally:
+        connector.close()
+    payload = {
+        "site_id": site_id,
+        "device_count": len(device_ids),
+        "window_minutes": window_minutes,
+        "source": "alarm_table_derived",
+        "note": (
+            "Live ClickHouse has no kpi_snapshots table; "
+            "this snapshot is derived from alarm_data.alarm for the site's devices."
+        ),
+        "snapshot": summary_rows[0] if summary_rows else {},
+        "top_error_codes": top_errors,
+    }
+    return _prepare_tool_output(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 async def _run_get_site_inventory(arguments: dict[str, Any], settings) -> tuple[str, bool]:
